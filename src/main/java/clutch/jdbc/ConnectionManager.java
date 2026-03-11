@@ -34,14 +34,14 @@ public class ConnectionManager {
      * @param props    extra driver properties (e.g. oracle.net.tns_admin)
      */
     public int connect(String url, String user, String password, Map<String, String> props,
-                       Integer networkTimeoutSeconds)
+                       Integer connectTimeoutSeconds, Integer networkTimeoutSeconds)
             throws SQLException {
         Properties p = new Properties();
         if (props != null) p.putAll(props);
         if (user != null)     p.setProperty("user",     user);
         if (password != null) p.setProperty("password", password);
 
-        Connection conn = DriverManager.getConnection(url, p);
+        Connection conn = openConnection(url, p, connectTimeoutSeconds);
         if (networkTimeoutSeconds != null && networkTimeoutSeconds > 0) {
             try {
                 conn.setNetworkTimeout(networkTimeoutExecutor, networkTimeoutSeconds * 1000);
@@ -52,6 +52,22 @@ public class ConnectionManager {
         int id = nextId.getAndIncrement();
         connections.put(id, conn);
         return id;
+    }
+
+    private Connection openConnection(String url, Properties props, Integer connectTimeoutSeconds)
+            throws SQLException {
+        if (connectTimeoutSeconds == null || connectTimeoutSeconds <= 0) {
+            return DriverManager.getConnection(url, props);
+        }
+        synchronized (DriverManager.class) {
+            int previousTimeout = DriverManager.getLoginTimeout();
+            DriverManager.setLoginTimeout(connectTimeoutSeconds);
+            try {
+                return DriverManager.getConnection(url, props);
+            } finally {
+                DriverManager.setLoginTimeout(previousTimeout);
+            }
+        }
     }
 
     /** Return the live Connection for {@code connId}, or throw if unknown. */

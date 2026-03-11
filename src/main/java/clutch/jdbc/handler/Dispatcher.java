@@ -60,12 +60,14 @@ public class Dispatcher {
         String password = (String) req.params.get("password");
         Map<String, String> props =
             (Map<String, String>) req.params.getOrDefault("props", Map.of());
+        Integer connectTimeoutSeconds = getOptionalInt(req, "connect-timeout-seconds");
         Integer networkTimeoutSeconds = getOptionalInt(req, "network-timeout-seconds");
 
         if (url == null)
             return Response.error(req.id, "connect: 'url' is required");
 
-        int connId = connMgr.connect(url, user, password, props, networkTimeoutSeconds);
+        int connId = connMgr.connect(url, user, password, props,
+            connectTimeoutSeconds, networkTimeoutSeconds);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
@@ -84,9 +86,13 @@ public class Dispatcher {
         int connId    = getInt(req, "conn-id");
         String sql    = getString(req, "sql").stripTrailing().replaceAll(";+$", "");
         int fetchSize = (int) req.params.getOrDefault("fetch-size", 200);
+        Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
 
         Connection conn = connMgr.get(connId);
         Statement stmt  = conn.createStatement();
+        if (queryTimeoutSeconds != null && queryTimeoutSeconds > 0) {
+            stmt.setQueryTimeout(queryTimeoutSeconds);
+        }
 
         boolean isQuery = stmt.execute(sql);
 

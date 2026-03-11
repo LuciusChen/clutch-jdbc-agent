@@ -30,7 +30,7 @@ agent over a simple JSON protocol on stdin/stdout.
 mvn package
 ```
 
-Produces `target/clutch-jdbc-agent-0.1.1.jar` (fat jar with Jackson bundled).
+Produces `target/clutch-jdbc-agent-0.1.2.jar` (fat jar with Jackson bundled).
 JDBC driver jars are **not** bundled — they are loaded at runtime from a
 `drivers/` directory next to the jar.
 
@@ -68,6 +68,12 @@ all logging goes to stderr.
 ```json
 {"id": 1, "op": "execute", "params": {"conn-id": 0, "sql": "SELECT 1"}}
 ```
+
+Timeout-related params are explicit:
+
+- `connect-timeout-seconds`: JDBC login/connect timeout for `connect`
+- `network-timeout-seconds`: socket/network timeout applied to the JDBC `Connection`
+- `query-timeout-seconds`: statement timeout applied before `execute`
 
 ### Response format
 
