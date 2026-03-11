@@ -79,7 +79,7 @@ public class Dispatcher {
 
     private Response execute(Request req) throws Exception {
         int connId    = getInt(req, "conn-id");
-        String sql    = getString(req, "sql");
+        String sql    = getString(req, "sql").stripTrailing().replaceAll(";+$", "");
         int fetchSize = (int) req.params.getOrDefault("fetch-size", 200);
 
         Connection conn = connMgr.get(connId);
