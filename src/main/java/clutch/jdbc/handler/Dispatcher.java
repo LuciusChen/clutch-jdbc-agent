@@ -82,11 +82,8 @@ public class Dispatcher {
         String sql    = getString(req, "sql").stripTrailing().replaceAll(";+$", "");
         int fetchSize = (int) req.params.getOrDefault("fetch-size", 200);
 
-        int queryTimeout = (int) req.params.getOrDefault("query-timeout", 0);
-
         Connection conn = connMgr.get(connId);
         Statement stmt  = conn.createStatement();
-        if (queryTimeout > 0) stmt.setQueryTimeout(queryTimeout);
 
         boolean isQuery = stmt.execute(sql);
 
