@@ -73,6 +73,7 @@ public class CursorManager {
         return new FetchResult(c.columnNames(), c.columnTypes(), rows, done);
     }
 
+    /** Close and remove the cursor for {@code cursorId}. No-op if already closed. */
     public void close(int cursorId) {
         Cursor c = cursors.remove(cursorId);
         if (c == null) return;

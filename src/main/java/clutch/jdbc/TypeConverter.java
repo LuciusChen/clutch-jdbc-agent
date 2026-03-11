@@ -36,6 +36,10 @@ public class TypeConverter {
         return java.util.Map.of("__type", "blob", "length", length);
     }
 
+    /**
+     * Convert column {@code col} of the current {@code rs} row to a JSON-safe value.
+     * Returns {@code null} for SQL NULL, or a Java type that Jackson serializes cleanly.
+     */
     public static Object convert(ResultSet rs, int col) throws SQLException {
         Object val = rs.getObject(col);
         if (rs.wasNull() || val == null) return null;

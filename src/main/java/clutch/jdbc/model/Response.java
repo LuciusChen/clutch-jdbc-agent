@@ -29,6 +29,7 @@ public class Response {
     @JsonProperty("error")
     public String error;
 
+    /** Build a success response with the given result payload. */
     public static Response ok(int id, Object result) {
         Response r = new Response();
         r.id = id;
@@ -37,6 +38,7 @@ public class Response {
         return r;
     }
 
+    /** Build an error response with the given message. */
     public static Response error(int id, String message) {
         Response r = new Response();
         r.id = id;

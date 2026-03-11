@@ -16,6 +16,7 @@ public class DriverShim implements Driver {
 
     private final Driver delegate;
 
+    /** Wrap {@code delegate} so DriverManager accepts it from an external classloader. */
     public DriverShim(Driver delegate) {
         this.delegate = delegate;
     }
