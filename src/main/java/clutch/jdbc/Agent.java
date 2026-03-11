@@ -24,6 +24,7 @@ public class Agent {
 
     private static final System.Logger LOG = System.getLogger(Agent.class.getName());
 
+    /** Start the agent: load drivers, emit ready signal, then loop on stdin. */
     public static void main(String[] args) throws Exception {
         // Determine drivers directory.
         File driversDir = args.length > 0

@@ -54,6 +54,7 @@ public class ConnectionManager {
         return id;
     }
 
+    /** Return the live Connection for {@code connId}, or throw if unknown. */
     public Connection get(int connId) throws SQLException {
         Connection c = connections.get(connId);
         if (c == null)
@@ -61,11 +62,13 @@ public class ConnectionManager {
         return c;
     }
 
+    /** Close and remove the connection for {@code connId}. No-op if already closed. */
     public void disconnect(int connId) throws SQLException {
         Connection c = connections.remove(connId);
         if (c != null && !c.isClosed()) c.close();
     }
 
+    /** Close all connections and shut down the network-timeout executor. */
     public void disconnectAll() {
         for (Map.Entry<Integer, Connection> e : connections.entrySet()) {
             try { e.getValue().close(); } catch (Exception ignored) {}

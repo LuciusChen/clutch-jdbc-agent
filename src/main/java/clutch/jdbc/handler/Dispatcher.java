@@ -17,11 +17,13 @@ public class Dispatcher {
     private final ConnectionManager connMgr;
     private final CursorManager cursorMgr;
 
+    /** Create a Dispatcher backed by the given connection and cursor managers. */
     public Dispatcher(ConnectionManager connMgr, CursorManager cursorMgr) {
         this.connMgr = connMgr;
         this.cursorMgr = cursorMgr;
     }
 
+    /** Route {@code req} to the appropriate handler and return its response. */
     public Response dispatch(Request req) throws Exception {
         return switch (req.op) {
             case "ping"            -> ping(req);
