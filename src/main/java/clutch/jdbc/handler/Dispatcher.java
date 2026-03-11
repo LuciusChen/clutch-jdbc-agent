@@ -58,11 +58,12 @@ public class Dispatcher {
         String password = (String) req.params.get("password");
         Map<String, String> props =
             (Map<String, String>) req.params.getOrDefault("props", Map.of());
+        Integer networkTimeoutSeconds = getOptionalInt(req, "network-timeout-seconds");
 
         if (url == null)
             return Response.error(req.id, "connect: 'url' is required");
 
-        int connId = connMgr.connect(url, user, password, props);
+        int connId = connMgr.connect(url, user, password, props, networkTimeoutSeconds);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
@@ -151,9 +152,17 @@ public class Dispatcher {
     private Response getTables(Request req) throws SQLException {
         int connId      = getInt(req, "conn-id");
         String schema   = (String) req.params.get("schema");
-        String[] types  = { "TABLE", "VIEW" };
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> tables = isOracle(conn)
+            ? getOracleTables(conn, schema)
+            : getJdbcMetadataTables(conn, schema);
+        return Response.ok(req.id, Map.of("tables", tables));
+    }
 
-        DatabaseMetaData meta = connMgr.get(connId).getMetaData();
+    private List<Map<String, Object>> getJdbcMetadataTables(Connection conn, String schema)
+            throws SQLException {
+        String[] types = { "TABLE", "VIEW" };
+        DatabaseMetaData meta = conn.getMetaData();
         List<Map<String, Object>> tables = new ArrayList<>();
         try (ResultSet rs = meta.getTables(null, schema, "%", types)) {
             while (rs.next()) {
@@ -164,7 +173,61 @@ public class Dispatcher {
                 ));
             }
         }
-        return Response.ok(req.id, Map.of("tables", tables));
+        return tables;
+    }
+
+    private List<Map<String, Object>> getOracleTables(Connection conn, String schema)
+            throws SQLException {
+        String sql;
+        String currentUser = currentOracleUser(conn);
+        boolean hasSchema = schema != null && !schema.isBlank();
+        boolean currentUserSchema = hasSchema && schema.equalsIgnoreCase(currentUser);
+        if (!hasSchema || currentUserSchema) {
+            sql = """
+                SELECT table_name AS object_name, 'TABLE' AS object_type,
+                       ? AS owner
+                FROM user_tables
+                UNION ALL
+                SELECT view_name AS object_name, 'VIEW' AS object_type,
+                       ? AS owner
+                FROM user_views
+                ORDER BY object_name
+                """;
+        } else {
+            sql = """
+                SELECT table_name AS object_name, 'TABLE' AS object_type, owner
+                FROM all_tables
+                WHERE owner = ?
+                UNION ALL
+                SELECT view_name AS object_name, 'VIEW' AS object_type, owner
+                FROM all_views
+                WHERE owner = ?
+                ORDER BY object_name
+                """;
+        }
+        List<Map<String, Object>> tables = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(15);
+            if (!hasSchema || currentUserSchema) {
+                String owner = currentUser != null ? currentUser : Objects.toString(schema, "");
+                ps.setString(1, owner);
+                ps.setString(2, owner);
+            } else {
+                String owner = schema.toUpperCase(Locale.ROOT);
+                ps.setString(1, owner);
+                ps.setString(2, owner);
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    tables.add(Map.of(
+                        "name", rs.getString("object_name"),
+                        "type", rs.getString("object_type"),
+                        "schema", Objects.toString(rs.getString("owner"), "")
+                    ));
+                }
+            }
+        }
+        return tables;
     }
 
     private Response getColumns(Request req) throws SQLException {
@@ -234,5 +297,27 @@ public class Dispatcher {
         Object v = req.params.get(key);
         if (v instanceof String s) return s;
         throw new IllegalArgumentException("Missing or non-string param: " + key);
+    }
+
+    private Integer getOptionalInt(Request req, String key) {
+        Object v = req.params.get(key);
+        if (v == null) return null;
+        if (v instanceof Number n) return n.intValue();
+        throw new IllegalArgumentException("Non-integer param: " + key);
+    }
+
+    private boolean isOracle(Connection conn) throws SQLException {
+        String productName = conn.getMetaData().getDatabaseProductName();
+        return productName != null && productName.toLowerCase(Locale.ROOT).contains("oracle");
+    }
+
+    private String currentOracleUser(Connection conn) throws SQLException {
+        String user = conn.getMetaData().getUserName();
+        if (user == null) return null;
+        int at = user.indexOf('@');
+        if (at >= 0) user = user.substring(0, at);
+        int bracket = user.indexOf('[');
+        if (bracket >= 0) user = user.substring(0, bracket);
+        return user.strip().toUpperCase(Locale.ROOT);
     }
 }

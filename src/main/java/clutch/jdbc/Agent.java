@@ -67,7 +67,9 @@ public class Agent {
                 out.println(mapper.writeValueAsString(resp));
             } catch (Exception e) {
                 int id = (req != null) ? req.id : -1;
-                LOG.log(System.Logger.Level.ERROR, "Error handling request: {0}", e.getMessage());
+                LOG.log(System.Logger.Level.ERROR,
+                        "Error handling request {0}: {1}",
+                        id, e.getMessage());
                 out.println(mapper.writeValueAsString(Response.error(id, e.getMessage())));
             }
         }

@@ -2,10 +2,13 @@ package clutch.jdbc;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLException;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -16,6 +19,11 @@ public class ConnectionManager {
 
     private final AtomicInteger nextId = new AtomicInteger(1);
     private final Map<Integer, Connection> connections = new ConcurrentHashMap<>();
+    private final ExecutorService networkTimeoutExecutor = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "clutch-jdbc-network-timeout");
+        t.setDaemon(true);
+        return t;
+    });
 
     /**
      * Open a new JDBC connection and return its assigned connId.
@@ -25,7 +33,8 @@ public class ConnectionManager {
      * @param password database password (may be null)
      * @param props    extra driver properties (e.g. oracle.net.tns_admin)
      */
-    public int connect(String url, String user, String password, Map<String, String> props)
+    public int connect(String url, String user, String password, Map<String, String> props,
+                       Integer networkTimeoutSeconds)
             throws SQLException {
         Properties p = new Properties();
         if (props != null) p.putAll(props);
@@ -33,6 +42,13 @@ public class ConnectionManager {
         if (password != null) p.setProperty("password", password);
 
         Connection conn = DriverManager.getConnection(url, p);
+        if (networkTimeoutSeconds != null && networkTimeoutSeconds > 0) {
+            try {
+                conn.setNetworkTimeout(networkTimeoutExecutor, networkTimeoutSeconds * 1000);
+            } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
+                // Driver does not implement network timeout; continue without it.
+            }
+        }
         int id = nextId.getAndIncrement();
         connections.put(id, conn);
         return id;
@@ -55,5 +71,6 @@ public class ConnectionManager {
             try { e.getValue().close(); } catch (Exception ignored) {}
         }
         connections.clear();
+        networkTimeoutExecutor.shutdownNow();
     }
 }
