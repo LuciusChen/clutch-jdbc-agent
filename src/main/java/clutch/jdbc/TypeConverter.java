@@ -14,6 +14,28 @@ import java.sql.*;
  */
 public class TypeConverter {
 
+    /**
+     * Convert a small BLOB's raw bytes to a map preserving the blob origin.
+     * If the bytes are valid UTF-8 and look like JSON, includes the text content.
+     * Otherwise returns a plain blob placeholder.
+     */
+    static java.util.Map<String, Object> blobBytesToMap(byte[] bytes, long length) {
+        try {
+            java.nio.charset.CharsetDecoder decoder =
+                java.nio.charset.StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
+            String text = decoder.decode(java.nio.ByteBuffer.wrap(bytes)).toString().strip();
+            if (!text.isEmpty() && (text.charAt(0) == '{' || text.charAt(0) == '[')) {
+                return java.util.Map.of("__type", "blob", "length", length,
+                                        "text", text);
+            }
+        } catch (java.nio.charset.CharacterCodingException ignored) {
+            // Not valid UTF-8: fall through to plain blob placeholder.
+        }
+        return java.util.Map.of("__type", "blob", "length", length);
+    }
+
     public static Object convert(ResultSet rs, int col) throws SQLException {
         Object val = rs.getObject(col);
         if (rs.wasNull() || val == null) return null;
@@ -49,8 +71,18 @@ public class TypeConverter {
                     yield java.util.Map.of("__type", "clob", "error", e.getMessage());
                 }
             }
-            case Blob blob -> java.util.Map.of("__type", "blob", "length", blob.length());
-            case byte[] bytes -> java.util.Map.of("__type", "blob", "length", bytes.length);
+            case Blob blob -> {
+                try {
+                    long len = blob.length();
+                    if (len <= 65536) {
+                        yield blobBytesToMap(blob.getBytes(1, (int) len), len);
+                    }
+                    yield java.util.Map.of("__type", "blob", "length", len);
+                } catch (SQLException e) {
+                    yield java.util.Map.of("__type", "blob", "error", e.getMessage());
+                }
+            }
+            case byte[] bytes -> blobBytesToMap(bytes, bytes.length);
 
             // Fallback: getString() for anything else (e.g. Oracle-specific types).
             default -> {
