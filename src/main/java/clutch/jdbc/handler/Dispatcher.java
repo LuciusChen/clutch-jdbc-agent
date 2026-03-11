@@ -84,7 +84,6 @@ public class Dispatcher {
 
         Connection conn = connMgr.get(connId);
         Statement stmt  = conn.createStatement();
-        stmt.setFetchSize(fetchSize);
 
         boolean isQuery = stmt.execute(sql);
 
@@ -99,7 +98,11 @@ public class Dispatcher {
         }
 
         // SELECT: open cursor, return first batch.
+        // setFetchSize is applied to the ResultSet after execute() succeeds,
+        // not before — setting it on Statement before execute() can cause
+        // Oracle 11g JDBC to hang on parse errors instead of throwing SQLException.
         ResultSet rs   = stmt.getResultSet();
+        rs.setFetchSize(fetchSize);
         int cursorId   = cursorMgr.register(connId, stmt, rs);
         CursorManager.FetchResult first = cursorMgr.fetch(cursorId, fetchSize);
 
