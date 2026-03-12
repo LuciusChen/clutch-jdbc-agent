@@ -183,6 +183,20 @@ Before releasing:
 - Smoke test: `echo '{"id":1,"op":"ping","params":{}}' | java -jar target/clutch-jdbc-agent-*.jar`
   must print `{"id":1,"ok":true,"result":{"pong":true}}`.
 
+## Release Discipline
+
+- Treat the published release jar as the source of truth consumed by `clutch`. If the jar bytes change, the consuming checksum in `clutch` must change in lockstep.
+- Prefer bumping `<version>` for any released jar content change. Replacing a GitHub release asset in place should be reserved for exceptional repair cases.
+- If an in-place asset replacement is unavoidable, update `clutch-jdbc-agent-sha256` in `clutch` immediately and verify `clutch-jdbc-ensure-agent` against the published asset, not just a local Maven build.
+- Do not assume the local `target/*.jar` checksum matches the release asset checksum. Always verify against the uploaded artifact before documenting or committing a checksum.
+
+## Release Discipline
+
+- Treat the published release jar as the source of truth consumed by `clutch`. If the jar bytes change, the consuming checksum in `clutch` must change in lockstep.
+- Prefer bumping `<version>` for any released jar content change. Replacing a GitHub release asset in place should be reserved for exceptional repair cases.
+- If an in-place asset replacement is unavoidable, update `clutch-jdbc-agent-sha256` in `clutch` immediately and verify `clutch-jdbc-ensure-agent` against the published asset, not just a local Maven build.
+- Do not assume the local `target/*.jar` checksum matches the release asset checksum. Always verify against the uploaded artifact before documenting or committing a checksum.
+
 ## Postmortems
 
 The `postmortem/` directory contains design decision records. **Read them before
