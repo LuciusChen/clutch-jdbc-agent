@@ -12,7 +12,7 @@ agent over a simple JSON protocol on stdin/stdout.
 
 | Database             | Driver                          | Auto-install via Maven |
 |----------------------|---------------------------------|------------------------|
-| Oracle Database      | `ojdbc11` (Oracle)              | Yes                    |
+| Oracle Database      | `ojdbc8` (default) / `ojdbc11`  | Yes                    |
 | Microsoft SQL Server | `mssql-jdbc` (Microsoft)        | Yes                    |
 | Amazon Redshift      | `redshift-jdbc` (AWS)           | Yes                    |
 | Snowflake            | `snowflake-jdbc` (Snowflake)    | Yes                    |
@@ -42,7 +42,7 @@ The agent is not meant to be invoked manually.
 ```elisp
 (require 'clutch-db-jdbc)
 (clutch-jdbc-ensure-agent)          ; downloads the jar from GitHub Releases
-(clutch-jdbc-install-driver 'oracle) ; downloads ojdbc11.jar from Maven Central
+(clutch-jdbc-install-driver 'oracle) ; downloads ojdbc8.jar + orai18n.jar from Maven Central
 ```
 
 Then connect as usual:
@@ -149,7 +149,8 @@ Each jar is scanned via `ServiceLoader<java.sql.Driver>`.
 
 From Emacs:
 ```elisp
-(clutch-jdbc-install-driver 'oracle)     ; → drivers/ojdbc11.jar + drivers/orai18n.jar
+(clutch-jdbc-install-driver 'oracle)     ; → drivers/ojdbc8.jar + drivers/orai18n.jar
+(clutch-jdbc-install-driver 'oracle-11)  ; → drivers/ojdbc11.jar + drivers/orai18n.jar
 (clutch-jdbc-install-driver 'oracle-i18n); → drivers/orai18n.jar  (installed automatically for oracle)
 (clutch-jdbc-install-driver 'sqlserver)  ; → drivers/mssql-jdbc.jar
 (clutch-jdbc-install-driver 'snowflake)  ; → drivers/snowflake-jdbc.jar
@@ -158,6 +159,11 @@ From Emacs:
 
 For DB2, download `db2jcc4.jar` from IBM manually and place it in the `drivers/`
 directory (`~/.emacs.d/clutch-jdbc/drivers/` by default).
+
+For Oracle, `clutch-jdbc-install-driver 'oracle` now chooses `ojdbc8` by
+default because it is the safest line across Oracle 11g/12c/19c. Installing
+`oracle` automatically removes a conflicting `ojdbc11.jar`; installing
+`oracle-11` does the inverse.
 
 ## License
 
