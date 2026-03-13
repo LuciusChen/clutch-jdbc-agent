@@ -34,7 +34,9 @@ public class Dispatcher {
             case "close-cursor"    -> closeCursor(req);
             case "get-schemas"     -> getSchemas(req);
             case "get-tables"      -> getTables(req);
+            case "search-tables"   -> searchTables(req);
             case "get-columns"     -> getColumns(req);
+            case "search-columns"  -> searchColumns(req);
             case "get-primary-keys"-> getPrimaryKeys(req);
             case "get-foreign-keys"-> getForeignKeys(req);
             default -> Response.error(req.id, "Unknown op: " + req.op);
@@ -243,9 +245,127 @@ public class Dispatcher {
         String schema = (String) req.params.get("schema");
         String table  = getString(req, "table");
 
-        DatabaseMetaData meta = connMgr.get(connId).getMetaData();
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> cols = isOracle(conn)
+            ? getOracleColumns(conn, schema, table, null)
+            : getJdbcMetadataColumns(conn, schema, table, null);
+        return Response.ok(req.id, Map.of("columns", cols));
+    }
+
+    private Response searchTables(Request req) throws SQLException {
+        int connId      = getInt(req, "conn-id");
+        String schema   = (String) req.params.get("schema");
+        String prefix   = Objects.toString(req.params.get("prefix"), "");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> tables = isOracle(conn)
+            ? searchOracleTables(conn, schema, prefix)
+            : searchJdbcMetadataTables(conn, schema, prefix);
+        return Response.ok(req.id, Map.of("tables", tables));
+    }
+
+    private List<Map<String, Object>> searchJdbcMetadataTables(Connection conn, String schema, String prefix)
+            throws SQLException {
+        String[] types = { "TABLE", "VIEW" };
+        String pattern = (prefix == null || prefix.isBlank()) ? "%" : prefix + "%";
+        DatabaseMetaData meta = conn.getMetaData();
+        List<Map<String, Object>> tables = new ArrayList<>();
+        try (ResultSet rs = meta.getTables(null, schema, pattern, types)) {
+            while (rs.next()) {
+                tables.add(Map.of(
+                    "name",   rs.getString("TABLE_NAME"),
+                    "type",   rs.getString("TABLE_TYPE"),
+                    "schema", Objects.toString(rs.getString("TABLE_SCHEM"), "")
+                ));
+            }
+        }
+        return tables;
+    }
+
+    private List<Map<String, Object>> searchOracleTables(Connection conn, String schema, String prefix)
+            throws SQLException {
+        String sql;
+        String currentUser = currentOracleUser(conn);
+        String pattern = ((prefix == null || prefix.isBlank()) ? "" : prefix)
+            .toUpperCase(Locale.ROOT) + "%";
+        boolean hasSchema = schema != null && !schema.isBlank();
+        boolean currentUserSchema = hasSchema && schema.equalsIgnoreCase(currentUser);
+        if (!hasSchema || currentUserSchema) {
+            sql = """
+                SELECT object_name, object_type, owner
+                FROM (
+                  SELECT table_name AS object_name, 'TABLE' AS object_type, ? AS owner
+                  FROM user_tables
+                  WHERE table_name LIKE ?
+                  UNION ALL
+                  SELECT view_name AS object_name, 'VIEW' AS object_type, ? AS owner
+                  FROM user_views
+                  WHERE view_name LIKE ?
+                )
+                ORDER BY object_name
+                """;
+        } else {
+            sql = """
+                SELECT object_name, object_type, owner
+                FROM (
+                  SELECT table_name AS object_name, 'TABLE' AS object_type, owner
+                  FROM all_tables
+                  WHERE owner = ? AND table_name LIKE ?
+                  UNION ALL
+                  SELECT view_name AS object_name, 'VIEW' AS object_type, owner
+                  FROM all_views
+                  WHERE owner = ? AND view_name LIKE ?
+                )
+                ORDER BY object_name
+                """;
+        }
+        List<Map<String, Object>> tables = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(5);
+            if (!hasSchema || currentUserSchema) {
+                String owner = currentUser != null ? currentUser : Objects.toString(schema, "");
+                ps.setString(1, owner);
+                ps.setString(2, pattern);
+                ps.setString(3, owner);
+                ps.setString(4, pattern);
+            } else {
+                String owner = schema.toUpperCase(Locale.ROOT);
+                ps.setString(1, owner);
+                ps.setString(2, pattern);
+                ps.setString(3, owner);
+                ps.setString(4, pattern);
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    tables.add(Map.of(
+                        "name", rs.getString("object_name"),
+                        "type", rs.getString("object_type"),
+                        "schema", Objects.toString(rs.getString("owner"), "")
+                    ));
+                }
+            }
+        }
+        return tables;
+    }
+
+    private Response searchColumns(Request req) throws SQLException {
+        int connId    = getInt(req, "conn-id");
+        String schema = (String) req.params.get("schema");
+        String table  = getString(req, "table");
+        String prefix = Objects.toString(req.params.get("prefix"), "");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> cols = isOracle(conn)
+            ? getOracleColumns(conn, schema, table, prefix)
+            : getJdbcMetadataColumns(conn, schema, table, prefix);
+        return Response.ok(req.id, Map.of("columns", cols));
+    }
+
+    private List<Map<String, Object>> getJdbcMetadataColumns(Connection conn, String schema,
+                                                             String table, String prefix)
+            throws SQLException {
+        DatabaseMetaData meta = conn.getMetaData();
+        String pattern = (prefix == null || prefix.isBlank()) ? "%" : prefix + "%";
         List<Map<String, Object>> cols = new ArrayList<>();
-        try (ResultSet rs = meta.getColumns(null, schema, table, "%")) {
+        try (ResultSet rs = meta.getColumns(null, schema, table, pattern)) {
             while (rs.next()) {
                 cols.add(Map.of(
                     "name",     rs.getString("COLUMN_NAME"),
@@ -255,7 +375,60 @@ public class Dispatcher {
                 ));
             }
         }
-        return Response.ok(req.id, Map.of("columns", cols));
+        return cols;
+    }
+
+    private List<Map<String, Object>> getOracleColumns(Connection conn, String schema,
+                                                       String table, String prefix)
+            throws SQLException {
+        String sql;
+        String currentUser = currentOracleUser(conn);
+        boolean hasSchema = schema != null && !schema.isBlank();
+        boolean currentUserSchema = hasSchema && schema.equalsIgnoreCase(currentUser);
+        String owner = (!hasSchema || currentUserSchema)
+            ? currentUser
+            : schema.toUpperCase(Locale.ROOT);
+        String columnPattern = ((prefix == null || prefix.isBlank()) ? "" : prefix)
+            .toUpperCase(Locale.ROOT) + "%";
+        if (!hasSchema || currentUserSchema) {
+            sql = """
+                SELECT column_name, data_type, nullable, column_id
+                FROM user_tab_columns
+                WHERE table_name = ?
+                  AND column_name LIKE ?
+                ORDER BY column_id
+                """;
+        } else {
+            sql = """
+                SELECT column_name, data_type, nullable, column_id
+                FROM all_tab_columns
+                WHERE owner = ?
+                  AND table_name = ?
+                  AND column_name LIKE ?
+                ORDER BY column_id
+                """;
+        }
+        List<Map<String, Object>> cols = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(5);
+            int i = 1;
+            if (hasSchema && !currentUserSchema) {
+                ps.setString(i++, owner);
+            }
+            ps.setString(i++, table.toUpperCase(Locale.ROOT));
+            ps.setString(i, columnPattern);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    cols.add(Map.of(
+                        "name", rs.getString("column_name"),
+                        "type", rs.getString("data_type"),
+                        "nullable", !"N".equalsIgnoreCase(rs.getString("nullable")),
+                        "position", rs.getInt("column_id")
+                    ));
+                }
+            }
+        }
+        return cols;
     }
 
     private Response getPrimaryKeys(Request req) throws SQLException {

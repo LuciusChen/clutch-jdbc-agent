@@ -30,7 +30,7 @@ agent over a simple JSON protocol on stdin/stdout.
 mvn package
 ```
 
-Produces `target/clutch-jdbc-agent-0.1.2.jar` (fat jar with Jackson bundled).
+Produces `target/clutch-jdbc-agent-0.1.3.jar` (fat jar with Jackson bundled).
 JDBC driver jars are **not** bundled — they are loaded at runtime from a
 `drivers/` directory next to the jar.
 
@@ -98,7 +98,9 @@ Error response:
 | `close-cursor`    | Close a cursor explicitly                        |
 | `get-schemas`     | List schemas via `DatabaseMetaData`              |
 | `get-tables`      | List tables/views in a schema                    |
+| `search-tables`   | Prefix-search tables/views for completion        |
 | `get-columns`     | List columns for a table                         |
+| `search-columns`  | Prefix-search columns for completion             |
 | `get-primary-keys`| List primary key columns                         |
 | `get-foreign-keys`| List imported foreign keys                       |
 
