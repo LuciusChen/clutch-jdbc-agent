@@ -33,6 +33,18 @@ The agent must NOT contain:
 - Connection profiles or credential storage
 - UI concepts of any kind
 
+## Version Baseline
+
+- The published Java baseline is **Java 17+** for both build and runtime.
+- Do not silently introduce Java 21-only syntax or APIs just because the local
+  machine has a newer JDK.
+- If a change would raise the baseline above Java 17, document the reason in a
+  postmortem first, then update:
+  - `pom.xml`
+  - `README.md`
+  - `clutch`'s JDBC documentation and bundled agent version/checksum
+- Treat baseline changes as release-level changes, not incidental refactors.
+
 ## Package Structure
 
 ```
@@ -83,8 +95,10 @@ Only split a class when it has a genuinely distinct responsibility. Do not creat
 
 - Prefer flat, linear control flow. Avoid deep nesting — extract a helper method
   rather than adding another indent level.
-- Use `switch` expressions (Java 21) for op dispatch and type branching.
-  Pattern matching in `switch` is clear and exhaustive.
+- Use straightforward modern Java that remains valid on Java 17.
+  `switch ->`, records, and `instanceof` pattern matching are fine; avoid newer
+  Java 21-only pattern-matching `switch` constructs unless the baseline is
+  intentionally raised and documented.
 - Use `record` for simple data carriers (`FetchResult`). Do not add behavior to
   records beyond accessor methods.
 - Avoid checked exceptions leaking across layer boundaries. Handler methods declare
