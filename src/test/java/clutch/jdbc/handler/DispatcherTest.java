@@ -7,8 +7,14 @@ import clutch.jdbc.model.Response;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Proxy;
+import java.sql.DatabaseMetaData;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -64,6 +70,60 @@ class DispatcherTest {
         assertTrue(stmt.closed);
         assertEquals("dml", ((Map<?, ?>) response.result).get("type"));
         assertEquals(3, ((Number) ((Map<?, ?>) response.result).get("affected-rows")).intValue());
+    }
+
+    @Test
+    void getColumnsUsesOracleFastPath() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 3;
+        req.op = "get-columns";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "ZJSY");
+        req.params.put("table", "t_sys_para");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertEquals(
+            "SELECT column_name, data_type, nullable, column_id\n" +
+            "FROM user_tab_columns\n" +
+            "WHERE table_name = ?\n" +
+            "  AND column_name LIKE ?\n" +
+            "ORDER BY column_id",
+            oracle.lastSqlNormalized());
+        assertEquals(List.of("T_SYS_PARA", "%"), oracle.params);
+        assertEquals(5, oracle.queryTimeoutSeconds);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> cols = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("columns");
+        assertEquals("PARA_ID", cols.get(0).get("name"));
+    }
+
+    @Test
+    void searchColumnsUsesOracleFastPathAndPrefix() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 4;
+        req.op = "search-columns";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "ZJSY");
+        req.params.put("table", "t_sys_para");
+        req.params.put("prefix", "pa");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertEquals(List.of("T_SYS_PARA", "PA%"), oracle.params);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> cols = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("columns");
+        assertEquals(2, cols.size());
+        assertEquals("PARA_NAME", cols.get(1).get("name"));
     }
 
     private static Connection proxyConnection(RecordingStatementHandler stmt) {
@@ -133,6 +193,98 @@ class DispatcherTest {
                     case "isWrapperFor" -> false;
                     default -> throw new UnsupportedOperationException(method.getName());
                 });
+        }
+    }
+
+    private static final class OracleMetadataRecorder {
+        private String sql;
+        private final List<String> params = new ArrayList<>();
+        private int queryTimeoutSeconds;
+
+        private Connection connection() {
+            DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(),
+                new Class<?>[]{DatabaseMetaData.class},
+                (_proxy, method, _args) -> switch (method.getName()) {
+                    case "getDatabaseProductName" -> "Oracle";
+                    case "getUserName" -> "zjsy";
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+            return (Connection) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(),
+                new Class<?>[]{Connection.class},
+                (_proxy, method, _args) -> switch (method.getName()) {
+                    case "getMetaData" -> meta;
+                    case "prepareStatement" -> preparedStatement((String) _args[0]);
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+        }
+
+        private PreparedStatement preparedStatement(String sql) {
+            this.sql = sql;
+            this.params.clear();
+            return (PreparedStatement) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(),
+                new Class<?>[]{PreparedStatement.class},
+                (_proxy, method, args) -> switch (method.getName()) {
+                    case "setQueryTimeout" -> {
+                        queryTimeoutSeconds = (Integer) args[0];
+                        yield null;
+                    }
+                    case "setString" -> {
+                        int idx = (Integer) args[0];
+                        while (params.size() < idx) params.add(null);
+                        params.set(idx - 1, (String) args[1]);
+                        yield null;
+                    }
+                    case "executeQuery" -> resultSet();
+                    case "close" -> null;
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+        }
+
+        private ResultSet resultSet() {
+            List<Map<String, Object>> rows = List.of(
+                row("PARA_ID", "NUMBER", "N", 1),
+                row("PARA_NAME", "VARCHAR2", "Y", 2)
+            );
+            return (ResultSet) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(),
+                new Class<?>[]{ResultSet.class},
+                new java.lang.reflect.InvocationHandler() {
+                    int index = -1;
+                    @Override
+                    public Object invoke(Object _proxy, java.lang.reflect.Method method, Object[] _args) {
+                        return switch (method.getName()) {
+                            case "next" -> ++index < rows.size();
+                            case "getString" -> rows.get(index).get((String) _args[0]);
+                            case "getInt" -> rows.get(index).get((String) _args[0]);
+                            case "close" -> null;
+                            case "unwrap" -> null;
+                            case "isWrapperFor" -> false;
+                            default -> throw new UnsupportedOperationException(method.getName());
+                        };
+                    }
+                });
+        }
+
+        private Map<String, Object> row(String name, String type, String nullable, int position) {
+            Map<String, Object> row = new HashMap<>();
+            row.put("column_name", name);
+            row.put("data_type", type);
+            row.put("nullable", nullable);
+            row.put("column_id", position);
+            return row;
+        }
+
+        private String lastSqlNormalized() {
+            return sql.stripIndent().trim().replace("\r\n", "\n");
         }
     }
 }
