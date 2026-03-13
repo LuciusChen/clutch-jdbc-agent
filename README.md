@@ -21,7 +21,7 @@ agent over a simple JSON protocol on stdin/stdout.
 
 ## Requirements
 
-- Java 11+
+- Java 17+
 - Maven (to build from source)
 
 ## Build
@@ -30,7 +30,7 @@ agent over a simple JSON protocol on stdin/stdout.
 mvn package
 ```
 
-Produces `target/clutch-jdbc-agent-0.1.3.jar` (fat jar with Jackson bundled).
+Produces `target/clutch-jdbc-agent-0.1.4.jar` (fat jar with Jackson bundled).
 JDBC driver jars are **not** bundled — they are loaded at runtime from a
 `drivers/` directory next to the jar.
 
@@ -149,8 +149,8 @@ Each jar is scanned via `ServiceLoader<java.sql.Driver>`.
 
 From Emacs:
 ```elisp
-(clutch-jdbc-install-driver 'oracle)     ; → drivers/ojdbc11.jar
-(clutch-jdbc-install-driver 'oracle-i18n); → drivers/orai18n.jar  (CJK character sets)
+(clutch-jdbc-install-driver 'oracle)     ; → drivers/ojdbc11.jar + drivers/orai18n.jar
+(clutch-jdbc-install-driver 'oracle-i18n); → drivers/orai18n.jar  (installed automatically for oracle)
 (clutch-jdbc-install-driver 'sqlserver)  ; → drivers/mssql-jdbc.jar
 (clutch-jdbc-install-driver 'snowflake)  ; → drivers/snowflake-jdbc.jar
 (clutch-jdbc-install-driver 'redshift)   ; → drivers/redshift-jdbc.jar
