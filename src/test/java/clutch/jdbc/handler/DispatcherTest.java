@@ -19,6 +19,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DispatcherTest {
@@ -73,6 +74,41 @@ class DispatcherTest {
     }
 
     @Test
+    void executeClosesStatementWhenResultSetFails() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        boolean[] closed = {false};
+        Statement failingStmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "execute"      -> true;  // pretend it's a SELECT
+                case "getResultSet" -> throw new java.sql.SQLException("simulated rs failure");
+                case "close"        -> { closed[0] = true; yield null; }
+                case "unwrap"       -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement" -> failingStmt;
+                case "unwrap"          -> null;
+                case "isWrapperFor"    -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 99;
+        req.op = "execute";
+        req.params.put("conn-id", 7);
+        req.params.put("sql", "SELECT 1");
+
+        assertThrows(java.sql.SQLException.class, () -> dispatcher.dispatch(req));
+        assertTrue(closed[0], "statement must be closed when getResultSet() fails");
+    }
+
+    @Test
     void getColumnsUsesOracleFastPath() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
@@ -124,6 +160,67 @@ class DispatcherTest {
         List<Map<String, Object>> cols = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("columns");
         assertEquals(2, cols.size());
         assertEquals("PARA_NAME", cols.get(1).get("name"));
+    }
+
+    @Test
+    void getPrimaryKeysUsesOracleFastPath() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        // default resultRows have "column_name" → "PARA_ID" / "PARA_NAME", which the PK query reads
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 5;
+        req.op = "get-primary-keys";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "ZJSY");  // matches currentUser "zjsy" → user_* path
+        req.params.put("table", "orders");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(oracle.lastSqlNormalized().contains("user_constraints"),
+            "should use Oracle fast path (user_constraints)");
+        assertEquals(List.of("ORDERS"), oracle.params);
+        assertEquals(5, oracle.queryTimeoutSeconds);
+        @SuppressWarnings("unchecked")
+        List<String> pks = (List<String>) ((Map<?, ?>) response.result).get("primary-keys");
+        assertEquals(List.of("PARA_ID", "PARA_NAME"), pks);
+    }
+
+    @Test
+    void getForeignKeysUsesOracleFastPath() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        Map<String, Object> fkRow = new HashMap<>();
+        fkRow.put("fk_column", "CUSTOMER_ID");
+        fkRow.put("pk_table",  "CUSTOMERS");
+        fkRow.put("pk_schema", "ZJSY");
+        fkRow.put("pk_column", "ID");
+        oracle.resultRows = List.of(fkRow);
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 6;
+        req.op = "get-foreign-keys";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "ZJSY");
+        req.params.put("table", "orders");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(oracle.lastSqlNormalized().contains("user_constraints"),
+            "should use Oracle fast path (user_constraints)");
+        assertEquals(List.of("ORDERS"), oracle.params);
+        assertEquals(5, oracle.queryTimeoutSeconds);
+        @SuppressWarnings("unchecked")
+        List<Map<?, ?>> fks = (List<Map<?, ?>>) ((Map<?, ?>) response.result).get("foreign-keys");
+        assertEquals(1, fks.size());
+        assertEquals("CUSTOMER_ID", fks.get(0).get("fk-column"));
+        assertEquals("CUSTOMERS",   fks.get(0).get("pk-table"));
+        assertEquals("ZJSY",        fks.get(0).get("pk-schema"));
+        assertEquals("ID",          fks.get(0).get("pk-column"));
     }
 
     private static Connection proxyConnection(RecordingStatementHandler stmt) {
@@ -200,6 +297,10 @@ class DispatcherTest {
         private String sql;
         private final List<String> params = new ArrayList<>();
         private int queryTimeoutSeconds;
+        List<Map<String, Object>> resultRows = List.of(
+            row("PARA_ID", "NUMBER", "N", 1),
+            row("PARA_NAME", "VARCHAR2", "Y", 2)
+        );
 
         private Connection connection() {
             DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
@@ -250,10 +351,7 @@ class DispatcherTest {
         }
 
         private ResultSet resultSet() {
-            List<Map<String, Object>> rows = List.of(
-                row("PARA_ID", "NUMBER", "N", 1),
-                row("PARA_NAME", "VARCHAR2", "Y", 2)
-            );
+            List<Map<String, Object>> rows = this.resultRows;
             return (ResultSet) Proxy.newProxyInstance(
                 DispatcherTest.class.getClassLoader(),
                 new Class<?>[]{ResultSet.class},
