@@ -171,75 +171,86 @@ public class Dispatcher {
     }
 
     private Response getTables(Request req) throws SQLException {
-        int connId      = getInt(req, "conn-id");
-        String schema   = (String) req.params.get("schema");
+        int connId    = getInt(req, "conn-id");
+        String schema = (String) req.params.get("schema");
         Connection conn = connMgr.get(connId);
-        List<Map<String, Object>> tables = isOracle(conn)
-            ? getOracleTables(conn, schema)
-            : getJdbcMetadataTables(conn, schema);
-        return Response.ok(req.id, Map.of("tables", tables));
+        return isOracle(conn)
+            ? oracleTablesCursor(req.id, connId, conn, schema)
+            : jdbcTablesOneBatch(req.id, conn, schema);
     }
 
-    private List<Map<String, Object>> getJdbcMetadataTables(Connection conn, String schema)
-            throws SQLException {
-        String[] types = { "TABLE", "VIEW" };
-        DatabaseMetaData meta = conn.getMetaData();
-        List<Map<String, Object>> tables = new ArrayList<>();
-        try (ResultSet rs = meta.getTables(null, schema, "%", types)) {
-            while (rs.next()) {
-                tables.add(Map.of(
-                    "name",   rs.getString("TABLE_NAME"),
-                    "type",   rs.getString("TABLE_TYPE"),
-                    "schema", Objects.toString(rs.getString("TABLE_SCHEM"), "")
-                ));
-            }
-        }
-        return tables;
-    }
-
-    private List<Map<String, Object>> getOracleTables(Connection conn, String schema)
+    /**
+     * Oracle path: open a cursor over user_tables/user_views and return the first
+     * batch.  Subsequent batches are fetched via the normal "fetch" op.
+     * fetchSize=1000 on the ResultSet reduces Oracle round-trips from O(N/10) to
+     * O(N/1000) — critical for schemas with tens of thousands of tables.
+     */
+    private Response oracleTablesCursor(int reqId, int connId, Connection conn, String schema)
             throws SQLException {
         OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
-        String sql;
-        if (os.useUserTables()) {
-            sql = """
-                SELECT table_name AS object_name, 'TABLE' AS object_type,
-                       ? AS owner
+        String sql = os.useUserTables() ? """
+                SELECT table_name AS name, 'TABLE' AS type, ? AS schema
                 FROM user_tables
                 UNION ALL
-                SELECT view_name AS object_name, 'VIEW' AS object_type,
-                       ? AS owner
+                SELECT view_name AS name, 'VIEW' AS type, ? AS schema
                 FROM user_views
-                ORDER BY object_name
-                """;
-        } else {
-            sql = """
-                SELECT table_name AS object_name, 'TABLE' AS object_type, owner
+                ORDER BY name
+                """ : """
+                SELECT table_name AS name, 'TABLE' AS type, owner AS schema
                 FROM all_tables
                 WHERE owner = ?
                 UNION ALL
-                SELECT view_name AS object_name, 'VIEW' AS object_type, owner
+                SELECT view_name AS name, 'VIEW' AS type, owner AS schema
                 FROM all_views
                 WHERE owner = ?
-                ORDER BY object_name
+                ORDER BY name
                 """;
-        }
-        List<Map<String, Object>> tables = new ArrayList<>();
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+        PreparedStatement ps = conn.prepareStatement(sql);
+        try {
             ps.setQueryTimeout(ORACLE_TABLES_TIMEOUT_SECONDS);
             ps.setString(1, os.owner());
             ps.setString(2, os.owner());
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    tables.add(Map.of(
-                        "name", rs.getString("object_name"),
-                        "type", rs.getString("object_type"),
-                        "schema", Objects.toString(rs.getString("owner"), "")
-                    ));
-                }
+            ResultSet rs = ps.executeQuery();
+            rs.setFetchSize(1000);
+            int cursorId = cursorMgr.register(connId, ps, rs);
+            CursorManager.FetchResult first = cursorMgr.fetch(cursorId, 1000);
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("cursor-id", first.done() ? null : cursorId);
+            result.put("columns",   List.of("name", "type", "schema"));
+            result.put("rows",      first.rows());
+            result.put("done",      first.done());
+            return Response.ok(reqId, result);
+        } catch (SQLException e) {
+            try { ps.close(); } catch (Exception ignored) {}
+            throw e;
+        }
+    }
+
+    /**
+     * Non-Oracle JDBC path: materialize via DatabaseMetaData in one batch.
+     * Returns the same cursor-format response with done=true so the Emacs side
+     * can use a single code path for both Oracle and non-Oracle.
+     */
+    private Response jdbcTablesOneBatch(int reqId, Connection conn, String schema)
+            throws SQLException {
+        String[] types = {"TABLE", "VIEW"};
+        DatabaseMetaData meta = conn.getMetaData();
+        List<List<Object>> rows = new ArrayList<>();
+        try (ResultSet rs = meta.getTables(null, schema, "%", types)) {
+            while (rs.next()) {
+                List<Object> row = new ArrayList<>(3);
+                row.add(rs.getString("TABLE_NAME"));
+                row.add(rs.getString("TABLE_TYPE"));
+                row.add(Objects.toString(rs.getString("TABLE_SCHEM"), ""));
+                rows.add(row);
             }
         }
-        return tables;
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("cursor-id", null);
+        result.put("columns",   List.of("name", "type", "schema"));
+        result.put("rows",      rows);
+        result.put("done",      true);
+        return Response.ok(reqId, result);
     }
 
     private Response getColumns(Request req) throws SQLException {
