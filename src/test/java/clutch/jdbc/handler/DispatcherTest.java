@@ -19,6 +19,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -199,11 +200,12 @@ class DispatcherTest {
             DispatcherTest.class.getClassLoader(),
             new Class<?>[]{Statement.class},
             (_proxy, method, args) -> switch (method.getName()) {
-                case "execute"      -> true;  // pretend it's a SELECT
-                case "getResultSet" -> throw new java.sql.SQLException("simulated rs failure");
-                case "close"        -> { closed[0] = true; yield null; }
-                case "unwrap"       -> null;
-                case "isWrapperFor" -> false;
+                case "setQueryTimeout" -> null;
+                case "execute"         -> true;  // pretend it's a SELECT
+                case "getResultSet"    -> throw new java.sql.SQLException("simulated rs failure");
+                case "close"           -> { closed[0] = true; yield null; }
+                case "unwrap"          -> null;
+                case "isWrapperFor"    -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
         connMgr.connection = (Connection) Proxy.newProxyInstance(
@@ -224,6 +226,96 @@ class DispatcherTest {
 
         assertThrows(java.sql.SQLException.class, () -> dispatcher.dispatch(req));
         assertTrue(closed[0], "statement must be closed when getResultSet() fails");
+    }
+
+    @Test
+    void executeTimesOutAndCancelsStatementWhenBlocked() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        boolean[] cancelled = {false};
+        boolean[] closed    = {false};
+        Statement blockingStmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "setQueryTimeout" -> null;
+                case "execute" -> {
+                    try { Thread.sleep(Long.MAX_VALUE); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                    throw new java.sql.SQLException("interrupted");
+                }
+                case "cancel" -> { cancelled[0] = true; yield null; }
+                case "close"  -> { closed[0] = true; yield null; }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement" -> blockingStmt;
+                case "unwrap"          -> null;
+                case "isWrapperFor"    -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 20;
+        req.op = "execute";
+        req.params.put("conn-id", 7);
+        req.params.put("sql", "UPDATE t SET x = 1");
+        req.params.put("query-timeout-seconds", 1);
+
+        long start = System.currentTimeMillis();
+        Response response = dispatcher.dispatch(req);
+        long elapsed = System.currentTimeMillis() - start;
+
+        assertFalse(response.ok);
+        assertNotNull(response.error);
+        assertTrue(response.error.contains("timed out"), "error should mention timed out: " + response.error);
+        assertTrue(cancelled[0], "stmt.cancel() must be called on timeout");
+        assertTrue(closed[0],    "stmt.close() must be called on timeout");
+        assertTrue(elapsed < 4000, "test must complete within 4s, took: " + elapsed + "ms");
+    }
+
+    @Test
+    void executeUsesDefaultTimeoutWhenNoneSpecified() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        int[] capturedTimeout = {-1};
+        Statement timedStmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "setQueryTimeout" -> { capturedTimeout[0] = (Integer) args[0]; yield null; }
+                case "execute"         -> false;   // DML
+                case "getUpdateCount"  -> 0;
+                case "close"           -> null;
+                case "unwrap"          -> null;
+                case "isWrapperFor"    -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement" -> timedStmt;
+                case "unwrap"          -> null;
+                case "isWrapperFor"    -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 21;
+        req.op = "execute";
+        req.params.put("conn-id", 7);
+        req.params.put("sql", "DELETE FROM t WHERE 1=0");
+        // no query-timeout-seconds param
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertEquals(Dispatcher.DEFAULT_EXECUTE_TIMEOUT, capturedTimeout[0],
+            "default timeout should be used when none specified");
+        assertEquals("dml", ((Map<?, ?>) response.result).get("type"));
     }
 
     @Test
