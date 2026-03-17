@@ -78,6 +78,7 @@ public class Agent {
         // stdin closed — clean up and exit.
         LOG.log(System.Logger.Level.INFO, "stdin closed, shutting down.");
         connMgr.disconnectAll();
+        dispatcher.shutdown();
     }
 
     /**

@@ -7,6 +7,7 @@ import clutch.jdbc.model.Response;
 
 import java.sql.*;
 import java.util.*;
+import java.util.concurrent.*;
 
 /**
  * Routes incoming requests to the appropriate handler method.
@@ -17,14 +18,25 @@ public class Dispatcher {
     private static final int DEFAULT_FETCH_SIZE              = 500;
     private static final int ORACLE_TABLES_TIMEOUT_SECONDS   =  15;
     private static final int ORACLE_METADATA_TIMEOUT_SECONDS =   5;
+    static final int DEFAULT_EXECUTE_TIMEOUT                 =  29; // s; safety net when no client timeout given
 
     private final ConnectionManager connMgr;
     private final CursorManager cursorMgr;
+    private final ExecutorService executePool = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "clutch-jdbc-execute");
+        t.setDaemon(true);
+        return t;
+    });
 
     /** Create a Dispatcher backed by the given connection and cursor managers. */
     public Dispatcher(ConnectionManager connMgr, CursorManager cursorMgr) {
         this.connMgr = connMgr;
         this.cursorMgr = cursorMgr;
+    }
+
+    /** Shut down the execute thread pool. Called on agent shutdown. */
+    public void shutdown() {
+        executePool.shutdownNow();
     }
 
     /** Route {@code req} to the appropriate handler and return its response. */
@@ -114,53 +126,60 @@ public class Dispatcher {
     // -------------------------------------------------------------------------
 
     private Response execute(Request req) throws Exception {
-        int connId    = getInt(req, "conn-id");
-        String sql    = getString(req, "sql").stripTrailing().replaceAll(";+$", "");
-        int fetchSize = (int) req.params.getOrDefault("fetch-size", DEFAULT_FETCH_SIZE);
+        int connId                  = getInt(req, "conn-id");
+        String sql                  = getString(req, "sql").stripTrailing().replaceAll(";+$", "");
+        int fetchSize               = (int) req.params.getOrDefault("fetch-size", DEFAULT_FETCH_SIZE);
         Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
+        int executeTimeout          = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
+                                      ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
 
         Connection conn = connMgr.get(connId);
-        Statement stmt  = conn.createStatement();
-        if (queryTimeoutSeconds != null && queryTimeoutSeconds > 0) {
-            stmt.setQueryTimeout(queryTimeoutSeconds);
-        }
+        Statement  stmt = conn.createStatement();
+        stmt.setQueryTimeout(executeTimeout);   // Oracle-side cancel (belt)
 
-        boolean isQuery = stmt.execute(sql);
+        Future<Boolean> future = executePool.submit(() -> stmt.execute(sql));
+        boolean isQuery;
+        try {
+            isQuery = future.get(executeTimeout + 1, TimeUnit.SECONDS); // thread-level cancel (suspenders)
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            try { stmt.cancel(); } catch (Exception ignored) {}
+            try { stmt.close(); } catch (Exception ignored) {}
+            return Response.error(req.id, "Query timed out after " + executeTimeout + "s");
+        } catch (ExecutionException e) {
+            try { stmt.close(); } catch (Exception ignored) {}
+            Throwable cause = e.getCause();
+            throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
+        }
 
         if (!isQuery) {
             // DML: return affected-rows, no cursor.
             int affected = stmt.getUpdateCount();
             stmt.close();
-            return Response.ok(req.id, Map.of(
-                "type",          "dml",
-                "affected-rows", affected
-            ));
+            return Response.ok(req.id, Map.of("type", "dml", "affected-rows", affected));
         }
 
         // SELECT: open cursor, return first batch.
         // setFetchSize is applied to the ResultSet after execute() succeeds,
         // not before — setting it on Statement before execute() can cause
         // Oracle 11g JDBC to hang on parse errors instead of throwing SQLException.
-        ResultSet rs;
-        int cursorId;
         try {
-            rs       = stmt.getResultSet();
+            ResultSet rs = stmt.getResultSet();
             rs.setFetchSize(fetchSize);
-            cursorId = cursorMgr.register(connId, stmt, rs);
+            int cursorId = cursorMgr.register(connId, stmt, rs);
+            CursorManager.FetchResult first = cursorMgr.fetch(cursorId, fetchSize);
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("type",      "query");
+            result.put("cursor-id", first.done() ? null : cursorId);
+            result.put("columns",   first.columns());
+            result.put("col-types", first.types());
+            result.put("rows",      first.rows());
+            result.put("done",      first.done());
+            return Response.ok(req.id, result);
         } catch (Exception e) {
-            stmt.close();
+            try { stmt.close(); } catch (Exception ignored) {}
             throw e;
         }
-        CursorManager.FetchResult first = cursorMgr.fetch(cursorId, fetchSize);
-
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("type",      "query");
-        result.put("cursor-id", first.done() ? null : cursorId);
-        result.put("columns",   first.columns());
-        result.put("col-types", first.types());
-        result.put("rows",      first.rows());
-        result.put("done",      first.done());
-        return Response.ok(req.id, result);
     }
 
     private Response fetch(Request req) throws Exception {
