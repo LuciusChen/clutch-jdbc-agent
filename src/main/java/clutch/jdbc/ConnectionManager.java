@@ -34,7 +34,8 @@ public class ConnectionManager {
      * @param props    extra driver properties (e.g. oracle.net.tns_admin)
      */
     public int connect(String url, String user, String password, Map<String, String> props,
-                       Integer connectTimeoutSeconds, Integer networkTimeoutSeconds)
+                       Integer connectTimeoutSeconds, Integer networkTimeoutSeconds,
+                       boolean autoCommit)
             throws SQLException {
         Properties p = new Properties();
         if (props != null) p.putAll(props);
@@ -42,6 +43,13 @@ public class ConnectionManager {
         if (password != null) p.setProperty("password", password);
 
         Connection conn = openConnection(url, p, connectTimeoutSeconds);
+        if (!autoCommit) {
+            try {
+                conn.setAutoCommit(false);
+            } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
+                // Driver does not support manual-commit mode; proceed with autocommit.
+            }
+        }
         if (networkTimeoutSeconds != null && networkTimeoutSeconds > 0) {
             try {
                 conn.setNetworkTimeout(networkTimeoutExecutor, networkTimeoutSeconds * 1000);
