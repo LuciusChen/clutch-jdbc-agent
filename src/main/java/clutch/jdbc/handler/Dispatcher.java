@@ -33,6 +33,8 @@ public class Dispatcher {
             case "ping"            -> ping(req);
             case "connect"         -> connect(req);
             case "disconnect"      -> disconnect(req);
+            case "commit"          -> commit(req);
+            case "rollback"        -> rollback(req);
             case "execute"         -> execute(req);
             case "fetch"           -> fetch(req);
             case "close-cursor"    -> closeCursor(req);
@@ -68,12 +70,14 @@ public class Dispatcher {
             (Map<String, String>) req.params.getOrDefault("props", Map.of());
         Integer connectTimeoutSeconds = getOptionalInt(req, "connect-timeout-seconds");
         Integer networkTimeoutSeconds = getOptionalInt(req, "network-timeout-seconds");
+        Object autoCommitValue = req.params.get("auto-commit");
+        boolean autoCommit = autoCommitValue == null || Boolean.TRUE.equals(autoCommitValue);
 
         if (url == null)
             return Response.error(req.id, "connect: 'url' is required");
 
         int connId = connMgr.connect(url, user, password, props,
-            connectTimeoutSeconds, networkTimeoutSeconds);
+            connectTimeoutSeconds, networkTimeoutSeconds, autoCommit);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
@@ -81,6 +85,18 @@ public class Dispatcher {
         int connId = getInt(req, "conn-id");
         cursorMgr.closeForConnection(connId);
         connMgr.disconnect(connId);
+        return Response.ok(req.id, Map.of("conn-id", connId));
+    }
+
+    private Response commit(Request req) throws SQLException {
+        int connId = getInt(req, "conn-id");
+        connMgr.get(connId).commit();
+        return Response.ok(req.id, Map.of("conn-id", connId));
+    }
+
+    private Response rollback(Request req) throws SQLException {
+        int connId = getInt(req, "conn-id");
+        connMgr.get(connId).rollback();
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
