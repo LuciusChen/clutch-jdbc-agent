@@ -14,6 +14,10 @@ import java.util.*;
  */
 public class Dispatcher {
 
+    private static final int DEFAULT_FETCH_SIZE              = 500;
+    private static final int ORACLE_TABLES_TIMEOUT_SECONDS   =  15;
+    private static final int ORACLE_METADATA_TIMEOUT_SECONDS =   5;
+
     private final ConnectionManager connMgr;
     private final CursorManager cursorMgr;
 
@@ -29,6 +33,8 @@ public class Dispatcher {
             case "ping"            -> ping(req);
             case "connect"         -> connect(req);
             case "disconnect"      -> disconnect(req);
+            case "commit"          -> commit(req);
+            case "rollback"        -> rollback(req);
             case "execute"         -> execute(req);
             case "fetch"           -> fetch(req);
             case "close-cursor"    -> closeCursor(req);
@@ -64,12 +70,14 @@ public class Dispatcher {
             (Map<String, String>) req.params.getOrDefault("props", Map.of());
         Integer connectTimeoutSeconds = getOptionalInt(req, "connect-timeout-seconds");
         Integer networkTimeoutSeconds = getOptionalInt(req, "network-timeout-seconds");
+        Object autoCommitValue = req.params.get("auto-commit");
+        boolean autoCommit = autoCommitValue == null || Boolean.TRUE.equals(autoCommitValue);
 
         if (url == null)
             return Response.error(req.id, "connect: 'url' is required");
 
         int connId = connMgr.connect(url, user, password, props,
-            connectTimeoutSeconds, networkTimeoutSeconds);
+            connectTimeoutSeconds, networkTimeoutSeconds, autoCommit);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
@@ -80,6 +88,18 @@ public class Dispatcher {
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
+    private Response commit(Request req) throws SQLException {
+        int connId = getInt(req, "conn-id");
+        connMgr.get(connId).commit();
+        return Response.ok(req.id, Map.of("conn-id", connId));
+    }
+
+    private Response rollback(Request req) throws SQLException {
+        int connId = getInt(req, "conn-id");
+        connMgr.get(connId).rollback();
+        return Response.ok(req.id, Map.of("conn-id", connId));
+    }
+
     // -------------------------------------------------------------------------
     // Execute / Fetch / Close
     // -------------------------------------------------------------------------
@@ -87,7 +107,7 @@ public class Dispatcher {
     private Response execute(Request req) throws Exception {
         int connId    = getInt(req, "conn-id");
         String sql    = getString(req, "sql").stripTrailing().replaceAll(";+$", "");
-        int fetchSize = (int) req.params.getOrDefault("fetch-size", 200);
+        int fetchSize = (int) req.params.getOrDefault("fetch-size", DEFAULT_FETCH_SIZE);
         Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
 
         Connection conn = connMgr.get(connId);
@@ -112,9 +132,16 @@ public class Dispatcher {
         // setFetchSize is applied to the ResultSet after execute() succeeds,
         // not before — setting it on Statement before execute() can cause
         // Oracle 11g JDBC to hang on parse errors instead of throwing SQLException.
-        ResultSet rs   = stmt.getResultSet();
-        rs.setFetchSize(fetchSize);
-        int cursorId   = cursorMgr.register(connId, stmt, rs);
+        ResultSet rs;
+        int cursorId;
+        try {
+            rs       = stmt.getResultSet();
+            rs.setFetchSize(fetchSize);
+            cursorId = cursorMgr.register(connId, stmt, rs);
+        } catch (Exception e) {
+            stmt.close();
+            throw e;
+        }
         CursorManager.FetchResult first = cursorMgr.fetch(cursorId, fetchSize);
 
         Map<String, Object> result = new LinkedHashMap<>();
@@ -129,7 +156,7 @@ public class Dispatcher {
 
     private Response fetch(Request req) throws Exception {
         int cursorId  = getInt(req, "cursor-id");
-        int fetchSize = (int) req.params.getOrDefault("fetch-size", 200);
+        int fetchSize = (int) req.params.getOrDefault("fetch-size", DEFAULT_FETCH_SIZE);
 
         CursorManager.FetchResult fr = cursorMgr.fetch(cursorId, fetchSize);
         Map<String, Object> result = new LinkedHashMap<>();
@@ -160,84 +187,86 @@ public class Dispatcher {
     }
 
     private Response getTables(Request req) throws SQLException {
-        int connId      = getInt(req, "conn-id");
-        String schema   = (String) req.params.get("schema");
+        int connId    = getInt(req, "conn-id");
+        String schema = (String) req.params.get("schema");
         Connection conn = connMgr.get(connId);
-        List<Map<String, Object>> tables = isOracle(conn)
-            ? getOracleTables(conn, schema)
-            : getJdbcMetadataTables(conn, schema);
-        return Response.ok(req.id, Map.of("tables", tables));
+        return isOracle(conn)
+            ? oracleTablesCursor(req.id, connId, conn, schema)
+            : jdbcTablesOneBatch(req.id, conn, schema);
     }
 
-    private List<Map<String, Object>> getJdbcMetadataTables(Connection conn, String schema)
+    /**
+     * Oracle path: open a cursor over user_tables/user_views and return the first
+     * batch.  Subsequent batches are fetched via the normal "fetch" op.
+     * fetchSize=1000 on the ResultSet reduces Oracle round-trips from O(N/10) to
+     * O(N/1000) — critical for schemas with tens of thousands of tables.
+     */
+    private Response oracleTablesCursor(int reqId, int connId, Connection conn, String schema)
             throws SQLException {
-        String[] types = { "TABLE", "VIEW" };
-        DatabaseMetaData meta = conn.getMetaData();
-        List<Map<String, Object>> tables = new ArrayList<>();
-        try (ResultSet rs = meta.getTables(null, schema, "%", types)) {
-            while (rs.next()) {
-                tables.add(Map.of(
-                    "name",   rs.getString("TABLE_NAME"),
-                    "type",   rs.getString("TABLE_TYPE"),
-                    "schema", Objects.toString(rs.getString("TABLE_SCHEM"), "")
-                ));
-            }
-        }
-        return tables;
-    }
-
-    private List<Map<String, Object>> getOracleTables(Connection conn, String schema)
-            throws SQLException {
-        String sql;
-        String currentUser = currentOracleUser(conn);
-        boolean hasSchema = schema != null && !schema.isBlank();
-        boolean currentUserSchema = hasSchema && schema.equalsIgnoreCase(currentUser);
-        if (!hasSchema || currentUserSchema) {
-            sql = """
-                SELECT table_name AS object_name, 'TABLE' AS object_type,
-                       ? AS owner
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql = os.useUserTables() ? """
+                SELECT table_name AS name, 'TABLE' AS type, ? AS schema
                 FROM user_tables
                 UNION ALL
-                SELECT view_name AS object_name, 'VIEW' AS object_type,
-                       ? AS owner
+                SELECT view_name AS name, 'VIEW' AS type, ? AS schema
                 FROM user_views
-                ORDER BY object_name
-                """;
-        } else {
-            sql = """
-                SELECT table_name AS object_name, 'TABLE' AS object_type, owner
+                ORDER BY name
+                """ : """
+                SELECT table_name AS name, 'TABLE' AS type, owner AS schema
                 FROM all_tables
                 WHERE owner = ?
                 UNION ALL
-                SELECT view_name AS object_name, 'VIEW' AS object_type, owner
+                SELECT view_name AS name, 'VIEW' AS type, owner AS schema
                 FROM all_views
                 WHERE owner = ?
-                ORDER BY object_name
+                ORDER BY name
                 """;
+        PreparedStatement ps = conn.prepareStatement(sql);
+        try {
+            ps.setQueryTimeout(ORACLE_TABLES_TIMEOUT_SECONDS);
+            ps.setString(1, os.owner());
+            ps.setString(2, os.owner());
+            ResultSet rs = ps.executeQuery();
+            rs.setFetchSize(1000);
+            int cursorId = cursorMgr.register(connId, ps, rs);
+            CursorManager.FetchResult first = cursorMgr.fetch(cursorId, 1000);
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("cursor-id", first.done() ? null : cursorId);
+            result.put("columns",   List.of("name", "type", "schema"));
+            result.put("rows",      first.rows());
+            result.put("done",      first.done());
+            return Response.ok(reqId, result);
+        } catch (SQLException e) {
+            try { ps.close(); } catch (Exception ignored) {}
+            throw e;
         }
-        List<Map<String, Object>> tables = new ArrayList<>();
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setQueryTimeout(15);
-            if (!hasSchema || currentUserSchema) {
-                String owner = currentUser != null ? currentUser : Objects.toString(schema, "");
-                ps.setString(1, owner);
-                ps.setString(2, owner);
-            } else {
-                String owner = schema.toUpperCase(Locale.ROOT);
-                ps.setString(1, owner);
-                ps.setString(2, owner);
-            }
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    tables.add(Map.of(
-                        "name", rs.getString("object_name"),
-                        "type", rs.getString("object_type"),
-                        "schema", Objects.toString(rs.getString("owner"), "")
-                    ));
-                }
+    }
+
+    /**
+     * Non-Oracle JDBC path: materialize via DatabaseMetaData in one batch.
+     * Returns the same cursor-format response with done=true so the Emacs side
+     * can use a single code path for both Oracle and non-Oracle.
+     */
+    private Response jdbcTablesOneBatch(int reqId, Connection conn, String schema)
+            throws SQLException {
+        String[] types = {"TABLE", "VIEW"};
+        DatabaseMetaData meta = conn.getMetaData();
+        List<List<Object>> rows = new ArrayList<>();
+        try (ResultSet rs = meta.getTables(null, schema, "%", types)) {
+            while (rs.next()) {
+                List<Object> row = new ArrayList<>(3);
+                row.add(rs.getString("TABLE_NAME"));
+                row.add(rs.getString("TABLE_TYPE"));
+                row.add(Objects.toString(rs.getString("TABLE_SCHEM"), ""));
+                rows.add(row);
             }
         }
-        return tables;
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("cursor-id", null);
+        result.put("columns",   List.of("name", "type", "schema"));
+        result.put("rows",      rows);
+        result.put("done",      true);
+        return Response.ok(reqId, result);
     }
 
     private Response getColumns(Request req) throws SQLException {
@@ -283,13 +312,11 @@ public class Dispatcher {
 
     private List<Map<String, Object>> searchOracleTables(Connection conn, String schema, String prefix)
             throws SQLException {
-        String sql;
-        String currentUser = currentOracleUser(conn);
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
         String pattern = ((prefix == null || prefix.isBlank()) ? "" : prefix)
             .toUpperCase(Locale.ROOT) + "%";
-        boolean hasSchema = schema != null && !schema.isBlank();
-        boolean currentUserSchema = hasSchema && schema.equalsIgnoreCase(currentUser);
-        if (!hasSchema || currentUserSchema) {
+        String sql;
+        if (os.useUserTables()) {
             sql = """
                 SELECT object_name, object_type, owner
                 FROM (
@@ -320,20 +347,11 @@ public class Dispatcher {
         }
         List<Map<String, Object>> tables = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setQueryTimeout(5);
-            if (!hasSchema || currentUserSchema) {
-                String owner = currentUser != null ? currentUser : Objects.toString(schema, "");
-                ps.setString(1, owner);
-                ps.setString(2, pattern);
-                ps.setString(3, owner);
-                ps.setString(4, pattern);
-            } else {
-                String owner = schema.toUpperCase(Locale.ROOT);
-                ps.setString(1, owner);
-                ps.setString(2, pattern);
-                ps.setString(3, owner);
-                ps.setString(4, pattern);
-            }
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            ps.setString(1, os.owner());
+            ps.setString(2, pattern);
+            ps.setString(3, os.owner());
+            ps.setString(4, pattern);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     tables.add(Map.of(
@@ -381,16 +399,11 @@ public class Dispatcher {
     private List<Map<String, Object>> getOracleColumns(Connection conn, String schema,
                                                        String table, String prefix)
             throws SQLException {
-        String sql;
-        String currentUser = currentOracleUser(conn);
-        boolean hasSchema = schema != null && !schema.isBlank();
-        boolean currentUserSchema = hasSchema && schema.equalsIgnoreCase(currentUser);
-        String owner = (!hasSchema || currentUserSchema)
-            ? currentUser
-            : schema.toUpperCase(Locale.ROOT);
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
         String columnPattern = ((prefix == null || prefix.isBlank()) ? "" : prefix)
             .toUpperCase(Locale.ROOT) + "%";
-        if (!hasSchema || currentUserSchema) {
+        String sql;
+        if (os.useUserTables()) {
             sql = """
                 SELECT column_name, data_type, nullable, column_id
                 FROM user_tab_columns
@@ -410,10 +423,10 @@ public class Dispatcher {
         }
         List<Map<String, Object>> cols = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setQueryTimeout(5);
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
             int i = 1;
-            if (hasSchema && !currentUserSchema) {
-                ps.setString(i++, owner);
+            if (!os.useUserTables()) {
+                ps.setString(i++, os.owner());
             }
             ps.setString(i++, table.toUpperCase(Locale.ROOT));
             ps.setString(i, columnPattern);
@@ -435,23 +448,77 @@ public class Dispatcher {
         int connId    = getInt(req, "conn-id");
         String schema = (String) req.params.get("schema");
         String table  = getString(req, "table");
+        Connection conn = connMgr.get(connId);
+        List<String> pks = isOracle(conn)
+            ? getOraclePrimaryKeys(conn, schema, table)
+            : getJdbcMetadataPrimaryKeys(conn, schema, table);
+        return Response.ok(req.id, Map.of("primary-keys", pks));
+    }
 
-        DatabaseMetaData meta = connMgr.get(connId).getMetaData();
+    private List<String> getJdbcMetadataPrimaryKeys(Connection conn, String schema, String table)
+            throws SQLException {
         List<String> pks = new ArrayList<>();
-        try (ResultSet rs = meta.getPrimaryKeys(null, schema, table)) {
+        try (ResultSet rs = conn.getMetaData().getPrimaryKeys(null, schema, table)) {
             while (rs.next()) pks.add(rs.getString("COLUMN_NAME"));
         }
-        return Response.ok(req.id, Map.of("primary-keys", pks));
+        return pks;
+    }
+
+    private List<String> getOraclePrimaryKeys(Connection conn, String schema, String table)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql;
+        if (os.useUserTables()) {
+            sql = """
+                SELECT ucc.column_name
+                FROM user_constraints uc
+                JOIN user_cons_columns ucc ON uc.constraint_name = ucc.constraint_name
+                WHERE uc.constraint_type = 'P'
+                  AND uc.table_name = ?
+                ORDER BY ucc.position
+                """;
+        } else {
+            sql = """
+                SELECT acc.column_name
+                FROM all_constraints ac
+                JOIN all_cons_columns acc ON ac.constraint_name = acc.constraint_name
+                                         AND ac.owner = acc.owner
+                WHERE ac.constraint_type = 'P'
+                  AND ac.owner = ?
+                  AND ac.table_name = ?
+                ORDER BY acc.position
+                """;
+        }
+        List<String> pks = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            int i = 1;
+            if (!os.useUserTables()) {
+                ps.setString(i++, os.owner());
+            }
+            ps.setString(i, table.toUpperCase(Locale.ROOT));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) pks.add(rs.getString("column_name"));
+            }
+        }
+        return pks;
     }
 
     private Response getForeignKeys(Request req) throws SQLException {
         int connId    = getInt(req, "conn-id");
         String schema = (String) req.params.get("schema");
         String table  = getString(req, "table");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> fks = isOracle(conn)
+            ? getOracleForeignKeys(conn, schema, table)
+            : getJdbcMetadataForeignKeys(conn, schema, table);
+        return Response.ok(req.id, Map.of("foreign-keys", fks));
+    }
 
-        DatabaseMetaData meta = connMgr.get(connId).getMetaData();
+    private List<Map<String, Object>> getJdbcMetadataForeignKeys(Connection conn, String schema, String table)
+            throws SQLException {
         List<Map<String, Object>> fks = new ArrayList<>();
-        try (ResultSet rs = meta.getImportedKeys(null, schema, table)) {
+        try (ResultSet rs = conn.getMetaData().getImportedKeys(null, schema, table)) {
             while (rs.next()) {
                 fks.add(Map.of(
                     "fk-column",   rs.getString("FKCOLUMN_NAME"),
@@ -461,7 +528,68 @@ public class Dispatcher {
                 ));
             }
         }
-        return Response.ok(req.id, Map.of("foreign-keys", fks));
+        return fks;
+    }
+
+    private List<Map<String, Object>> getOracleForeignKeys(Connection conn, String schema, String table)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql;
+        if (os.useUserTables()) {
+            sql = """
+                SELECT ucc.column_name AS fk_column,
+                       ruc.table_name AS pk_table,
+                       ruc.owner AS pk_schema,
+                       rucc.column_name AS pk_column
+                FROM user_constraints uc
+                JOIN user_cons_columns ucc ON uc.constraint_name = ucc.constraint_name
+                JOIN all_constraints ruc ON uc.r_constraint_name = ruc.constraint_name
+                JOIN all_cons_columns rucc ON ruc.constraint_name = rucc.constraint_name
+                                          AND ruc.owner = rucc.owner
+                                          AND ucc.position = rucc.position
+                WHERE uc.constraint_type = 'R'
+                  AND uc.table_name = ?
+                ORDER BY ucc.position
+                """;
+        } else {
+            sql = """
+                SELECT acc.column_name AS fk_column,
+                       ruc.table_name AS pk_table,
+                       ruc.owner AS pk_schema,
+                       rucc.column_name AS pk_column
+                FROM all_constraints ac
+                JOIN all_cons_columns acc ON ac.constraint_name = acc.constraint_name
+                                         AND ac.owner = acc.owner
+                JOIN all_constraints ruc ON ac.r_constraint_name = ruc.constraint_name
+                JOIN all_cons_columns rucc ON ruc.constraint_name = rucc.constraint_name
+                                          AND ruc.owner = rucc.owner
+                                          AND acc.position = rucc.position
+                WHERE ac.constraint_type = 'R'
+                  AND ac.owner = ?
+                  AND ac.table_name = ?
+                ORDER BY acc.position
+                """;
+        }
+        List<Map<String, Object>> fks = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            int i = 1;
+            if (!os.useUserTables()) {
+                ps.setString(i++, os.owner());
+            }
+            ps.setString(i, table.toUpperCase(Locale.ROOT));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    fks.add(Map.of(
+                        "fk-column",  rs.getString("fk_column"),
+                        "pk-table",   rs.getString("pk_table"),
+                        "pk-schema",  Objects.toString(rs.getString("pk_schema"), ""),
+                        "pk-column",  rs.getString("pk_column")
+                    ));
+                }
+            }
+        }
+        return fks;
     }
 
     // -------------------------------------------------------------------------
@@ -500,5 +628,21 @@ public class Dispatcher {
         int bracket = user.indexOf('[');
         if (bracket >= 0) user = user.substring(0, bracket);
         return user.strip().toUpperCase(Locale.ROOT);
+    }
+
+    /**
+     * Captures the two decisions derived from a schema argument in Oracle methods:
+     * whether to query user_* views (vs all_*), and what owner string to bind.
+     */
+    private record OracleSchema(boolean useUserTables, String owner) {
+        static OracleSchema of(String currentUser, String schema) {
+            boolean hasSchema = schema != null && !schema.isBlank();
+            boolean currentUserSchema = hasSchema && schema.equalsIgnoreCase(currentUser);
+            boolean useUserTables = !hasSchema || currentUserSchema;
+            String owner = useUserTables
+                ? Objects.toString(currentUser, Objects.toString(schema, ""))
+                : schema.toUpperCase(Locale.ROOT);
+            return new OracleSchema(useUserTables, owner);
+        }
     }
 }
