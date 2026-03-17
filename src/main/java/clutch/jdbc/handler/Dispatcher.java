@@ -35,6 +35,7 @@ public class Dispatcher {
             case "disconnect"      -> disconnect(req);
             case "commit"          -> commit(req);
             case "rollback"        -> rollback(req);
+            case "set-auto-commit" -> setAutoCommit(req);
             case "execute"         -> execute(req);
             case "fetch"           -> fetch(req);
             case "close-cursor"    -> closeCursor(req);
@@ -98,6 +99,14 @@ public class Dispatcher {
         int connId = getInt(req, "conn-id");
         connMgr.get(connId).rollback();
         return Response.ok(req.id, Map.of("conn-id", connId));
+    }
+
+    private Response setAutoCommit(Request req) throws SQLException {
+        int connId = getInt(req, "conn-id");
+        Object autoCommitValue = req.params.get("auto-commit");
+        boolean autoCommit = autoCommitValue == null || Boolean.TRUE.equals(autoCommitValue);
+        connMgr.get(connId).setAutoCommit(autoCommit);
+        return Response.ok(req.id, Map.of("conn-id", connId, "auto-commit", autoCommit));
     }
 
     // -------------------------------------------------------------------------
