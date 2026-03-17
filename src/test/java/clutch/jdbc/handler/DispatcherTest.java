@@ -37,6 +37,7 @@ class DispatcherTest {
         req.params.put("props", Map.of("role", "reporting"));
         req.params.put("connect-timeout-seconds", 8);
         req.params.put("network-timeout-seconds", 9);
+        req.params.put("auto-commit", false);
 
         Response response = dispatcher.dispatch(req);
 
@@ -47,7 +48,64 @@ class DispatcherTest {
         assertEquals(Map.of("role", "reporting"), connMgr.props);
         assertEquals(8, connMgr.connectTimeoutSeconds);
         assertEquals(9, connMgr.networkTimeoutSeconds);
+        assertFalse(connMgr.autoCommit);
         assertEquals(42, ((Number) ((Map<?, ?>) response.result).get("conn-id")).intValue());
+    }
+
+    @Test
+    void commitCallsConnectionCommit() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        boolean[] committed = {false};
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "commit" -> {
+                    committed[0] = true;
+                    yield null;
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 7;
+        req.op = "commit";
+        req.params.put("conn-id", 7);
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(committed[0]);
+    }
+
+    @Test
+    void rollbackCallsConnectionRollback() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        boolean[] rolledBack = {false};
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "rollback" -> {
+                    rolledBack[0] = true;
+                    yield null;
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 8;
+        req.op = "rollback";
+        req.params.put("conn-id", 7);
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(rolledBack[0]);
     }
 
     @Test
@@ -242,17 +300,20 @@ class DispatcherTest {
         private Map<String, String> props;
         private Integer connectTimeoutSeconds;
         private Integer networkTimeoutSeconds;
+        private boolean autoCommit = true;
         private Connection connection;
 
         @Override
         public int connect(String url, String user, String password, Map<String, String> props,
-                           Integer connectTimeoutSeconds, Integer networkTimeoutSeconds) {
+                           Integer connectTimeoutSeconds, Integer networkTimeoutSeconds,
+                           boolean autoCommit) {
             this.url = url;
             this.user = user;
             this.password = password;
             this.props = props;
             this.connectTimeoutSeconds = connectTimeoutSeconds;
             this.networkTimeoutSeconds = networkTimeoutSeconds;
+            this.autoCommit = autoCommit;
             return 42;
         }
 

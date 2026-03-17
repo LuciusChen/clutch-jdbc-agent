@@ -28,7 +28,7 @@ class ConnectionManagerTest {
         try {
             ConnectionManager mgr = new ConnectionManager();
             int connId = mgr.connect("jdbc:test:demo", "scott", "tiger",
-                Map.of("role", "reporting"), 7, 11);
+                Map.of("role", "reporting"), 7, 11, true);
             assertEquals(1, connId);
             assertEquals(7, driver.seenLoginTimeout);
             assertEquals("scott", driver.seenProps.getProperty("user"));
@@ -44,10 +44,27 @@ class ConnectionManagerTest {
         }
     }
 
+    @Test
+    void connectDisablesAutoCommitWhenRequested() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager();
+            int connId = mgr.connect("jdbc:test:demo", "scott", "tiger",
+                Map.of(), null, null, false);
+            assertEquals(1, connId);
+            assertTrue(driver.autoCommitDisabled);
+            mgr.disconnect(connId);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
     private static final class RecordingDriver implements Driver {
         private int seenLoginTimeout = -1;
         private Properties seenProps;
         private int seenNetworkTimeoutMillis = -1;
+        private boolean autoCommitDisabled;
         private boolean closed;
 
         @Override
@@ -65,6 +82,10 @@ class ConnectionManagerTest {
                 (_proxy, method, args) -> switch (method.getName()) {
                     case "setNetworkTimeout" -> {
                         seenNetworkTimeoutMillis = (Integer) args[1];
+                        yield null;
+                    }
+                    case "setAutoCommit" -> {
+                        autoCommitDisabled = !((Boolean) args[0]);
                         yield null;
                     }
                     case "isClosed" -> closed;
