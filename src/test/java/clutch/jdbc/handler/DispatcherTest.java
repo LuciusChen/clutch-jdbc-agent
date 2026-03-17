@@ -212,6 +212,7 @@ class DispatcherTest {
             DispatcherTest.class.getClassLoader(),
             new Class<?>[]{Connection.class},
             (_proxy, method, _args) -> switch (method.getName()) {
+                case "isValid"         -> true;
                 case "createStatement" -> failingStmt;
                 case "unwrap"          -> null;
                 case "isWrapperFor"    -> false;
@@ -226,6 +227,32 @@ class DispatcherTest {
 
         assertThrows(java.sql.SQLException.class, () -> dispatcher.dispatch(req));
         assertTrue(closed[0], "statement must be closed when getResultSet() fails");
+    }
+
+    @Test
+    void executeReturnsErrorWhenConnectionIsInvalid() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "isValid"      -> false;   // dead connection
+                case "unwrap"       -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 19;
+        req.op = "execute";
+        req.params.put("conn-id", 7);
+        req.params.put("sql", "SELECT 1 FROM dual");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertFalse(response.ok);
+        assertNotNull(response.error);
+        assertTrue(response.error.contains("idle timeout"), "error should mention idle timeout: " + response.error);
     }
 
     @Test
@@ -252,6 +279,7 @@ class DispatcherTest {
             DispatcherTest.class.getClassLoader(),
             new Class<?>[]{Connection.class},
             (_proxy, method, _args) -> switch (method.getName()) {
+                case "isValid"         -> true;
                 case "createStatement" -> blockingStmt;
                 case "unwrap"          -> null;
                 case "isWrapperFor"    -> false;
@@ -297,6 +325,7 @@ class DispatcherTest {
             DispatcherTest.class.getClassLoader(),
             new Class<?>[]{Connection.class},
             (_proxy, method, _args) -> switch (method.getName()) {
+                case "isValid"         -> true;
                 case "createStatement" -> timedStmt;
                 case "unwrap"          -> null;
                 case "isWrapperFor"    -> false;
@@ -438,9 +467,10 @@ class DispatcherTest {
             DispatcherTest.class.getClassLoader(),
             new Class<?>[]{Connection.class},
             (_proxy, method, _args) -> switch (method.getName()) {
+                case "isValid"         -> true;
                 case "createStatement" -> stmt.proxy();
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
+                case "unwrap"          -> null;
+                case "isWrapperFor"    -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
     }

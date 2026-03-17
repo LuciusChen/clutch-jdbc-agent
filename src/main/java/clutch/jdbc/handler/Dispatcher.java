@@ -134,6 +134,9 @@ public class Dispatcher {
                                       ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
 
         Connection conn = connMgr.get(connId);
+        if (!conn.isValid(3))
+            return Response.error(req.id,
+                "Connection lost: the server closed the connection (idle timeout). Please reconnect.");
         Statement  stmt = conn.createStatement();
         stmt.setQueryTimeout(executeTimeout);   // Oracle-side cancel (belt)
 
