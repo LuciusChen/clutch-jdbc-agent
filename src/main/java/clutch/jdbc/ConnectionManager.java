@@ -44,7 +44,11 @@ public class ConnectionManager {
 
         Connection conn = openConnection(url, p, connectTimeoutSeconds);
         if (!autoCommit) {
-            conn.setAutoCommit(false);
+            try {
+                conn.setAutoCommit(false);
+            } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
+                // Driver does not support manual-commit mode; proceed with autocommit.
+            }
         }
         if (networkTimeoutSeconds != null && networkTimeoutSeconds > 0) {
             try {
