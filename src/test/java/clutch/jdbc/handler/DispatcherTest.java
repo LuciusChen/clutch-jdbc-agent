@@ -109,6 +109,66 @@ class DispatcherTest {
     }
 
     @Test
+    void setAutoCommitTrueCallsConnectionSetAutoCommit() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        Boolean[] capturedValue = {null};
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "setAutoCommit" -> {
+                    capturedValue[0] = (Boolean) args[0];
+                    yield null;
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 9;
+        req.op = "set-auto-commit";
+        req.params.put("conn-id", 7);
+        req.params.put("auto-commit", true);
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(capturedValue[0]);
+        assertEquals(true, ((Map<?, ?>) response.result).get("auto-commit"));
+    }
+
+    @Test
+    void setAutoCommitFalseCallsConnectionSetAutoCommit() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        Boolean[] capturedValue = {null};
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "setAutoCommit" -> {
+                    capturedValue[0] = (Boolean) args[0];
+                    yield null;
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 10;
+        req.op = "set-auto-commit";
+        req.params.put("conn-id", 7);
+        req.params.put("auto-commit", false);
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertFalse(capturedValue[0]);
+        assertEquals(false, ((Map<?, ?>) response.result).get("auto-commit"));
+    }
+
+    @Test
     void executeAppliesQueryTimeoutBeforeRunningStatement() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         RecordingStatementHandler stmt = new RecordingStatementHandler();
