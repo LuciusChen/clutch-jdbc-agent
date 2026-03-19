@@ -30,7 +30,7 @@ agent over a simple JSON protocol on stdin/stdout.
 mvn package
 ```
 
-Produces `target/clutch-jdbc-agent-0.1.7.jar` (fat jar with Jackson bundled).
+Produces `target/clutch-jdbc-agent-0.1.10.jar` (fat jar with Jackson bundled).
 JDBC driver jars are **not** bundled — they are loaded at runtime from a
 `drivers/` directory next to the jar.
 
@@ -97,8 +97,8 @@ Error response:
 | `fetch`           | Fetch next batch from an open cursor             |
 | `close-cursor`    | Close a cursor explicitly                        |
 | `get-schemas`     | List schemas via `DatabaseMetaData`              |
-| `get-tables`      | List tables/views in a schema                    |
-| `search-tables`   | Prefix-search tables/views for completion        |
+| `get-tables`      | List schema/browser tables; Oracle uses direct SQL over `user_*`, `user_synonyms`, and accessible `all_*` views |
+| `search-tables`   | Prefix-search tables/views for completion; Oracle also includes low-privilege synonym / accessible-owner paths, with system owners filtered in SQL except for `PUBLIC SYNONYM` |
 | `get-columns`     | List columns for a table                         |
 | `search-columns`  | Prefix-search columns for completion             |
 | `get-primary-keys`| List primary key columns                         |

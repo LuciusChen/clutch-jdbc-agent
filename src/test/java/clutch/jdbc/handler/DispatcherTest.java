@@ -11,6 +11,7 @@ import java.sql.DatabaseMetaData;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -402,6 +403,174 @@ class DispatcherTest {
     }
 
     @Test
+    void searchTablesUsesOracleAccessibleObjectPath() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        oracle.resultRows = List.of(
+            oracle.objectRow("ORDERS", "SYNONYM", "DATA_OWNER", "ZJSY"),
+            oracle.objectRow("ORDER_LOG", "TABLE", "REPORTING")
+        );
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 40;
+        req.op = "search-tables";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "ZJSY");
+        req.params.put("prefix", "or");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(oracle.lastSqlNormalized().contains("user_synonyms"),
+            "search-tables should consult user synonyms for current-user schema");
+        assertTrue(oracle.lastSqlNormalized().contains("all_tables"),
+            "search-tables should consult accessible tables outside the current schema");
+        assertTrue(oracle.lastSqlNormalized().toUpperCase().contains("OWNER NOT IN ('SYS', 'SYSTEM', 'XDB'"),
+            "search-tables should filter Oracle system owners in SQL");
+        assertEquals(List.of("ZJSY", "ZJSY", "OR%",
+                             "ZJSY", "ZJSY", "OR%",
+                             "ZJSY", "OR%",
+                             "ZJSY", "OR%",
+                             "ZJSY", "OR%",
+                             "OR%"),
+            oracle.params);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> tables = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("tables");
+        assertEquals(2, tables.size());
+        assertEquals("ORDERS", tables.get(0).get("name"));
+        assertEquals("DATA_OWNER", tables.get(0).get("schema"));
+        assertEquals("ZJSY", tables.get(0).get("source-schema"));
+    }
+
+    @Test
+    void searchTablesKeepsOraclePublicSynonymsForSystemOwners() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        oracle.resultRows = List.of(
+            oracle.objectRow("USER_TABLES", "PUBLIC SYNONYM", "SYS", "PUBLIC")
+        );
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 42;
+        req.op = "search-tables";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "APP");
+        req.params.put("prefix", "user_");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> tables = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("tables");
+        assertEquals(1, tables.size());
+        assertEquals("USER_TABLES", tables.get(0).get("name"));
+        assertEquals("PUBLIC SYNONYM", tables.get(0).get("type"));
+        assertEquals("SYS", tables.get(0).get("schema"));
+        assertEquals("PUBLIC", tables.get(0).get("source-schema"));
+    }
+
+    @Test
+    void getTablesUsesOracleAccessibleObjectPath() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        oracle.resultRows = List.of(
+            oracle.objectRow("CUSTOMERS", "SYNONYM", "DATA_OWNER", "ZJSY"),
+            oracle.objectRow("ORDERS", "SYNONYM", "DATA_OWNER", "ZJSY"),
+            oracle.objectRow("PAYMENTS", "TABLE", "DATA_OWNER", "DATA_OWNER")
+        );
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 43;
+        req.op = "get-tables";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "ZJSY");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(oracle.executedSqlsNormalized().stream()
+                       .anyMatch(sql -> sql.contains("user_synonyms")),
+            "get-tables should include user synonyms for current-user schema");
+        assertTrue(oracle.executedSqlsNormalized().stream()
+                       .anyMatch(sql -> sql.contains("all_tables")),
+            "get-tables should include accessible tables outside the current schema");
+        assertEquals(List.of("ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY"), oracle.params);
+        @SuppressWarnings("unchecked")
+        List<List<Object>> rows = (List<List<Object>>) ((Map<?, ?>) response.result).get("rows");
+        assertEquals(3, rows.size());
+        assertEquals(List.of("CUSTOMERS", "SYNONYM", "DATA_OWNER", "ZJSY"), rows.get(0));
+        assertEquals(List.of("ORDERS", "SYNONYM", "DATA_OWNER", "ZJSY"), rows.get(1));
+        assertEquals(List.of("PAYMENTS", "TABLE", "DATA_OWNER", "DATA_OWNER"), rows.get(2));
+    }
+
+    @Test
+    void searchColumnsFallsBackToResolvedOracleSynonym() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        oracle.setRowsForSql("""
+            SELECT column_name, data_type, nullable, column_id
+            FROM user_tab_columns
+            WHERE table_name = ?
+              AND column_name LIKE ?
+            ORDER BY column_id
+            """, List.of());
+        oracle.setRowsForSql("""
+            SELECT table_owner, table_name
+            FROM user_synonyms
+            WHERE synonym_name = ?
+            UNION ALL
+            SELECT table_owner, table_name
+            FROM all_synonyms
+            WHERE owner = 'PUBLIC'
+              AND synonym_name = ?
+            """, List.of(oracle.synonymRow("DATA_OWNER", "ORDERS")));
+        oracle.setRowsForSql("""
+            SELECT column_name, data_type, nullable, column_id
+            FROM all_tab_columns
+            WHERE owner = ?
+              AND table_name = ?
+              AND column_name LIKE ?
+            ORDER BY column_id
+            """, List.of(
+                oracle.row("PARA_ID", "NUMBER", "N", 1),
+                oracle.row("PARA_NAME", "VARCHAR2", "Y", 2)
+            ));
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 41;
+        req.op = "search-columns";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "ZJSY");
+        req.params.put("table", "orders");
+        req.params.put("prefix", "pa");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(oracle.executedSqlsNormalized().stream()
+                       .anyMatch(sql -> sql.contains("user_synonyms")),
+            "search-columns should resolve the synonym before loading columns");
+        assertEquals(
+            "SELECT column_name, data_type, nullable, column_id\n" +
+            "FROM all_tab_columns\n" +
+            "WHERE owner = ?\n" +
+            "  AND table_name = ?\n" +
+            "  AND column_name LIKE ?\n" +
+            "ORDER BY column_id",
+            oracle.lastSqlNormalized());
+        assertEquals(List.of("DATA_OWNER", "ORDERS", "PA%"), oracle.params);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> cols = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("columns");
+        assertEquals(2, cols.size());
+        assertEquals("PARA_ID", cols.get(0).get("name"));
+        assertEquals("PARA_NAME", cols.get(1).get("name"));
+    }
+
+    @Test
     void getPrimaryKeysUsesOracleFastPath() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
@@ -538,8 +707,10 @@ class DispatcherTest {
 
     private static final class OracleMetadataRecorder {
         private String sql;
+        private final List<String> sqlHistory = new ArrayList<>();
         private final List<String> params = new ArrayList<>();
         private int queryTimeoutSeconds;
+        private final Map<String, List<Map<String, Object>>> rowsBySql = new HashMap<>();
         List<Map<String, Object>> resultRows = List.of(
             row("PARA_ID", "NUMBER", "N", 1),
             row("PARA_NAME", "VARCHAR2", "Y", 2)
@@ -570,6 +741,7 @@ class DispatcherTest {
 
         private PreparedStatement preparedStatement(String sql) {
             this.sql = sql;
+            this.sqlHistory.add(sql);
             this.params.clear();
             return (PreparedStatement) Proxy.newProxyInstance(
                 DispatcherTest.class.getClassLoader(),
@@ -594,18 +766,38 @@ class DispatcherTest {
         }
 
         private ResultSet resultSet() {
-            List<Map<String, Object>> rows = this.resultRows;
+            List<Map<String, Object>> rows = rowsBySql.getOrDefault(lastSqlNormalized(), this.resultRows);
+            List<String> columnLabels = resultSetColumnLabels(rows);
             return (ResultSet) Proxy.newProxyInstance(
                 DispatcherTest.class.getClassLoader(),
                 new Class<?>[]{ResultSet.class},
                 new java.lang.reflect.InvocationHandler() {
                     int index = -1;
+                    Object lastValue;
                     @Override
                     public Object invoke(Object _proxy, java.lang.reflect.Method method, Object[] _args) {
                         return switch (method.getName()) {
                             case "next" -> ++index < rows.size();
-                            case "getString" -> rows.get(index).get((String) _args[0]);
+                            case "getString" -> {
+                                if (_args[0] instanceof Integer col) {
+                                    lastValue = resultSetValue(rows.get(index), columnLabels.get(col - 1));
+                                    yield lastValue;
+                                }
+                                lastValue = rows.get(index).get((String) _args[0]);
+                                yield lastValue;
+                            }
                             case "getInt" -> rows.get(index).get((String) _args[0]);
+                            case "getObject" -> {
+                                if (_args[0] instanceof Integer col) {
+                                    lastValue = resultSetValue(rows.get(index), columnLabels.get(col - 1));
+                                    yield lastValue;
+                                }
+                                lastValue = rows.get(index).get((String) _args[0]);
+                                yield lastValue;
+                            }
+                            case "wasNull" -> lastValue == null;
+                            case "getMetaData" -> resultSetMetaData(columnLabels);
+                            case "setFetchSize" -> null;
                             case "close" -> null;
                             case "unwrap" -> null;
                             case "isWrapperFor" -> false;
@@ -613,6 +805,37 @@ class DispatcherTest {
                         };
                     }
                 });
+        }
+
+        private ResultSetMetaData resultSetMetaData(List<String> columnLabels) {
+            return (ResultSetMetaData) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(),
+                new Class<?>[]{ResultSetMetaData.class},
+                (_proxy, method, args) -> switch (method.getName()) {
+                    case "getColumnCount" -> columnLabels.size();
+                    case "getColumnLabel" -> columnLabels.get(((Integer) args[0]) - 1);
+                    case "getColumnTypeName" -> "VARCHAR";
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+        }
+
+        private List<String> resultSetColumnLabels(List<Map<String, Object>> rows) {
+            if (rows.isEmpty()) return List.of();
+            Map<String, Object> row = rows.get(0);
+            if (row.containsKey("object_name")) return List.of("name", "type", "schema", "source_schema");
+            return new ArrayList<>(row.keySet());
+        }
+
+        private Object resultSetValue(Map<String, Object> row, String label) {
+            return switch (label) {
+                case "name" -> row.get("object_name");
+                case "type" -> row.get("object_type");
+                case "schema" -> row.get("owner");
+                case "source_schema" -> row.get("source_owner");
+                default -> row.get(label);
+            };
         }
 
         private Map<String, Object> row(String name, String type, String nullable, int position) {
@@ -624,7 +847,39 @@ class DispatcherTest {
             return row;
         }
 
+        private Map<String, Object> objectRow(String name, String type, String owner) {
+            return objectRow(name, type, owner, owner);
+        }
+
+        private Map<String, Object> objectRow(String name, String type, String owner, String sourceOwner) {
+            Map<String, Object> row = new HashMap<>();
+            row.put("object_name", name);
+            row.put("object_type", type);
+            row.put("owner", owner);
+            row.put("source_owner", sourceOwner);
+            return row;
+        }
+
+        private Map<String, Object> synonymRow(String owner, String table) {
+            Map<String, Object> row = new HashMap<>();
+            row.put("table_owner", owner);
+            row.put("table_name", table);
+            return row;
+        }
+
+        private void setRowsForSql(String sql, List<Map<String, Object>> rows) {
+            rowsBySql.put(normalizeSql(sql), rows);
+        }
+
         private String lastSqlNormalized() {
+            return normalizeSql(sql);
+        }
+
+        private List<String> executedSqlsNormalized() {
+            return sqlHistory.stream().map(this::normalizeSql).toList();
+        }
+
+        private String normalizeSql(String sql) {
             return sql.stripIndent().trim().replace("\r\n", "\n");
         }
     }
