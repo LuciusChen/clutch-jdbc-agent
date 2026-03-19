@@ -69,6 +69,17 @@ public class Dispatcher {
             case "search-columns"  -> searchColumns(req);
             case "get-primary-keys"-> getPrimaryKeys(req);
             case "get-foreign-keys"-> getForeignKeys(req);
+            case "get-referencing-objects" -> getReferencingObjects(req);
+            case "get-indexes"     -> getIndexes(req);
+            case "get-index-columns" -> getIndexColumns(req);
+            case "get-sequences"   -> getSequences(req);
+            case "get-procedures"  -> getProcedures(req);
+            case "get-functions"   -> getFunctions(req);
+            case "get-procedure-params" -> getProcedureParams(req);
+            case "get-function-params" -> getFunctionParams(req);
+            case "get-object-source" -> getObjectSource(req);
+            case "get-object-ddl"  -> getObjectDdl(req);
+            case "get-triggers"    -> getTriggers(req);
             default -> Response.error(req.id, "Unknown op: " + req.op);
         };
     }
@@ -367,7 +378,7 @@ public class Dispatcher {
 
     private List<Map<String, Object>> searchJdbcMetadataTables(Connection conn, String schema, String prefix)
             throws SQLException {
-        String[] types = { "TABLE", "VIEW" };
+        String[] types = { "TABLE", "VIEW", "SYNONYM" };
         String pattern = (prefix == null || prefix.isBlank()) ? "%" : prefix + "%";
         DatabaseMetaData meta = conn.getMetaData();
         List<Map<String, Object>> tables = new ArrayList<>();
@@ -435,6 +446,14 @@ public class Dispatcher {
                   SELECT view_name AS object_name, 'VIEW' AS object_type, owner
                   FROM all_views
                   WHERE owner = ? AND view_name LIKE ?
+                  UNION ALL
+                  SELECT synonym_name AS object_name, 'SYNONYM' AS object_type, owner
+                  FROM all_synonyms
+                  WHERE owner = ? AND synonym_name LIKE ?
+                  UNION ALL
+                  SELECT synonym_name AS object_name, 'SYNONYM' AS object_type, owner
+                  FROM all_synonyms
+                  WHERE owner = 'PUBLIC' AND synonym_name LIKE ?
                 )
                 ORDER BY object_name
                 """;
@@ -746,6 +765,36 @@ public class Dispatcher {
         return fks;
     }
 
+    private Response getReferencingObjects(Request req) throws SQLException {
+        int connId    = getInt(req, "conn-id");
+        String schema = (String) req.params.get("schema");
+        String table  = getString(req, "table");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> objects = isOracle(conn)
+            ? getOracleReferencingObjects(conn, schema, table)
+            : getJdbcMetadataReferencingObjects(conn, schema, table);
+        return Response.ok(req.id, Map.of("objects", objects));
+    }
+
+    private List<Map<String, Object>> getJdbcMetadataReferencingObjects(Connection conn, String schema, String table)
+            throws SQLException {
+        List<Map<String, Object>> objects = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        try (ResultSet rs = conn.getMetaData().getExportedKeys(null, schema, table)) {
+            while (rs.next()) {
+                String name = rs.getString("FKTABLE_NAME");
+                if (name == null || !seen.add(Objects.toString(rs.getString("FKTABLE_SCHEM"), "") + "\u0000" + name)) {
+                    continue;
+                }
+                objects.add(Map.of(
+                    "name", name,
+                    "schema", Objects.toString(rs.getString("FKTABLE_SCHEM"), "")
+                ));
+            }
+        }
+        return objects;
+    }
+
     private List<Map<String, Object>> getOracleForeignKeys(Connection conn, String schema, String table)
             throws SQLException {
         OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
@@ -807,9 +856,874 @@ public class Dispatcher {
         return fks;
     }
 
+    private List<Map<String, Object>> getOracleReferencingObjects(Connection conn, String schema, String table)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql;
+        if (os.useUserTables()) {
+            sql = """
+                SELECT DISTINCT ac.table_name AS name,
+                                USER AS schema
+                FROM user_constraints uc
+                JOIN user_constraints ac
+                  ON ac.r_constraint_name = uc.constraint_name
+                WHERE uc.constraint_type IN ('P', 'U')
+                  AND uc.table_name = ?
+                  AND ac.constraint_type = 'R'
+                ORDER BY ac.table_name
+                """;
+        } else {
+            sql = """
+                SELECT DISTINCT ac.table_name AS name,
+                                ac.owner AS schema
+                FROM all_constraints uc
+                JOIN all_constraints ac
+                  ON ac.r_constraint_name = uc.constraint_name
+                 AND ac.r_owner = uc.owner
+                WHERE uc.owner = ?
+                  AND uc.constraint_type IN ('P', 'U')
+                  AND uc.table_name = ?
+                  AND ac.owner = ?
+                  AND ac.constraint_type = 'R'
+                ORDER BY ac.owner, ac.table_name
+                """;
+        }
+        List<Map<String, Object>> objects = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            int i = 1;
+            if (!os.useUserTables()) {
+                ps.setString(i++, os.owner());
+            }
+            ps.setString(i, table.toUpperCase(Locale.ROOT));
+            if (!os.useUserTables()) {
+                ps.setString(++i, os.owner());
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    objects.add(Map.of(
+                        "name", rs.getString("name"),
+                        "schema", Objects.toString(rs.getString("schema"), "")
+                    ));
+                }
+            }
+        }
+        return objects;
+    }
+
+    private Response getIndexes(Request req) throws SQLException {
+        int connId    = getInt(req, "conn-id");
+        String schema = (String) req.params.get("schema");
+        String table  = getOptionalString(req, "table");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> indexes = isOracle(conn)
+            ? getOracleIndexes(conn, schema, table)
+            : getJdbcIndexes(conn, schema, table);
+        return Response.ok(req.id, Map.of("indexes", indexes));
+    }
+
+    private List<Map<String, Object>> getJdbcMetadataTables(Connection conn, String schema)
+            throws SQLException {
+        String[] types = { "TABLE", "VIEW", "SYNONYM" };
+        DatabaseMetaData meta = conn.getMetaData();
+        List<Map<String, Object>> tables = new ArrayList<>();
+        try (ResultSet rs = meta.getTables(null, schema, "%", types)) {
+            while (rs.next()) {
+                String tableSchema = Objects.toString(rs.getString("TABLE_SCHEM"), "");
+                tables.add(entryMap(
+                    "name", rs.getString("TABLE_NAME"),
+                    "type", rs.getString("TABLE_TYPE"),
+                    "schema", tableSchema,
+                    "source-schema", tableSchema
+                ));
+            }
+        }
+        return tables;
+    }
+
+    private List<Map<String, Object>> getOracleIndexes(Connection conn, String schema, String table)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql;
+        if (os.useUserTables()) {
+            sql = """
+                SELECT index_name, table_name, uniqueness
+                FROM user_indexes
+                WHERE index_type IN ('NORMAL', 'BITMAP', 'FUNCTION-BASED NORMAL')
+                  AND (? IS NULL OR table_name = ?)
+                ORDER BY table_name, index_name
+                """;
+        } else {
+            sql = """
+                SELECT index_name, table_name, uniqueness, owner
+                FROM all_indexes
+                WHERE owner = ?
+                  AND index_type IN ('NORMAL', 'BITMAP', 'FUNCTION-BASED NORMAL')
+                  AND (? IS NULL OR table_name = ?)
+                ORDER BY table_name, index_name
+                """;
+        }
+        List<Map<String, Object>> indexes = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            int i = 1;
+            if (!os.useUserTables()) {
+                ps.setString(i++, os.owner());
+            }
+            String tableName = table == null ? null : table.toUpperCase(Locale.ROOT);
+            ps.setString(i++, tableName);
+            ps.setString(i, tableName);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    indexes.add(entryMap(
+                        "name", rs.getString("index_name"),
+                        "type", "INDEX",
+                        "schema", os.owner(),
+                        "source-schema", os.owner(),
+                        "table", rs.getString("table_name"),
+                        "unique", "UNIQUE".equalsIgnoreCase(rs.getString("uniqueness"))
+                    ));
+                }
+            }
+        }
+        return indexes;
+    }
+
+    private List<Map<String, Object>> getJdbcIndexes(Connection conn, String schema, String table)
+            throws SQLException {
+        DatabaseMetaData meta = conn.getMetaData();
+        List<Map<String, Object>> indexes = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        List<String> tables = table == null
+            ? getJdbcMetadataTables(conn, schema).stream()
+                .filter(entry -> "TABLE".equalsIgnoreCase(Objects.toString(entry.get("type"), "")))
+                .map(entry -> Objects.toString(entry.get("name"), ""))
+                .toList()
+            : List.of(table);
+        for (String tableName : tables) {
+            try (ResultSet rs = meta.getIndexInfo(null, schema, tableName, false, true)) {
+                while (rs.next()) {
+                    short type = rs.getShort("TYPE");
+                    String indexName = rs.getString("INDEX_NAME");
+                    if (type == DatabaseMetaData.tableIndexStatistic || indexName == null) {
+                        continue;
+                    }
+                    String key = tableName + "\u0000" + indexName;
+                    if (seen.add(key)) {
+                        indexes.add(entryMap(
+                            "name", indexName,
+                            "type", "INDEX",
+                            "schema", schema,
+                            "source-schema", schema,
+                            "table", rs.getString("TABLE_NAME"),
+                            "unique", !rs.getBoolean("NON_UNIQUE")
+                        ));
+                    }
+                }
+            }
+        }
+        return indexes;
+    }
+
+    private Response getIndexColumns(Request req) throws SQLException {
+        int connId    = getInt(req, "conn-id");
+        String schema = (String) req.params.get("schema");
+        String index  = getString(req, "index");
+        String table  = getOptionalString(req, "table");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> columns = isOracle(conn)
+            ? getOracleIndexColumns(conn, schema, index)
+            : getJdbcIndexColumns(conn, schema, index, table);
+        return Response.ok(req.id, Map.of("columns", columns));
+    }
+
+    private List<Map<String, Object>> getOracleIndexColumns(Connection conn, String schema, String index)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql;
+        if (os.useUserTables()) {
+            sql = """
+                SELECT column_name, column_position, descend
+                FROM user_ind_columns
+                WHERE index_name = ?
+                ORDER BY column_position
+                """;
+        } else {
+            sql = """
+                SELECT column_name, column_position, descend
+                FROM all_ind_columns
+                WHERE index_owner = ?
+                  AND index_name = ?
+                ORDER BY column_position
+                """;
+        }
+        List<Map<String, Object>> columns = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            int i = 1;
+            if (!os.useUserTables()) {
+                ps.setString(i++, os.owner());
+            }
+            ps.setString(i, index.toUpperCase(Locale.ROOT));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    columns.add(entryMap(
+                        "name", rs.getString("column_name"),
+                        "position", rs.getInt("column_position"),
+                        "descend", rs.getString("descend")
+                    ));
+                }
+            }
+        }
+        return columns;
+    }
+
+    private List<Map<String, Object>> getJdbcIndexColumns(Connection conn, String schema,
+                                                          String index, String table)
+            throws SQLException {
+        DatabaseMetaData meta = conn.getMetaData();
+        List<Map<String, Object>> columns = new ArrayList<>();
+        List<String> tables = table == null
+            ? getJdbcIndexes(conn, schema, null).stream()
+                .filter(entry -> index.equalsIgnoreCase(Objects.toString(entry.get("name"), "")))
+                .map(entry -> Objects.toString(entry.get("table"), ""))
+                .filter(name -> !name.isBlank())
+                .distinct()
+                .toList()
+            : List.of(table);
+        for (String tableName : tables) {
+            try (ResultSet rs = meta.getIndexInfo(null, schema, tableName, false, true)) {
+                while (rs.next()) {
+                    short type = rs.getShort("TYPE");
+                    String indexName = rs.getString("INDEX_NAME");
+                    if (type == DatabaseMetaData.tableIndexStatistic
+                        || indexName == null
+                        || !index.equalsIgnoreCase(indexName)) {
+                        continue;
+                    }
+                    columns.add(entryMap(
+                        "name", rs.getString("COLUMN_NAME"),
+                        "position", rs.getInt("ORDINAL_POSITION"),
+                        "descend", switch (Objects.toString(rs.getString("ASC_OR_DESC"), "")) {
+                            case "D" -> "DESC";
+                            default -> "ASC";
+                        }
+                    ));
+                }
+            }
+        }
+        columns.sort(Comparator.comparingInt(col -> ((Number) col.get("position")).intValue()));
+        return columns;
+    }
+
+    private Response getSequences(Request req) throws SQLException {
+        int connId    = getInt(req, "conn-id");
+        String schema = (String) req.params.get("schema");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> sequences = isOracle(conn)
+            ? getOracleSequences(conn, schema)
+            : getDialectSequences(conn, schema);
+        return Response.ok(req.id, Map.of("sequences", sequences));
+    }
+
+    private List<Map<String, Object>> getOracleSequences(Connection conn, String schema)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql;
+        if (os.useUserTables()) {
+            sql = """
+                SELECT sequence_name, min_value, max_value, increment_by, last_number
+                FROM user_sequences
+                ORDER BY sequence_name
+                """;
+        } else {
+            sql = """
+                SELECT sequence_name, min_value, max_value, increment_by, last_number
+                FROM all_sequences
+                WHERE sequence_owner = ?
+                ORDER BY sequence_name
+                """;
+        }
+        List<Map<String, Object>> sequences = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            if (!os.useUserTables()) {
+                ps.setString(1, os.owner());
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    sequences.add(entryMap(
+                        "name", rs.getString("sequence_name"),
+                        "type", "SEQUENCE",
+                        "schema", os.owner(),
+                        "source-schema", os.owner(),
+                        "min", rs.getObject("min_value"),
+                        "max", rs.getObject("max_value"),
+                        "increment", rs.getObject("increment_by"),
+                        "last", rs.getObject("last_number")
+                    ));
+                }
+            }
+        }
+        return sequences;
+    }
+
+    private List<Map<String, Object>> getDialectSequences(Connection conn, String schema)
+            throws SQLException {
+        String product = conn.getMetaData().getDatabaseProductName().toLowerCase(Locale.ROOT);
+        if (product.contains("postgres")) {
+            String effectiveSchema = (schema == null || schema.isBlank()) ? "current_schema()" : "?";
+            String sql = """
+                SELECT sequencename, min_value, max_value, increment_by, last_value
+                FROM pg_sequences
+                WHERE schemaname = %s
+                ORDER BY sequencename
+                """.formatted(effectiveSchema);
+            List<Map<String, Object>> sequences = new ArrayList<>();
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+                if (!"current_schema()".equals(effectiveSchema)) {
+                    ps.setString(1, schema);
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        sequences.add(entryMap(
+                            "name", rs.getString("sequencename"),
+                            "type", "SEQUENCE",
+                            "schema", schema,
+                            "source-schema", schema,
+                            "min", rs.getObject("min_value"),
+                            "max", rs.getObject("max_value"),
+                            "increment", rs.getObject("increment_by"),
+                            "last", rs.getObject("last_value")
+                        ));
+                    }
+                }
+            }
+            return sequences;
+        }
+        return List.of();
+    }
+
+    private Response getProcedures(Request req) throws SQLException {
+        int connId    = getInt(req, "conn-id");
+        String schema = (String) req.params.get("schema");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> procedures = isOracle(conn)
+            ? getOracleRoutines(conn, schema, "PROCEDURE")
+            : getJdbcRoutines(conn, schema, true);
+        return Response.ok(req.id, Map.of("procedures", procedures));
+    }
+
+    private Response getFunctions(Request req) throws SQLException {
+        int connId    = getInt(req, "conn-id");
+        String schema = (String) req.params.get("schema");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> functions = isOracle(conn)
+            ? getOracleRoutines(conn, schema, "FUNCTION")
+            : getJdbcRoutines(conn, schema, false);
+        return Response.ok(req.id, Map.of("functions", functions));
+    }
+
+    private List<Map<String, Object>> getOracleRoutines(Connection conn, String schema, String type)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql;
+        if (os.useUserTables()) {
+            sql = """
+                SELECT object_name, status
+                FROM user_objects
+                WHERE object_type = ?
+                ORDER BY object_name
+                """;
+        } else {
+            sql = """
+                SELECT object_name, status
+                FROM all_objects
+                WHERE owner = ?
+                  AND object_type = ?
+                ORDER BY object_name
+                """;
+        }
+        List<Map<String, Object>> routines = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            int i = 1;
+            if (!os.useUserTables()) {
+                ps.setString(i++, os.owner());
+            }
+            ps.setString(i, type);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    routines.add(entryMap(
+                        "name", rs.getString("object_name"),
+                        "type", type,
+                        "schema", os.owner(),
+                        "source-schema", os.owner(),
+                        "status", rs.getString("status")
+                    ));
+                }
+            }
+        }
+        return routines;
+    }
+
+    private List<Map<String, Object>> getJdbcRoutines(Connection conn, String schema, boolean procedures)
+            throws SQLException {
+        DatabaseMetaData meta = conn.getMetaData();
+        List<Map<String, Object>> routines = new ArrayList<>();
+        try (ResultSet rs = procedures
+                ? meta.getProcedures(null, schema, "%")
+                : meta.getFunctions(null, schema, "%")) {
+            while (rs.next()) {
+                String name = procedures
+                    ? rs.getString("PROCEDURE_NAME")
+                    : rs.getString("FUNCTION_NAME");
+                String specificName = rs.getString("SPECIFIC_NAME");
+                routines.add(entryMap(
+                    "name", name,
+                    "type", procedures ? "PROCEDURE" : "FUNCTION",
+                    "schema", Objects.toString(schema, ""),
+                    "source-schema", Objects.toString(schema, ""),
+                    "identity", specificName == null ? null : "SPECIFIC_NAME:" + specificName
+                ));
+            }
+        }
+        return routines;
+    }
+
+    private Response getProcedureParams(Request req) throws SQLException {
+        int connId     = getInt(req, "conn-id");
+        String schema  = (String) req.params.get("schema");
+        String name    = getString(req, "name");
+        String identity = getOptionalString(req, "identity");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> params = isOracle(conn)
+            ? getOracleRoutineParams(conn, schema, name)
+            : getJdbcRoutineParams(conn, schema, name, identity, true);
+        return Response.ok(req.id, Map.of("params", params));
+    }
+
+    private Response getFunctionParams(Request req) throws SQLException {
+        int connId     = getInt(req, "conn-id");
+        String schema  = (String) req.params.get("schema");
+        String name    = getString(req, "name");
+        String identity = getOptionalString(req, "identity");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> params = isOracle(conn)
+            ? getOracleRoutineParams(conn, schema, name)
+            : getJdbcRoutineParams(conn, schema, name, identity, false);
+        return Response.ok(req.id, Map.of("params", params));
+    }
+
+    private List<Map<String, Object>> getOracleRoutineParams(Connection conn, String schema, String name)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql;
+        if (os.useUserTables()) {
+            sql = """
+                SELECT argument_name, data_type, in_out, position
+                FROM user_arguments
+                WHERE object_name = ?
+                  AND package_name IS NULL
+                ORDER BY position
+                """;
+        } else {
+            sql = """
+                SELECT argument_name, data_type, in_out, position
+                FROM all_arguments
+                WHERE owner = ?
+                  AND object_name = ?
+                  AND package_name IS NULL
+                ORDER BY position
+                """;
+        }
+        List<Map<String, Object>> params = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            int i = 1;
+            if (!os.useUserTables()) {
+                ps.setString(i++, os.owner());
+            }
+            ps.setString(i, name.toUpperCase(Locale.ROOT));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    int position = rs.getInt("position");
+                    params.add(entryMap(
+                        "name", rs.getString("argument_name"),
+                        "type", rs.getString("data_type"),
+                        "mode", position == 0 ? "RETURN" : rs.getString("in_out"),
+                        "position", position
+                    ));
+                }
+            }
+        }
+        return params;
+    }
+
+    private List<Map<String, Object>> getJdbcRoutineParams(Connection conn, String schema, String name,
+                                                           String identity, boolean procedures)
+            throws SQLException {
+        DatabaseMetaData meta = conn.getMetaData();
+        List<Map<String, Object>> params = new ArrayList<>();
+        String specificName = specificNameFromIdentity(identity);
+        try (ResultSet rs = procedures
+                ? meta.getProcedureColumns(null, schema, name, "%")
+                : meta.getFunctionColumns(null, schema, name, "%")) {
+            while (rs.next()) {
+                if (specificName != null
+                    && !specificName.equals(Objects.toString(rs.getString("SPECIFIC_NAME"), ""))) {
+                    continue;
+                }
+                int columnType = rs.getInt("COLUMN_TYPE");
+                params.add(entryMap(
+                    "name", rs.getString("COLUMN_NAME"),
+                    "type", rs.getString("TYPE_NAME"),
+                    "mode", routinesColumnMode(columnType, procedures),
+                    "position", rs.getInt("ORDINAL_POSITION")
+                ));
+            }
+        }
+        return params;
+    }
+
+    private Response getObjectSource(Request req) throws SQLException {
+        int connId      = getInt(req, "conn-id");
+        String schema   = (String) req.params.get("schema");
+        String name     = getString(req, "name");
+        String type     = getString(req, "type");
+        String identity = getOptionalString(req, "identity");
+        Connection conn = connMgr.get(connId);
+        String source = isOracle(conn)
+            ? getOracleObjectSource(conn, schema, name, type)
+            : getDialectObjectSource(conn, schema, name, type, identity);
+        return Response.ok(req.id, entryMap("source", source));
+    }
+
+    private Response getObjectDdl(Request req) throws SQLException {
+        int connId      = getInt(req, "conn-id");
+        String schema   = (String) req.params.get("schema");
+        String name     = getString(req, "name");
+        String type     = getString(req, "type");
+        String identity = getOptionalString(req, "identity");
+        Connection conn = connMgr.get(connId);
+        String ddl = isOracle(conn)
+            ? getOracleObjectDdl(conn, schema, name, type)
+            : getDialectObjectDdl(conn, schema, name, type, identity);
+        return Response.ok(req.id, entryMap("ddl", ddl));
+    }
+
+    private String getOracleObjectSource(Connection conn, String schema, String name, String type)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql;
+        if (os.useUserTables()) {
+            sql = """
+                SELECT text
+                FROM user_source
+                WHERE name = ? AND type = ?
+                ORDER BY line
+                """;
+        } else {
+            sql = """
+                SELECT text
+                FROM all_source
+                WHERE owner = ? AND name = ? AND type = ?
+                ORDER BY line
+                """;
+        }
+        StringBuilder source = new StringBuilder();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            int i = 1;
+            if (!os.useUserTables()) {
+                ps.setString(i++, os.owner());
+            }
+            ps.setString(i++, name.toUpperCase(Locale.ROOT));
+            ps.setString(i, type.toUpperCase(Locale.ROOT));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    source.append(Objects.toString(rs.getString("text"), ""));
+                }
+            }
+        }
+        return source.length() == 0 ? null : source.toString();
+    }
+
+    private String getOracleObjectDdl(Connection conn, String schema, String name, String type)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        try (PreparedStatement ps =
+                 conn.prepareStatement("SELECT DBMS_METADATA.GET_DDL(?, ?, ?) FROM DUAL")) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            ps.setString(1, type.toUpperCase(Locale.ROOT));
+            ps.setString(2, name.toUpperCase(Locale.ROOT));
+            ps.setString(3, os.owner());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return null;
+                }
+                return readLargeText(rs, 1);
+            }
+        }
+    }
+
+    private String getDialectObjectSource(Connection conn, String schema, String name,
+                                          String type, String identity)
+            throws SQLException {
+        String product = conn.getMetaData().getDatabaseProductName().toLowerCase(Locale.ROOT);
+        if (!product.contains("postgres")) {
+            return null;
+        }
+        String oid = oidFromIdentity(identity);
+        if (oid == null) {
+            return null;
+        }
+        String sql = switch (type.toUpperCase(Locale.ROOT)) {
+            case "PROCEDURE", "FUNCTION" ->
+                "SELECT pg_get_functiondef(?::oid)";
+            case "TRIGGER" ->
+                "SELECT pg_get_triggerdef(?::oid, true)";
+            default -> null;
+        };
+        if (sql == null) {
+            return null;
+        }
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, oid);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    private String getDialectObjectDdl(Connection conn, String schema, String name,
+                                       String type, String identity)
+            throws SQLException {
+        String product = conn.getMetaData().getDatabaseProductName().toLowerCase(Locale.ROOT);
+        if (!product.contains("postgres")) {
+            return null;
+        }
+        return switch (type.toUpperCase(Locale.ROOT)) {
+            case "INDEX" -> querySingleString(
+                conn,
+                "SELECT pg_get_indexdef(i.oid) " +
+                    "FROM pg_class i JOIN pg_namespace n ON n.oid = i.relnamespace " +
+                    "WHERE i.relkind = 'i' AND i.relname = ? AND n.nspname = current_schema()",
+                name);
+            case "VIEW" -> querySingleString(
+                conn,
+                "SELECT 'CREATE OR REPLACE VIEW ' || quote_ident(viewname) || E' AS\\n' || " +
+                    "pg_get_viewdef((quote_ident(schemaname) || ''.'' || quote_ident(viewname))::regclass, true) " +
+                    "FROM pg_views WHERE schemaname = current_schema() AND viewname = ?",
+                name);
+            case "SEQUENCE" -> querySingleString(
+                conn,
+                "SELECT format('CREATE SEQUENCE %I.%I INCREMENT BY %s MINVALUE %s MAXVALUE %s START WITH %s;', " +
+                    "schemaname, sequencename, increment_by, min_value, max_value, start_value) " +
+                    "FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = ?",
+                name);
+            case "TRIGGER" -> getDialectObjectSource(conn, schema, name, type, identity);
+            default -> null;
+        };
+    }
+
+    private String querySingleString(Connection conn, String sql, String value) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, value);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    private String readLargeText(ResultSet rs, int column) throws SQLException {
+        Clob clob = rs.getClob(column);
+        if (clob != null) {
+            try (java.io.Reader reader = clob.getCharacterStream()) {
+                StringBuilder text = new StringBuilder();
+                char[] buffer = new char[4096];
+                int n;
+                while ((n = reader.read(buffer)) != -1) {
+                    text.append(buffer, 0, n);
+                }
+                return text.toString();
+            } catch (java.io.IOException e) {
+                throw new SQLException("Failed reading CLOB", e);
+            }
+        }
+        return rs.getString(column);
+    }
+
+    private Response getTriggers(Request req) throws SQLException {
+        int connId    = getInt(req, "conn-id");
+        String schema = (String) req.params.get("schema");
+        String table  = getOptionalString(req, "table");
+        Connection conn = connMgr.get(connId);
+        List<Map<String, Object>> triggers = isOracle(conn)
+            ? getOracleTriggers(conn, schema, table)
+            : getDialectTriggers(conn, schema, table);
+        return Response.ok(req.id, Map.of("triggers", triggers));
+    }
+
+    private List<Map<String, Object>> getOracleTriggers(Connection conn, String schema, String table)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql;
+        if (os.useUserTables()) {
+            sql = """
+                SELECT trigger_name, table_name, triggering_event, trigger_type, status
+                FROM user_triggers
+                WHERE (? IS NULL OR table_name = ?)
+                ORDER BY table_name, trigger_name
+                """;
+        } else {
+            sql = """
+                SELECT trigger_name, table_name, triggering_event, trigger_type, status
+                FROM all_triggers
+                WHERE owner = ?
+                  AND (? IS NULL OR table_name = ?)
+                ORDER BY table_name, trigger_name
+                """;
+        }
+        List<Map<String, Object>> triggers = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            int i = 1;
+            if (!os.useUserTables()) {
+                ps.setString(i++, os.owner());
+            }
+            String tableName = table == null ? null : table.toUpperCase(Locale.ROOT);
+            ps.setString(i++, tableName);
+            ps.setString(i, tableName);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    triggers.add(entryMap(
+                        "name", rs.getString("trigger_name"),
+                        "type", "TRIGGER",
+                        "schema", os.owner(),
+                        "source-schema", os.owner(),
+                        "table", rs.getString("table_name"),
+                        "event", rs.getString("triggering_event"),
+                        "timing", rs.getString("trigger_type"),
+                        "status", rs.getString("status")
+                    ));
+                }
+            }
+        }
+        return triggers;
+    }
+
+    private List<Map<String, Object>> getDialectTriggers(Connection conn, String schema, String table)
+            throws SQLException {
+        String product = conn.getMetaData().getDatabaseProductName().toLowerCase(Locale.ROOT);
+        if (product.contains("postgres")) {
+            return getPostgresTriggers(conn, schema, table);
+        }
+        if (product.contains("mysql")) {
+            return getMySqlTriggers(conn, schema, table);
+        }
+        return List.of();
+    }
+
+    private List<Map<String, Object>> getPostgresTriggers(Connection conn, String schema, String table)
+            throws SQLException {
+        String effectiveSchema = (schema == null || schema.isBlank()) ? "current_schema()" : "?";
+        String sql = """
+            SELECT t.trigger_name, t.event_object_table, t.event_manipulation,
+                   t.action_timing, pg_t.oid
+            FROM information_schema.triggers t
+            JOIN pg_class c ON c.relname = t.event_object_table
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_trigger pg_t ON pg_t.tgrelid = c.oid
+                                AND pg_t.tgname = t.trigger_name
+            WHERE t.trigger_schema = %s
+              AND NOT pg_t.tgisinternal
+              AND (? IS NULL OR t.event_object_table = ?)
+            ORDER BY t.event_object_table, t.trigger_name
+            """.formatted(effectiveSchema);
+        Map<String, Map<String, Object>> grouped = new LinkedHashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            int i = 1;
+            if (!"current_schema()".equals(effectiveSchema)) {
+                ps.setString(i++, schema);
+            }
+            ps.setString(i++, table);
+            ps.setString(i, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String key = rs.getString("trigger_name") + "\u0000" + rs.getString("event_object_table");
+                    Map<String, Object> trigger = grouped.get(key);
+                    if (trigger == null) {
+                        trigger = entryMap(
+                            "name", rs.getString("trigger_name"),
+                            "type", "TRIGGER",
+                            "schema", schema,
+                            "source-schema", schema,
+                            "table", rs.getString("event_object_table"),
+                            "timing", rs.getString("action_timing"),
+                            "status", "ENABLED",
+                            "identity", "OID:" + rs.getLong("oid"),
+                            "event", rs.getString("event_manipulation")
+                        );
+                        grouped.put(key, trigger);
+                    }
+                    String existing = Objects.toString(trigger.get("event"), "");
+                    String event = rs.getString("event_manipulation");
+                    if (!existing.contains(event)) {
+                        trigger.put("event", existing.isBlank() ? event : existing + " OR " + event);
+                    }
+                }
+            }
+        }
+        return new ArrayList<>(grouped.values());
+    }
+
+    private List<Map<String, Object>> getMySqlTriggers(Connection conn, String schema, String table)
+            throws SQLException {
+        String sql = """
+            SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, EVENT_MANIPULATION, ACTION_TIMING
+            FROM INFORMATION_SCHEMA.TRIGGERS
+            WHERE TRIGGER_SCHEMA = DATABASE()
+              AND (? IS NULL OR EVENT_OBJECT_TABLE = ?)
+            ORDER BY EVENT_OBJECT_TABLE, TRIGGER_NAME
+            """;
+        List<Map<String, Object>> triggers = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, table);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    triggers.add(entryMap(
+                        "name", rs.getString("TRIGGER_NAME"),
+                        "type", "TRIGGER",
+                        "schema", schema,
+                        "source-schema", schema,
+                        "table", rs.getString("EVENT_OBJECT_TABLE"),
+                        "event", rs.getString("EVENT_MANIPULATION"),
+                        "timing", rs.getString("ACTION_TIMING"),
+                        "status", "ENABLED"
+                    ));
+                }
+            }
+        }
+        return triggers;
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    private Map<String, Object> entryMap(Object... kvs) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        for (int i = 0; i < kvs.length; i += 2) {
+            Object value = kvs[i + 1];
+            if (value != null) {
+                map.put((String) kvs[i], value);
+            }
+        }
+        return map;
+    }
 
     private int getInt(Request req, String key) {
         Object v = req.params.get(key);
@@ -823,11 +1737,53 @@ public class Dispatcher {
         throw new IllegalArgumentException("Missing or non-string param: " + key);
     }
 
+    private String getOptionalString(Request req, String key) {
+        Object v = req.params.get(key);
+        if (v == null) return null;
+        if (v instanceof String s) return s;
+        throw new IllegalArgumentException("Non-string param: " + key);
+    }
+
     private Integer getOptionalInt(Request req, String key) {
         Object v = req.params.get(key);
         if (v == null) return null;
         if (v instanceof Number n) return n.intValue();
         throw new IllegalArgumentException("Non-integer param: " + key);
+    }
+
+    private String routinesColumnMode(int columnType, boolean procedures) {
+        if (columnType == DatabaseMetaData.procedureColumnIn
+            || columnType == DatabaseMetaData.functionColumnIn) {
+            return "IN";
+        }
+        if (columnType == DatabaseMetaData.procedureColumnInOut
+            || columnType == DatabaseMetaData.functionColumnInOut) {
+            return "INOUT";
+        }
+        if (columnType == DatabaseMetaData.procedureColumnOut
+            || columnType == DatabaseMetaData.functionColumnOut) {
+            return "OUT";
+        }
+        if (columnType == DatabaseMetaData.procedureColumnReturn
+            || columnType == DatabaseMetaData.functionReturn
+            || columnType == DatabaseMetaData.functionColumnResult) {
+            return "RETURN";
+        }
+        return "IN";
+    }
+
+    private String specificNameFromIdentity(String identity) {
+        if (identity == null || !identity.startsWith("SPECIFIC_NAME:")) {
+            return null;
+        }
+        return identity.substring("SPECIFIC_NAME:".length());
+    }
+
+    private String oidFromIdentity(String identity) {
+        if (identity == null || !identity.startsWith("OID:")) {
+            return null;
+        }
+        return identity.substring("OID:".length());
     }
 
     private boolean isOracle(Connection conn) throws SQLException {

@@ -379,6 +379,31 @@ class DispatcherTest {
     }
 
     @Test
+    void getTablesIncludesOracleSynonyms() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        oracle.resultRows = List.of(
+            oracle.objectRow("USER_SYM", "SYNONYM", "APP", "ZJSY")
+        );
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 30;
+        req.op = "get-tables";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "ZJSY");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(oracle.lastSqlNormalized().contains("user_synonyms"));
+        assertEquals(List.of("ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY"), oracle.params);
+        @SuppressWarnings("unchecked")
+        List<List<Object>> rows = (List<List<Object>>) ((Map<?, ?>) response.result).get("rows");
+        assertEquals(List.of("USER_SYM", "SYNONYM", "APP", "ZJSY"), rows.get(0));
+    }
+
+    @Test
     void searchColumnsUsesOracleFastPathAndPrefix() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
@@ -629,6 +654,91 @@ class DispatcherTest {
         assertEquals("CUSTOMERS",   fks.get(0).get("pk-table"));
         assertEquals("ZJSY",        fks.get(0).get("pk-schema"));
         assertEquals("ID",          fks.get(0).get("pk-column"));
+    }
+
+    @Test
+    void getReferencingObjectsUsesOracleFastPath() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        Map<String, Object> row = new HashMap<>();
+        row.put("name", "ORDERS");
+        row.put("schema", "ZJSY");
+        oracle.resultRows = List.of(row);
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 33;
+        req.op = "get-referencing-objects";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "ZJSY");
+        req.params.put("table", "customers");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(oracle.lastSqlNormalized().contains("user_constraints"));
+        assertEquals(List.of("CUSTOMERS"), oracle.params);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> objects = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("objects");
+        assertEquals("ORDERS", objects.get(0).get("name"));
+        assertEquals("ZJSY", objects.get(0).get("schema"));
+    }
+
+    @Test
+    void getIndexesUsesOracleFastPath() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        Map<String, Object> indexRow = new HashMap<>();
+        indexRow.put("index_name", "ORDER_IDX");
+        indexRow.put("table_name", "ORDERS");
+        indexRow.put("uniqueness", "UNIQUE");
+        oracle.resultRows = List.of(indexRow);
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 31;
+        req.op = "get-indexes";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "ZJSY");
+        req.params.put("table", "orders");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(oracle.lastSqlNormalized().contains("user_indexes"));
+        assertEquals(List.of("ORDERS", "ORDERS"), oracle.params);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> indexes = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("indexes");
+        assertEquals("ORDER_IDX", indexes.get(0).get("name"));
+        assertEquals("ORDERS", indexes.get(0).get("table"));
+        assertEquals(true, indexes.get(0).get("unique"));
+    }
+
+    @Test
+    void getProceduresUsesOracleObjectsFastPath() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        Map<String, Object> procRow = new HashMap<>();
+        procRow.put("object_name", "PROCESS_ORDER");
+        procRow.put("status", "VALID");
+        oracle.resultRows = List.of(procRow);
+        connMgr.connection = oracle.connection();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 32;
+        req.op = "get-procedures";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "ZJSY");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertTrue(oracle.lastSqlNormalized().contains("user_objects"));
+        assertEquals(List.of("PROCEDURE"), oracle.params);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> procedures = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("procedures");
+        assertEquals("PROCESS_ORDER", procedures.get(0).get("name"));
+        assertEquals("VALID", procedures.get(0).get("status"));
     }
 
     private static Connection proxyConnection(RecordingStatementHandler stmt) {
