@@ -8,6 +8,7 @@ import clutch.jdbc.model.Response;
 import java.sql.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 /**
  * Routes incoming requests to the appropriate handler method.
@@ -19,6 +20,16 @@ public class Dispatcher {
     private static final int ORACLE_TABLES_TIMEOUT_SECONDS   =  15;
     private static final int ORACLE_METADATA_TIMEOUT_SECONDS =   5;
     static final int DEFAULT_EXECUTE_TIMEOUT                 =  29; // s; safety net when no client timeout given
+    private static final List<String> ORACLE_SYSTEM_OWNERS = List.of(
+        "SYS", "SYSTEM", "XDB", "MDSYS", "CTXSYS", "LBACSYS", "OLAPSYS",
+        "WMSYS", "DBSNMP", "APPQOSSYS", "AUDSYS", "DVSYS",
+        "GSMADMIN_INTERNAL", "OJVMSYS", "OUTLN"
+    );
+    private static final Set<String> ORACLE_SYSTEM_OWNER_SET = Set.copyOf(ORACLE_SYSTEM_OWNERS);
+    private static final String ORACLE_SYSTEM_OWNERS_SQL =
+        ORACLE_SYSTEM_OWNERS.stream()
+            .map(owner -> "'" + owner + "'")
+            .collect(Collectors.joining(", "));
 
     private final ConnectionManager connMgr;
     private final CursorManager cursorMgr;
@@ -236,18 +247,39 @@ public class Dispatcher {
             throws SQLException {
         OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
         String sql = os.useUserTables() ? """
-                SELECT table_name AS name, 'TABLE' AS type, ? AS schema
-                FROM user_tables
-                UNION ALL
-                SELECT view_name AS name, 'VIEW' AS type, ? AS schema
-                FROM user_views
+                SELECT object_name AS name, object_type AS type, owner AS schema, source_owner AS source_schema
+                FROM (
+                  SELECT object_name, object_type, owner, source_owner, source_rank,
+                         ROW_NUMBER() OVER (PARTITION BY object_name ORDER BY source_rank) AS rn
+                  FROM (
+                    SELECT table_name AS object_name, 'TABLE' AS object_type, ? AS owner, ? AS source_owner, 0 AS source_rank
+                    FROM user_tables
+                    UNION ALL
+                    SELECT view_name AS object_name, 'VIEW' AS object_type, ? AS owner, ? AS source_owner, 0 AS source_rank
+                    FROM user_views
+                    UNION ALL
+                    SELECT synonym_name AS object_name, 'SYNONYM' AS object_type, table_owner AS owner, ? AS source_owner, 1 AS source_rank
+                    FROM user_synonyms
+                    UNION ALL
+                    SELECT table_name AS object_name, 'TABLE' AS object_type, owner, owner AS source_owner, 2 AS source_rank
+                    FROM all_tables
+                    WHERE owner NOT IN (%s)
+                      AND owner <> ?
+                    UNION ALL
+                    SELECT view_name AS object_name, 'VIEW' AS object_type, owner, owner AS source_owner, 2 AS source_rank
+                    FROM all_views
+                    WHERE owner NOT IN (%s)
+                      AND owner <> ?
+                  )
+                )
+                WHERE rn = 1
                 ORDER BY name
-                """ : """
-                SELECT table_name AS name, 'TABLE' AS type, owner AS schema
+                """.formatted(ORACLE_SYSTEM_OWNERS_SQL, ORACLE_SYSTEM_OWNERS_SQL) : """
+                SELECT table_name AS name, 'TABLE' AS type, owner AS schema, owner AS source_schema
                 FROM all_tables
                 WHERE owner = ?
                 UNION ALL
-                SELECT view_name AS name, 'VIEW' AS type, owner AS schema
+                SELECT view_name AS name, 'VIEW' AS type, owner AS schema, owner AS source_schema
                 FROM all_views
                 WHERE owner = ?
                 ORDER BY name
@@ -255,15 +287,25 @@ public class Dispatcher {
         PreparedStatement ps = conn.prepareStatement(sql);
         try {
             ps.setQueryTimeout(ORACLE_TABLES_TIMEOUT_SECONDS);
-            ps.setString(1, os.owner());
-            ps.setString(2, os.owner());
+            if (os.useUserTables()) {
+                ps.setString(1, os.owner());
+                ps.setString(2, os.owner());
+                ps.setString(3, os.owner());
+                ps.setString(4, os.owner());
+                ps.setString(5, os.owner());
+                ps.setString(6, os.owner());
+                ps.setString(7, os.owner());
+            } else {
+                ps.setString(1, os.owner());
+                ps.setString(2, os.owner());
+            }
             ResultSet rs = ps.executeQuery();
             rs.setFetchSize(1000);
             int cursorId = cursorMgr.register(connId, ps, rs);
             CursorManager.FetchResult first = cursorMgr.fetch(cursorId, 1000);
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("cursor-id", first.done() ? null : cursorId);
-            result.put("columns",   List.of("name", "type", "schema"));
+            result.put("columns",   List.of("name", "type", "schema", "source_schema"));
             result.put("rows",      first.rows());
             result.put("done",      first.done());
             return Response.ok(reqId, result);
@@ -334,7 +376,8 @@ public class Dispatcher {
                 tables.add(Map.of(
                     "name",   rs.getString("TABLE_NAME"),
                     "type",   rs.getString("TABLE_TYPE"),
-                    "schema", Objects.toString(rs.getString("TABLE_SCHEM"), "")
+                    "schema", Objects.toString(rs.getString("TABLE_SCHEM"), ""),
+                    "source-schema", Objects.toString(rs.getString("TABLE_SCHEM"), "")
                 ));
             }
         }
@@ -349,21 +392,41 @@ public class Dispatcher {
         String sql;
         if (os.useUserTables()) {
             sql = """
-                SELECT object_name, object_type, owner
+                SELECT object_name, object_type, owner, source_owner, source_rank
                 FROM (
-                  SELECT table_name AS object_name, 'TABLE' AS object_type, ? AS owner
+                  SELECT table_name AS object_name, 'TABLE' AS object_type, ? AS owner, ? AS source_owner, 0 AS source_rank
                   FROM user_tables
                   WHERE table_name LIKE ?
                   UNION ALL
-                  SELECT view_name AS object_name, 'VIEW' AS object_type, ? AS owner
+                  SELECT view_name AS object_name, 'VIEW' AS object_type, ? AS owner, ? AS source_owner, 0 AS source_rank
                   FROM user_views
                   WHERE view_name LIKE ?
+                  UNION ALL
+                  SELECT synonym_name AS object_name, 'SYNONYM' AS object_type, table_owner AS owner, ? AS source_owner, 1 AS source_rank
+                  FROM user_synonyms
+                  WHERE synonym_name LIKE ?
+                  UNION ALL
+                  SELECT table_name AS object_name, 'TABLE' AS object_type, owner, owner AS source_owner, 2 AS source_rank
+                  FROM all_tables
+                  WHERE owner NOT IN (%s)
+                    AND owner <> ?
+                    AND table_name LIKE ?
+                  UNION ALL
+                  SELECT view_name AS object_name, 'VIEW' AS object_type, owner, owner AS source_owner, 2 AS source_rank
+                  FROM all_views
+                  WHERE owner NOT IN (%s)
+                    AND owner <> ?
+                    AND view_name LIKE ?
+                  UNION ALL
+                  SELECT synonym_name AS object_name, 'PUBLIC SYNONYM' AS object_type, table_owner AS owner, 'PUBLIC' AS source_owner, 3 AS source_rank
+                  FROM all_synonyms
+                  WHERE owner = 'PUBLIC' AND synonym_name LIKE ?
                 )
-                ORDER BY object_name
-                """;
+                ORDER BY source_rank, object_name
+                """.formatted(ORACLE_SYSTEM_OWNERS_SQL, ORACLE_SYSTEM_OWNERS_SQL);
         } else {
             sql = """
-                SELECT object_name, object_type, owner
+                SELECT object_name, object_type, owner, owner AS source_owner
                 FROM (
                   SELECT table_name AS object_name, 'TABLE' AS object_type, owner
                   FROM all_tables
@@ -376,24 +439,45 @@ public class Dispatcher {
                 ORDER BY object_name
                 """;
         }
-        List<Map<String, Object>> tables = new ArrayList<>();
+        LinkedHashMap<String, Map<String, Object>> tablesByName = new LinkedHashMap<>();
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
-            ps.setString(1, os.owner());
-            ps.setString(2, pattern);
-            ps.setString(3, os.owner());
-            ps.setString(4, pattern);
+            if (os.useUserTables()) {
+                ps.setString(1, os.owner());
+                ps.setString(2, os.owner());
+                ps.setString(3, pattern);
+                ps.setString(4, os.owner());
+                ps.setString(5, os.owner());
+                ps.setString(6, pattern);
+                ps.setString(7, os.owner());
+                ps.setString(8, pattern);
+                ps.setString(9, os.owner());
+                ps.setString(10, pattern);
+                ps.setString(11, os.owner());
+                ps.setString(12, pattern);
+                ps.setString(13, pattern);
+            } else {
+                ps.setString(1, os.owner());
+                ps.setString(2, pattern);
+                ps.setString(3, os.owner());
+                ps.setString(4, pattern);
+            }
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    tables.add(Map.of(
-                        "name", rs.getString("object_name"),
-                        "type", rs.getString("object_type"),
-                        "schema", Objects.toString(rs.getString("owner"), "")
+                    String name = rs.getString("object_name");
+                    String owner = Objects.toString(rs.getString("owner"), "");
+                    String objectType = rs.getString("object_type");
+                    String sourceOwner = Objects.toString(rs.getString("source_owner"), owner);
+                    tablesByName.putIfAbsent(name, Map.of(
+                        "name", name,
+                        "type", objectType,
+                        "schema", owner,
+                        "source-schema", sourceOwner
                     ));
                 }
             }
         }
-        return tables;
+        return new ArrayList<>(tablesByName.values());
     }
 
     private Response searchColumns(Request req) throws SQLException {
@@ -403,9 +487,31 @@ public class Dispatcher {
         String prefix = Objects.toString(req.params.get("prefix"), "");
         Connection conn = connMgr.get(connId);
         List<Map<String, Object>> cols = isOracle(conn)
-            ? getOracleColumns(conn, schema, table, prefix)
+            ? searchOracleColumns(conn, schema, table, prefix)
             : getJdbcMetadataColumns(conn, schema, table, prefix);
         return Response.ok(req.id, Map.of("columns", cols));
+    }
+
+    private List<Map<String, Object>> searchOracleColumns(Connection conn, String schema,
+                                                          String table, String prefix)
+            throws SQLException {
+        List<Map<String, Object>> cols = getOracleColumns(conn, schema, table, prefix);
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String columnPattern = ((prefix == null || prefix.isBlank()) ? "" : prefix)
+            .toUpperCase(Locale.ROOT) + "%";
+        if (!cols.isEmpty() || !os.useUserTables()) {
+            return cols;
+        }
+
+        OracleObject target = resolveOracleSynonym(conn, table);
+        if (target != null) {
+            cols = getOracleColumnsByOwner(conn, target.owner(), target.name(), columnPattern);
+            if (!cols.isEmpty()) {
+                return cols;
+            }
+        }
+
+        return searchOracleAccessibleColumns(conn, table, prefix);
     }
 
     private List<Map<String, Object>> getJdbcMetadataColumns(Connection conn, String schema,
@@ -433,46 +539,124 @@ public class Dispatcher {
         OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
         String columnPattern = ((prefix == null || prefix.isBlank()) ? "" : prefix)
             .toUpperCase(Locale.ROOT) + "%";
-        String sql;
-        if (os.useUserTables()) {
-            sql = """
-                SELECT column_name, data_type, nullable, column_id
-                FROM user_tab_columns
-                WHERE table_name = ?
-                  AND column_name LIKE ?
-                ORDER BY column_id
-                """;
-        } else {
-            sql = """
-                SELECT column_name, data_type, nullable, column_id
-                FROM all_tab_columns
-                WHERE owner = ?
-                  AND table_name = ?
-                  AND column_name LIKE ?
-                ORDER BY column_id
-                """;
-        }
+        return os.useUserTables()
+            ? getOracleUserColumns(conn, table, columnPattern)
+            : getOracleColumnsByOwner(conn, os.owner(), table, columnPattern);
+    }
+
+    private List<Map<String, Object>> getOracleUserColumns(Connection conn, String table,
+                                                           String columnPattern)
+            throws SQLException {
+        String sql = """
+            SELECT column_name, data_type, nullable, column_id
+            FROM user_tab_columns
+            WHERE table_name = ?
+              AND column_name LIKE ?
+            ORDER BY column_id
+            """;
         List<Map<String, Object>> cols = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
-            int i = 1;
-            if (!os.useUserTables()) {
-                ps.setString(i++, os.owner());
-            }
-            ps.setString(i++, table.toUpperCase(Locale.ROOT));
-            ps.setString(i, columnPattern);
+            ps.setString(1, table.toUpperCase(Locale.ROOT));
+            ps.setString(2, columnPattern);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    cols.add(Map.of(
-                        "name", rs.getString("column_name"),
-                        "type", rs.getString("data_type"),
-                        "nullable", !"N".equalsIgnoreCase(rs.getString("nullable")),
-                        "position", rs.getInt("column_id")
-                    ));
+                    cols.add(oracleColumnRow(rs));
                 }
             }
         }
         return cols;
+    }
+
+    private List<Map<String, Object>> getOracleColumnsByOwner(Connection conn, String owner,
+                                                              String table, String columnPattern)
+            throws SQLException {
+        String sql = """
+            SELECT column_name, data_type, nullable, column_id
+            FROM all_tab_columns
+            WHERE owner = ?
+              AND table_name = ?
+              AND column_name LIKE ?
+            ORDER BY column_id
+            """;
+        List<Map<String, Object>> cols = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            ps.setString(1, owner.toUpperCase(Locale.ROOT));
+            ps.setString(2, table.toUpperCase(Locale.ROOT));
+            ps.setString(3, columnPattern);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    cols.add(oracleColumnRow(rs));
+                }
+            }
+        }
+        return cols;
+    }
+
+    private List<Map<String, Object>> searchOracleAccessibleColumns(Connection conn, String table,
+                                                                    String prefix)
+            throws SQLException {
+        String columnPattern = ((prefix == null || prefix.isBlank()) ? "" : prefix)
+            .toUpperCase(Locale.ROOT) + "%";
+        String sql = """
+            SELECT column_name, data_type, nullable, column_id
+            FROM all_tab_columns
+            WHERE table_name = ?
+              AND column_name LIKE ?
+            ORDER BY owner, column_id
+            """;
+        LinkedHashMap<String, Map<String, Object>> colsByName = new LinkedHashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            ps.setString(1, table.toUpperCase(Locale.ROOT));
+            ps.setString(2, columnPattern);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String name = rs.getString("column_name");
+                    colsByName.putIfAbsent(name, oracleColumnRow(rs));
+                }
+            }
+        }
+        return new ArrayList<>(colsByName.values());
+    }
+
+    private OracleObject resolveOracleSynonym(Connection conn, String name) throws SQLException {
+        String sql = """
+            SELECT table_owner, table_name
+            FROM user_synonyms
+            WHERE synonym_name = ?
+            UNION ALL
+            SELECT table_owner, table_name
+            FROM all_synonyms
+            WHERE owner = 'PUBLIC'
+              AND synonym_name = ?
+            """;
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            ps.setString(1, name.toUpperCase(Locale.ROOT));
+            ps.setString(2, name.toUpperCase(Locale.ROOT));
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new OracleObject(rs.getString("table_owner"),
+                                            rs.getString("table_name"));
+                }
+            }
+        }
+        return null;
+    }
+
+    private Map<String, Object> oracleColumnRow(ResultSet rs) throws SQLException {
+        return Map.of(
+            "name", rs.getString("column_name"),
+            "type", rs.getString("data_type"),
+            "nullable", !"N".equalsIgnoreCase(rs.getString("nullable")),
+            "position", rs.getInt("column_id")
+        );
+    }
+
+    private boolean isOracleSystemOwner(String owner) {
+        return owner != null && ORACLE_SYSTEM_OWNER_SET.contains(owner.toUpperCase(Locale.ROOT));
     }
 
     private Response getPrimaryKeys(Request req) throws SQLException {
@@ -676,4 +860,6 @@ public class Dispatcher {
             return new OracleSchema(useUserTables, owner);
         }
     }
+
+    private record OracleObject(String owner, String name) {}
 }
