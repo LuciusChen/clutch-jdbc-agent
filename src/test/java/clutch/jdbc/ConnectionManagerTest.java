@@ -30,6 +30,7 @@ class ConnectionManagerTest {
             int connId = mgr.connect("jdbc:test:demo", "scott", "tiger",
                 Map.of("role", "reporting"), 7, 11, true);
             assertEquals(1, connId);
+            assertEquals(2, driver.connectCount);
             assertEquals(7, driver.seenLoginTimeout);
             assertEquals("scott", driver.seenProps.getProperty("user"));
             assertEquals("tiger", driver.seenProps.getProperty("password"));
@@ -37,7 +38,7 @@ class ConnectionManagerTest {
             assertEquals(11_000, driver.seenNetworkTimeoutMillis);
             assertEquals(3, DriverManager.getLoginTimeout());
             mgr.disconnect(connId);
-            assertTrue(driver.closed);
+            assertEquals(2, driver.closedCount);
         } finally {
             DriverManager.deregisterDriver(driver);
             DriverManager.setLoginTimeout(originalTimeout);
@@ -53,7 +54,8 @@ class ConnectionManagerTest {
             int connId = mgr.connect("jdbc:test:demo", "scott", "tiger",
                 Map.of(), null, null, false);
             assertEquals(1, connId);
-            assertTrue(driver.autoCommitDisabled);
+            assertTrue(driver.primaryAutoCommitDisabled);
+            assertTrue(driver.metadataReadOnly);
             mgr.disconnect(connId);
         } finally {
             DriverManager.deregisterDriver(driver);
@@ -64,18 +66,20 @@ class ConnectionManagerTest {
         private int seenLoginTimeout = -1;
         private Properties seenProps;
         private int seenNetworkTimeoutMillis = -1;
-        private boolean autoCommitDisabled;
-        private boolean closed;
+        private boolean primaryAutoCommitDisabled;
+        private boolean metadataReadOnly;
+        private int connectCount;
+        private int closedCount;
 
         @Override
         public Connection connect(String url, Properties info) {
             if (!acceptsURL(url)) {
                 return null;
             }
+            boolean metadata = connectCount++ > 0;
             seenLoginTimeout = DriverManager.getLoginTimeout();
             seenProps = new Properties();
             seenProps.putAll(info);
-            closed = false;
             return (Connection) Proxy.newProxyInstance(
                 getClass().getClassLoader(),
                 new Class<?>[]{Connection.class},
@@ -85,12 +89,20 @@ class ConnectionManagerTest {
                         yield null;
                     }
                     case "setAutoCommit" -> {
-                        autoCommitDisabled = !((Boolean) args[0]);
+                        if (!metadata) {
+                            primaryAutoCommitDisabled = !((Boolean) args[0]);
+                        }
                         yield null;
                     }
-                    case "isClosed" -> closed;
+                    case "setReadOnly" -> {
+                        if (metadata) {
+                            metadataReadOnly = (Boolean) args[0];
+                        }
+                        yield null;
+                    }
+                    case "isClosed" -> false;
                     case "close" -> {
-                        closed = true;
+                        closedCount++;
                         yield null;
                     }
                     case "unwrap" -> null;

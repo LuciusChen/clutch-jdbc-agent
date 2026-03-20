@@ -63,6 +63,7 @@ public class Dispatcher {
             case "fetch"           -> fetch(req);
             case "close-cursor"    -> closeCursor(req);
             case "get-schemas"     -> getSchemas(req);
+            case "set-current-schema" -> setCurrentSchema(req);
             case "get-tables"      -> getTables(req);
             case "search-tables"   -> searchTables(req);
             case "get-columns"     -> getColumns(req);
@@ -125,13 +126,13 @@ public class Dispatcher {
 
     private Response commit(Request req) throws SQLException {
         int connId = getInt(req, "conn-id");
-        connMgr.get(connId).commit();
+        primaryConnection(connId).commit();
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
     private Response rollback(Request req) throws SQLException {
         int connId = getInt(req, "conn-id");
-        connMgr.get(connId).rollback();
+        primaryConnection(connId).rollback();
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
@@ -139,7 +140,7 @@ public class Dispatcher {
         int connId = getInt(req, "conn-id");
         Object autoCommitValue = req.params.get("auto-commit");
         boolean autoCommit = autoCommitValue == null || Boolean.TRUE.equals(autoCommitValue);
-        connMgr.get(connId).setAutoCommit(autoCommit);
+        primaryConnection(connId).setAutoCommit(autoCommit);
         return Response.ok(req.id, Map.of("conn-id", connId, "auto-commit", autoCommit));
     }
 
@@ -155,7 +156,7 @@ public class Dispatcher {
         int executeTimeout          = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
                                       ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
 
-        Connection conn = connMgr.get(connId);
+        Connection conn = primaryConnection(connId);
         if (!conn.isValid(3))
             return Response.error(req.id,
                 "Connection lost: the server closed the connection (idle timeout). Please reconnect.");
@@ -231,7 +232,7 @@ public class Dispatcher {
 
     private Response getSchemas(Request req) throws SQLException {
         int connId = getInt(req, "conn-id");
-        DatabaseMetaData meta = connMgr.get(connId).getMetaData();
+        DatabaseMetaData meta = metadataConnection(connId).getMetaData();
         List<String> schemas = new ArrayList<>();
         try (ResultSet rs = meta.getSchemas()) {
             while (rs.next()) schemas.add(rs.getString("TABLE_SCHEM"));
@@ -239,10 +240,22 @@ public class Dispatcher {
         return Response.ok(req.id, Map.of("schemas", schemas));
     }
 
+    private Response setCurrentSchema(Request req) throws SQLException {
+        int connId = getInt(req, "conn-id");
+        String schema = getString(req, "schema");
+        Connection primary = primaryConnection(connId);
+        Connection metadata = metadataConnection(connId);
+        applyCurrentSchema(primary, schema);
+        if (metadata != primary) {
+            applyCurrentSchema(metadata, schema);
+        }
+        return Response.ok(req.id, Map.of("conn-id", connId, "schema", schema));
+    }
+
     private Response getTables(Request req) throws SQLException {
         int connId    = getInt(req, "conn-id");
         String schema = (String) req.params.get("schema");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         return isOracle(conn)
             ? oracleTablesCursor(req.id, connId, conn, schema)
             : jdbcTablesOneBatch(req.id, conn, schema);
@@ -358,7 +371,7 @@ public class Dispatcher {
         String schema = (String) req.params.get("schema");
         String table  = getString(req, "table");
 
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> cols = isOracle(conn)
             ? getOracleColumns(conn, schema, table, null)
             : getJdbcMetadataColumns(conn, schema, table, null);
@@ -369,7 +382,7 @@ public class Dispatcher {
         int connId      = getInt(req, "conn-id");
         String schema   = (String) req.params.get("schema");
         String prefix   = Objects.toString(req.params.get("prefix"), "");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> tables = isOracle(conn)
             ? searchOracleTables(conn, schema, prefix)
             : searchJdbcMetadataTables(conn, schema, prefix);
@@ -504,7 +517,7 @@ public class Dispatcher {
         String schema = (String) req.params.get("schema");
         String table  = getString(req, "table");
         String prefix = Objects.toString(req.params.get("prefix"), "");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> cols = isOracle(conn)
             ? searchOracleColumns(conn, schema, table, prefix)
             : getJdbcMetadataColumns(conn, schema, table, prefix);
@@ -682,7 +695,7 @@ public class Dispatcher {
         int connId    = getInt(req, "conn-id");
         String schema = (String) req.params.get("schema");
         String table  = getString(req, "table");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<String> pks = isOracle(conn)
             ? getOraclePrimaryKeys(conn, schema, table)
             : getJdbcMetadataPrimaryKeys(conn, schema, table);
@@ -742,7 +755,7 @@ public class Dispatcher {
         int connId    = getInt(req, "conn-id");
         String schema = (String) req.params.get("schema");
         String table  = getString(req, "table");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> fks = isOracle(conn)
             ? getOracleForeignKeys(conn, schema, table)
             : getJdbcMetadataForeignKeys(conn, schema, table);
@@ -769,7 +782,7 @@ public class Dispatcher {
         int connId    = getInt(req, "conn-id");
         String schema = (String) req.params.get("schema");
         String table  = getString(req, "table");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> objects = isOracle(conn)
             ? getOracleReferencingObjects(conn, schema, table)
             : getJdbcMetadataReferencingObjects(conn, schema, table);
@@ -915,7 +928,7 @@ public class Dispatcher {
         int connId    = getInt(req, "conn-id");
         String schema = (String) req.params.get("schema");
         String table  = getOptionalString(req, "table");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> indexes = isOracle(conn)
             ? getOracleIndexes(conn, schema, table)
             : getJdbcIndexes(conn, schema, table);
@@ -1030,7 +1043,7 @@ public class Dispatcher {
         String schema = (String) req.params.get("schema");
         String index  = getString(req, "index");
         String table  = getOptionalString(req, "table");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> columns = isOracle(conn)
             ? getOracleIndexColumns(conn, schema, index)
             : getJdbcIndexColumns(conn, schema, index, table);
@@ -1119,7 +1132,7 @@ public class Dispatcher {
     private Response getSequences(Request req) throws SQLException {
         int connId    = getInt(req, "conn-id");
         String schema = (String) req.params.get("schema");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> sequences = isOracle(conn)
             ? getOracleSequences(conn, schema)
             : getDialectSequences(conn, schema);
@@ -1208,7 +1221,7 @@ public class Dispatcher {
     private Response getProcedures(Request req) throws SQLException {
         int connId    = getInt(req, "conn-id");
         String schema = (String) req.params.get("schema");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> procedures = isOracle(conn)
             ? getOracleRoutines(conn, schema, "PROCEDURE")
             : getJdbcRoutines(conn, schema, true);
@@ -1218,7 +1231,7 @@ public class Dispatcher {
     private Response getFunctions(Request req) throws SQLException {
         int connId    = getInt(req, "conn-id");
         String schema = (String) req.params.get("schema");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> functions = isOracle(conn)
             ? getOracleRoutines(conn, schema, "FUNCTION")
             : getJdbcRoutines(conn, schema, false);
@@ -1297,7 +1310,7 @@ public class Dispatcher {
         String schema  = (String) req.params.get("schema");
         String name    = getString(req, "name");
         String identity = getOptionalString(req, "identity");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> params = isOracle(conn)
             ? getOracleRoutineParams(conn, schema, name)
             : getJdbcRoutineParams(conn, schema, name, identity, true);
@@ -1309,7 +1322,7 @@ public class Dispatcher {
         String schema  = (String) req.params.get("schema");
         String name    = getString(req, "name");
         String identity = getOptionalString(req, "identity");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> params = isOracle(conn)
             ? getOracleRoutineParams(conn, schema, name)
             : getJdbcRoutineParams(conn, schema, name, identity, false);
@@ -1393,7 +1406,7 @@ public class Dispatcher {
         String name     = getString(req, "name");
         String type     = getString(req, "type");
         String identity = getOptionalString(req, "identity");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         String source = isOracle(conn)
             ? getOracleObjectSource(conn, schema, name, type)
             : getDialectObjectSource(conn, schema, name, type, identity);
@@ -1406,7 +1419,7 @@ public class Dispatcher {
         String name     = getString(req, "name");
         String type     = getString(req, "type");
         String identity = getOptionalString(req, "identity");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         String ddl = isOracle(conn)
             ? getOracleObjectDdl(conn, schema, name, type)
             : getDialectObjectDdl(conn, schema, name, type, identity);
@@ -1559,7 +1572,7 @@ public class Dispatcher {
         int connId    = getInt(req, "conn-id");
         String schema = (String) req.params.get("schema");
         String table  = getOptionalString(req, "table");
-        Connection conn = connMgr.get(connId);
+        Connection conn = metadataConnection(connId);
         List<Map<String, Object>> triggers = isOracle(conn)
             ? getOracleTriggers(conn, schema, table)
             : getDialectTriggers(conn, schema, table);
@@ -1713,6 +1726,44 @@ public class Dispatcher {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    private Connection primaryConnection(int connId) throws SQLException {
+        return connMgr.getPrimary(connId);
+    }
+
+    private Connection metadataConnection(int connId) throws SQLException {
+        return connMgr.getMetadata(connId);
+    }
+
+    private void applyCurrentSchema(Connection conn, String schema) throws SQLException {
+        String trimmed = schema.strip();
+        if (trimmed.isEmpty()) {
+            throw new SQLException("Schema must not be blank");
+        }
+        if (isOracle(conn)) {
+            try (Statement stmt = conn.createStatement()) {
+                stmt.execute("ALTER SESSION SET CURRENT_SCHEMA = "
+                    + quoteIdentifier(trimmed, "oracle"));
+            }
+            return;
+        }
+        String productName = conn.getMetaData().getDatabaseProductName();
+        if (productName != null
+            && productName.toLowerCase(Locale.ROOT).contains("mysql")) {
+            try (Statement stmt = conn.createStatement()) {
+                stmt.execute("USE " + quoteIdentifier(trimmed, "mysql"));
+            }
+            return;
+        }
+        throw new SQLException("Runtime schema switching is not available for this connection");
+    }
+
+    private String quoteIdentifier(String identifier, String product) {
+        if ("mysql".equals(product)) {
+            return "`" + identifier.replace("`", "``") + "`";
+        }
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    }
 
     private Map<String, Object> entryMap(Object... kvs) {
         Map<String, Object> map = new LinkedHashMap<>();
