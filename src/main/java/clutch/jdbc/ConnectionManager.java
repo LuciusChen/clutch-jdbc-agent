@@ -12,13 +12,14 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Maintains a map of connId → Connection.
- * No pooling — one JDBC Connection per clutch connection.
+ * Maintains a map of connId → logical JDBC session.
+ * Each session owns a primary connection for foreground queries and a separate
+ * metadata connection for schema/object introspection.
  */
 public class ConnectionManager {
 
     private final AtomicInteger nextId = new AtomicInteger(1);
-    private final Map<Integer, Connection> connections = new ConcurrentHashMap<>();
+    private final Map<Integer, Session> connections = new ConcurrentHashMap<>();
     private final ExecutorService networkTimeoutExecutor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "clutch-jdbc-network-timeout");
         t.setDaemon(true);
@@ -42,7 +43,28 @@ public class ConnectionManager {
         if (user != null)     p.setProperty("user",     user);
         if (password != null) p.setProperty("password", password);
 
-        Connection conn = openConnection(url, p, connectTimeoutSeconds);
+        Connection primary = openConnection(url, p, connectTimeoutSeconds);
+        try {
+            configurePrimaryConnection(primary, autoCommit, networkTimeoutSeconds);
+            Connection metadata = openConnection(url, p, connectTimeoutSeconds);
+            try {
+                configureMetadataConnection(metadata, networkTimeoutSeconds);
+                int id = nextId.getAndIncrement();
+                connections.put(id, new Session(primary, metadata));
+                return id;
+            } catch (SQLException | RuntimeException e) {
+                closeQuietly(metadata);
+                throw e;
+            }
+        } catch (SQLException | RuntimeException e) {
+            closeQuietly(primary);
+            throw e;
+        }
+    }
+
+    private void configurePrimaryConnection(Connection conn, boolean autoCommit,
+                                            Integer networkTimeoutSeconds)
+            throws SQLException {
         if (!autoCommit) {
             try {
                 conn.setAutoCommit(false);
@@ -50,6 +72,26 @@ public class ConnectionManager {
                 // Driver does not support manual-commit mode; proceed with autocommit.
             }
         }
+        applyNetworkTimeout(conn, networkTimeoutSeconds);
+    }
+
+    private void configureMetadataConnection(Connection conn, Integer networkTimeoutSeconds)
+            throws SQLException {
+        try {
+            conn.setAutoCommit(true);
+        } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
+            // Driver does not allow autocommit changes; continue.
+        }
+        try {
+            conn.setReadOnly(true);
+        } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
+            // Driver does not implement read-only mode; continue.
+        }
+        applyNetworkTimeout(conn, networkTimeoutSeconds);
+    }
+
+    private void applyNetworkTimeout(Connection conn, Integer networkTimeoutSeconds)
+            throws SQLException {
         if (networkTimeoutSeconds != null && networkTimeoutSeconds > 0) {
             try {
                 conn.setNetworkTimeout(networkTimeoutExecutor, networkTimeoutSeconds * 1000);
@@ -57,9 +99,6 @@ public class ConnectionManager {
                 // Driver does not implement network timeout; continue without it.
             }
         }
-        int id = nextId.getAndIncrement();
-        connections.put(id, conn);
-        return id;
     }
 
     private Connection openConnection(String url, Properties props, Integer connectTimeoutSeconds)
@@ -78,26 +117,56 @@ public class ConnectionManager {
         }
     }
 
-    /** Return the live Connection for {@code connId}, or throw if unknown. */
+    /** Return the live primary Connection for {@code connId}, or throw if unknown. */
     public Connection get(int connId) throws SQLException {
-        Connection c = connections.get(connId);
-        if (c == null)
+        return getPrimary(connId);
+    }
+
+    /** Return the live primary Connection for {@code connId}, or throw if unknown. */
+    public Connection getPrimary(int connId) throws SQLException {
+        Session session = connections.get(connId);
+        if (session == null)
             throw new SQLException("Unknown connection id: " + connId);
-        return c;
+        return session.primary();
+    }
+
+    /** Return the live metadata Connection for {@code connId}, or throw if unknown. */
+    public Connection getMetadata(int connId) throws SQLException {
+        Session session = connections.get(connId);
+        if (session == null)
+            throw new SQLException("Unknown connection id: " + connId);
+        return session.metadata();
     }
 
     /** Close and remove the connection for {@code connId}. No-op if already closed. */
     public void disconnect(int connId) throws SQLException {
-        Connection c = connections.remove(connId);
-        if (c != null && !c.isClosed()) c.close();
+        Session session = connections.remove(connId);
+        if (session != null) {
+            closeQuietly(session.metadata());
+            closeQuietly(session.primary());
+        }
     }
 
     /** Close all connections and shut down the network-timeout executor. */
     public void disconnectAll() {
-        for (Map.Entry<Integer, Connection> e : connections.entrySet()) {
-            try { e.getValue().close(); } catch (Exception ignored) {}
+        for (Map.Entry<Integer, Session> e : connections.entrySet()) {
+            closeQuietly(e.getValue().metadata());
+            closeQuietly(e.getValue().primary());
         }
         connections.clear();
         networkTimeoutExecutor.shutdownNow();
     }
+
+    private void closeQuietly(Connection connection) {
+        if (connection == null) {
+            return;
+        }
+        try {
+            if (!connection.isClosed()) {
+                connection.close();
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private record Session(Connection primary, Connection metadata) {}
 }

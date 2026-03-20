@@ -171,6 +171,53 @@ class DispatcherTest {
     }
 
     @Test
+    void getSchemasUsesMetadataConnection() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> throw new AssertionError("primary connection should not serve metadata");
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        connMgr.metadataConnection = metadataConnectionWithSchemas(List.of("APP", "REPORTING"));
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 11;
+        req.op = "get-schemas";
+        req.params.put("conn-id", 7);
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertEquals(List.of("APP", "REPORTING"), ((Map<?, ?>) response.result).get("schemas"));
+    }
+
+    @Test
+    void setCurrentSchemaUpdatesPrimaryAndMetadataConnections() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        List<String> primarySql = new ArrayList<>();
+        List<String> metadataSql = new ArrayList<>();
+        connMgr.connection = oracleSchemaConnection(primarySql);
+        connMgr.metadataConnection = oracleSchemaConnection(metadataSql);
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = new Request();
+        req.id = 12;
+        req.op = "set-current-schema";
+        req.params.put("conn-id", 7);
+        req.params.put("schema", "CJH_TEST");
+
+        Response response = dispatcher.dispatch(req);
+
+        assertTrue(response.ok);
+        assertEquals(List.of("ALTER SESSION SET CURRENT_SCHEMA = \"CJH_TEST\""), primarySql);
+        assertEquals(List.of("ALTER SESSION SET CURRENT_SCHEMA = \"CJH_TEST\""), metadataSql);
+        assertEquals("CJH_TEST", ((Map<?, ?>) response.result).get("schema"));
+    }
+
+    @Test
     void executeAppliesQueryTimeoutBeforeRunningStatement() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         RecordingStatementHandler stmt = new RecordingStatementHandler();
@@ -754,6 +801,86 @@ class DispatcherTest {
             });
     }
 
+    private static Connection metadataConnectionWithSchemas(List<String> schemas) {
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getSchemas" -> resultSet(List.of("TABLE_SCHEM"), schemas.stream()
+                    .map(schema -> List.<Object>of(schema))
+                    .toList());
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        return (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
+    private static Connection oracleSchemaConnection(List<String> executedSql) {
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getDatabaseProductName" -> "Oracle";
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Statement stmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "execute" -> {
+                    executedSql.add((String) args[0]);
+                    yield true;
+                }
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        return (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "createStatement" -> stmt;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
+    private static ResultSet resultSet(List<String> columns, List<List<Object>> rows) {
+        final int[] index = {-1};
+        return (ResultSet) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{ResultSet.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "next" -> ++index[0] < rows.size();
+                case "getString" -> {
+                    Object key = args[0];
+                    int col = key instanceof Integer n
+                        ? n.intValue() - 1
+                        : columns.indexOf((String) key);
+                    Object value = rows.get(index[0]).get(col);
+                    yield value == null ? null : value.toString();
+                }
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
     private static final class RecordingConnectionManager extends ConnectionManager {
         private String url;
         private String user;
@@ -763,6 +890,7 @@ class DispatcherTest {
         private Integer networkTimeoutSeconds;
         private boolean autoCommit = true;
         private Connection connection;
+        private Connection metadataConnection;
 
         @Override
         public int connect(String url, String user, String password, Map<String, String> props,
@@ -780,8 +908,19 @@ class DispatcherTest {
 
         @Override
         public Connection get(int connId) {
+            return getPrimary(connId);
+        }
+
+        @Override
+        public Connection getPrimary(int connId) {
             assertEquals(7, connId);
             return connection;
+        }
+
+        @Override
+        public Connection getMetadata(int connId) {
+            assertEquals(7, connId);
+            return metadataConnection != null ? metadataConnection : connection;
         }
     }
 
