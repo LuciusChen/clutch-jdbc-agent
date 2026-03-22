@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -29,19 +30,14 @@ class DispatcherTest {
     @Test
     void connectForwardsExplicitTimeouts() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 1;
-        req.op = "connect";
-        req.params.put("url", "jdbc:test:demo");
-        req.params.put("user", "scott");
-        req.params.put("password", "tiger");
-        req.params.put("props", Map.of("role", "reporting"));
-        req.params.put("connect-timeout-seconds", 8);
-        req.params.put("network-timeout-seconds", 9);
-        req.params.put("auto-commit", false);
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatch(connMgr, 1, "connect",
+            "url", "jdbc:test:demo",
+            "user", "scott",
+            "password", "tiger",
+            "props", Map.of("role", "reporting"),
+            "connect-timeout-seconds", 8,
+            "network-timeout-seconds", 9,
+            "auto-commit", false);
 
         assertTrue(response.ok);
         assertEquals("jdbc:test:demo", connMgr.url);
@@ -58,25 +54,8 @@ class DispatcherTest {
     void commitCallsConnectionCommit() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         boolean[] committed = {false};
-        connMgr.connection = (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, _args) -> switch (method.getName()) {
-                case "commit" -> {
-                    committed[0] = true;
-                    yield null;
-                }
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 7;
-        req.op = "commit";
-        req.params.put("conn-id", 7);
-
-        Response response = dispatcher.dispatch(req);
+        connMgr.connection = connectionWithNoArgCall("commit", () -> committed[0] = true);
+        Response response = dispatch(connMgr, 7, "commit", "conn-id", 7);
 
         assertTrue(response.ok);
         assertTrue(committed[0]);
@@ -86,25 +65,8 @@ class DispatcherTest {
     void rollbackCallsConnectionRollback() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         boolean[] rolledBack = {false};
-        connMgr.connection = (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, _args) -> switch (method.getName()) {
-                case "rollback" -> {
-                    rolledBack[0] = true;
-                    yield null;
-                }
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 8;
-        req.op = "rollback";
-        req.params.put("conn-id", 7);
-
-        Response response = dispatcher.dispatch(req);
+        connMgr.connection = connectionWithNoArgCall("rollback", () -> rolledBack[0] = true);
+        Response response = dispatch(connMgr, 8, "rollback", "conn-id", 7);
 
         assertTrue(response.ok);
         assertTrue(rolledBack[0]);
@@ -114,60 +76,28 @@ class DispatcherTest {
     void setAutoCommitTrueCallsConnectionSetAutoCommit() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         Boolean[] capturedValue = {null};
-        connMgr.connection = (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, args) -> switch (method.getName()) {
-                case "setAutoCommit" -> {
-                    capturedValue[0] = (Boolean) args[0];
-                    yield null;
-                }
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 9;
-        req.op = "set-auto-commit";
-        req.params.put("conn-id", 7);
-        req.params.put("auto-commit", true);
-
-        Response response = dispatcher.dispatch(req);
+        connMgr.connection = connectionWithBooleanCall("setAutoCommit", value -> capturedValue[0] = value);
+        Response response = dispatch(connMgr, 9, "set-auto-commit",
+            "conn-id", 7,
+            "auto-commit", true);
 
         assertTrue(response.ok);
         assertTrue(capturedValue[0]);
-        assertEquals(true, ((Map<?, ?>) response.result).get("auto-commit"));
+        assertEquals(true, resultMap(response).get("auto-commit"));
     }
 
     @Test
     void setAutoCommitFalseCallsConnectionSetAutoCommit() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         Boolean[] capturedValue = {null};
-        connMgr.connection = (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, args) -> switch (method.getName()) {
-                case "setAutoCommit" -> {
-                    capturedValue[0] = (Boolean) args[0];
-                    yield null;
-                }
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 10;
-        req.op = "set-auto-commit";
-        req.params.put("conn-id", 7);
-        req.params.put("auto-commit", false);
-
-        Response response = dispatcher.dispatch(req);
+        connMgr.connection = connectionWithBooleanCall("setAutoCommit", value -> capturedValue[0] = value);
+        Response response = dispatch(connMgr, 10, "set-auto-commit",
+            "conn-id", 7,
+            "auto-commit", false);
 
         assertTrue(response.ok);
         assertFalse(capturedValue[0]);
-        assertEquals(false, ((Map<?, ?>) response.result).get("auto-commit"));
+        assertEquals(false, resultMap(response).get("auto-commit"));
     }
 
     @Test
@@ -183,16 +113,10 @@ class DispatcherTest {
                 default -> throw new UnsupportedOperationException(method.getName());
             });
         connMgr.metadataConnection = metadataConnectionWithSchemas(List.of("APP", "REPORTING"));
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 11;
-        req.op = "get-schemas";
-        req.params.put("conn-id", 7);
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatch(connMgr, 11, "get-schemas", "conn-id", 7);
 
         assertTrue(response.ok);
-        assertEquals(List.of("APP", "REPORTING"), ((Map<?, ?>) response.result).get("schemas"));
+        assertEquals(List.of("APP", "REPORTING"), resultMap(response).get("schemas"));
     }
 
     @Test
@@ -202,19 +126,14 @@ class DispatcherTest {
         List<String> metadataSql = new ArrayList<>();
         connMgr.connection = oracleSchemaConnection(primarySql);
         connMgr.metadataConnection = oracleSchemaConnection(metadataSql);
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 12;
-        req.op = "set-current-schema";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "CJH_TEST");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatch(connMgr, 12, "set-current-schema",
+            "conn-id", 7,
+            "schema", "CJH_TEST");
 
         assertTrue(response.ok);
         assertEquals(List.of("ALTER SESSION SET CURRENT_SCHEMA = \"CJH_TEST\""), primarySql);
         assertEquals(List.of("ALTER SESSION SET CURRENT_SCHEMA = \"CJH_TEST\""), metadataSql);
-        assertEquals("CJH_TEST", ((Map<?, ?>) response.result).get("schema"));
+        assertEquals("CJH_TEST", resultMap(response).get("schema"));
     }
 
     @Test
@@ -222,22 +141,17 @@ class DispatcherTest {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         RecordingStatementHandler stmt = new RecordingStatementHandler();
         connMgr.connection = proxyConnection(stmt);
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 2;
-        req.op = "execute";
-        req.params.put("conn-id", 7);
-        req.params.put("sql", "update demo set x = 1;");
-        req.params.put("query-timeout-seconds", 16);
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatch(connMgr, 2, "execute",
+            "conn-id", 7,
+            "sql", "update demo set x = 1;",
+            "query-timeout-seconds", 16);
 
         assertTrue(response.ok);
         assertEquals(16, stmt.queryTimeoutSeconds);
         assertEquals("update demo set x = 1", stmt.executedSql);
         assertTrue(stmt.closed);
-        assertEquals("dml", ((Map<?, ?>) response.result).get("type"));
-        assertEquals(3, ((Number) ((Map<?, ?>) response.result).get("affected-rows")).intValue());
+        assertEquals("dml", resultMap(response).get("type"));
+        assertEquals(3, ((Number) resultMap(response).get("affected-rows")).intValue());
     }
 
     @Test
@@ -266,14 +180,8 @@ class DispatcherTest {
                 case "isWrapperFor"    -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 99;
-        req.op = "execute";
-        req.params.put("conn-id", 7);
-        req.params.put("sql", "SELECT 1");
-
-        assertThrows(java.sql.SQLException.class, () -> dispatcher.dispatch(req));
+        assertThrows(java.sql.SQLException.class,
+            () -> dispatch(connMgr, 99, "execute", "conn-id", 7, "sql", "SELECT 1"));
         assertTrue(closed[0], "statement must be closed when getResultSet() fails");
     }
 
@@ -289,14 +197,9 @@ class DispatcherTest {
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 19;
-        req.op = "execute";
-        req.params.put("conn-id", 7);
-        req.params.put("sql", "SELECT 1 FROM dual");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatch(connMgr, 19, "execute",
+            "conn-id", 7,
+            "sql", "SELECT 1 FROM dual");
 
         assertFalse(response.ok);
         assertNotNull(response.error);
@@ -333,16 +236,11 @@ class DispatcherTest {
                 case "isWrapperFor"    -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 20;
-        req.op = "execute";
-        req.params.put("conn-id", 7);
-        req.params.put("sql", "UPDATE t SET x = 1");
-        req.params.put("query-timeout-seconds", 1);
-
         long start = System.currentTimeMillis();
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatch(connMgr, 20, "execute",
+            "conn-id", 7,
+            "sql", "UPDATE t SET x = 1",
+            "query-timeout-seconds", 1);
         long elapsed = System.currentTimeMillis() - start;
 
         assertFalse(response.ok);
@@ -379,36 +277,23 @@ class DispatcherTest {
                 case "isWrapperFor"    -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 21;
-        req.op = "execute";
-        req.params.put("conn-id", 7);
-        req.params.put("sql", "DELETE FROM t WHERE 1=0");
-        // no query-timeout-seconds param
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatch(connMgr, 21, "execute",
+            "conn-id", 7,
+            "sql", "DELETE FROM t WHERE 1=0");
 
         assertTrue(response.ok);
         assertEquals(Dispatcher.DEFAULT_EXECUTE_TIMEOUT, capturedTimeout[0],
             "default timeout should be used when none specified");
-        assertEquals("dml", ((Map<?, ?>) response.result).get("type"));
+        assertEquals("dml", resultMap(response).get("type"));
     }
 
     @Test
     void getColumnsUsesOracleFastPath() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 3;
-        req.op = "get-columns";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "ZJSY");
-        req.params.put("table", "t_sys_para");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 3, "get-columns",
+            "conn-id", 7,
+            "schema", "ZJSY",
+            "table", "t_sys_para");
 
         assertTrue(response.ok);
         assertEquals(
@@ -420,78 +305,54 @@ class DispatcherTest {
             oracle.lastSqlNormalized());
         assertEquals(List.of("T_SYS_PARA", "%"), oracle.params);
         assertEquals(5, oracle.queryTimeoutSeconds);
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> cols = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("columns");
+        List<Map<String, Object>> cols = resultList(response, "columns");
         assertEquals("PARA_ID", cols.get(0).get("name"));
     }
 
     @Test
     void getTablesIncludesOracleSynonyms() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         oracle.resultRows = List.of(
             oracle.objectRow("USER_SYM", "SYNONYM", "APP", "ZJSY")
         );
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 30;
-        req.op = "get-tables";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "ZJSY");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 30, "get-tables",
+            "conn-id", 7,
+            "schema", "ZJSY");
 
         assertTrue(response.ok);
         assertTrue(oracle.lastSqlNormalized().contains("user_synonyms"));
         assertEquals(List.of("ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY"), oracle.params);
-        @SuppressWarnings("unchecked")
-        List<List<Object>> rows = (List<List<Object>>) ((Map<?, ?>) response.result).get("rows");
+        List<List<Object>> rows = resultList(response, "rows");
         assertEquals(List.of("USER_SYM", "SYNONYM", "APP", "ZJSY"), rows.get(0));
     }
 
     @Test
     void searchColumnsUsesOracleFastPathAndPrefix() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 4;
-        req.op = "search-columns";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "ZJSY");
-        req.params.put("table", "t_sys_para");
-        req.params.put("prefix", "pa");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 4, "search-columns",
+            "conn-id", 7,
+            "schema", "ZJSY",
+            "table", "t_sys_para",
+            "prefix", "pa");
 
         assertTrue(response.ok);
         assertEquals(List.of("T_SYS_PARA", "PA%"), oracle.params);
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> cols = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("columns");
+        List<Map<String, Object>> cols = resultList(response, "columns");
         assertEquals(2, cols.size());
         assertEquals("PARA_NAME", cols.get(1).get("name"));
     }
 
     @Test
     void searchTablesUsesOracleAccessibleObjectPath() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         oracle.resultRows = List.of(
             oracle.objectRow("ORDERS", "SYNONYM", "DATA_OWNER", "ZJSY"),
             oracle.objectRow("ORDER_LOG", "TABLE", "REPORTING")
         );
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 40;
-        req.op = "search-tables";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "ZJSY");
-        req.params.put("prefix", "or");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 40, "search-tables",
+            "conn-id", 7,
+            "schema", "ZJSY",
+            "prefix", "or");
 
         assertTrue(response.ok);
         assertTrue(oracle.lastSqlNormalized().contains("user_synonyms"),
@@ -507,8 +368,7 @@ class DispatcherTest {
                              "ZJSY", "OR%",
                              "OR%"),
             oracle.params);
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> tables = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("tables");
+        List<Map<String, Object>> tables = resultList(response, "tables");
         assertEquals(2, tables.size());
         assertEquals("ORDERS", tables.get(0).get("name"));
         assertEquals("DATA_OWNER", tables.get(0).get("schema"));
@@ -517,25 +377,17 @@ class DispatcherTest {
 
     @Test
     void searchTablesKeepsOraclePublicSynonymsForSystemOwners() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         oracle.resultRows = List.of(
             oracle.objectRow("USER_TABLES", "PUBLIC SYNONYM", "SYS", "PUBLIC")
         );
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 42;
-        req.op = "search-tables";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "APP");
-        req.params.put("prefix", "user_");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 42, "search-tables",
+            "conn-id", 7,
+            "schema", "APP",
+            "prefix", "user_");
 
         assertTrue(response.ok);
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> tables = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("tables");
+        List<Map<String, Object>> tables = resultList(response, "tables");
         assertEquals(1, tables.size());
         assertEquals("USER_TABLES", tables.get(0).get("name"));
         assertEquals("PUBLIC SYNONYM", tables.get(0).get("type"));
@@ -545,22 +397,15 @@ class DispatcherTest {
 
     @Test
     void getTablesUsesOracleAccessibleObjectPath() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         oracle.resultRows = List.of(
             oracle.objectRow("CUSTOMERS", "SYNONYM", "DATA_OWNER", "ZJSY"),
             oracle.objectRow("ORDERS", "SYNONYM", "DATA_OWNER", "ZJSY"),
             oracle.objectRow("PAYMENTS", "TABLE", "DATA_OWNER", "DATA_OWNER")
         );
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 43;
-        req.op = "get-tables";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "ZJSY");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 43, "get-tables",
+            "conn-id", 7,
+            "schema", "ZJSY");
 
         assertTrue(response.ok);
         assertTrue(oracle.executedSqlsNormalized().stream()
@@ -570,8 +415,7 @@ class DispatcherTest {
                        .anyMatch(sql -> sql.contains("all_tables")),
             "get-tables should include accessible tables outside the current schema");
         assertEquals(List.of("ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY", "ZJSY"), oracle.params);
-        @SuppressWarnings("unchecked")
-        List<List<Object>> rows = (List<List<Object>>) ((Map<?, ?>) response.result).get("rows");
+        List<List<Object>> rows = resultList(response, "rows");
         assertEquals(3, rows.size());
         assertEquals(List.of("CUSTOMERS", "SYNONYM", "DATA_OWNER", "ZJSY"), rows.get(0));
         assertEquals(List.of("ORDERS", "SYNONYM", "DATA_OWNER", "ZJSY"), rows.get(1));
@@ -580,7 +424,6 @@ class DispatcherTest {
 
     @Test
     void searchColumnsFallsBackToResolvedOracleSynonym() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         oracle.setRowsForSql("""
             SELECT column_name, data_type, nullable, column_id
@@ -610,17 +453,11 @@ class DispatcherTest {
                 oracle.row("PARA_ID", "NUMBER", "N", 1),
                 oracle.row("PARA_NAME", "VARCHAR2", "Y", 2)
             ));
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 41;
-        req.op = "search-columns";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "ZJSY");
-        req.params.put("table", "orders");
-        req.params.put("prefix", "pa");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 41, "search-columns",
+            "conn-id", 7,
+            "schema", "ZJSY",
+            "table", "orders",
+            "prefix", "pa");
 
         assertTrue(response.ok);
         assertTrue(oracle.executedSqlsNormalized().stream()
@@ -635,8 +472,7 @@ class DispatcherTest {
             "ORDER BY column_id",
             oracle.lastSqlNormalized());
         assertEquals(List.of("DATA_OWNER", "ORDERS", "PA%"), oracle.params);
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> cols = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("columns");
+        List<Map<String, Object>> cols = resultList(response, "columns");
         assertEquals(2, cols.size());
         assertEquals("PARA_ID", cols.get(0).get("name"));
         assertEquals("PARA_NAME", cols.get(1).get("name"));
@@ -644,33 +480,24 @@ class DispatcherTest {
 
     @Test
     void getPrimaryKeysUsesOracleFastPath() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         // default resultRows have "column_name" → "PARA_ID" / "PARA_NAME", which the PK query reads
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 5;
-        req.op = "get-primary-keys";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "ZJSY");  // matches currentUser "zjsy" → user_* path
-        req.params.put("table", "orders");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 5, "get-primary-keys",
+            "conn-id", 7,
+            "schema", "ZJSY",
+            "table", "orders");
 
         assertTrue(response.ok);
         assertTrue(oracle.lastSqlNormalized().contains("user_constraints"),
             "should use Oracle fast path (user_constraints)");
         assertEquals(List.of("ORDERS"), oracle.params);
         assertEquals(5, oracle.queryTimeoutSeconds);
-        @SuppressWarnings("unchecked")
-        List<String> pks = (List<String>) ((Map<?, ?>) response.result).get("primary-keys");
+        List<String> pks = resultList(response, "primary-keys");
         assertEquals(List.of("PARA_ID", "PARA_NAME"), pks);
     }
 
     @Test
     void getForeignKeysUsesOracleFastPath() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         Map<String, Object> fkRow = new HashMap<>();
         fkRow.put("fk_column", "CUSTOMER_ID");
@@ -678,24 +505,17 @@ class DispatcherTest {
         fkRow.put("pk_schema", "ZJSY");
         fkRow.put("pk_column", "ID");
         oracle.resultRows = List.of(fkRow);
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 6;
-        req.op = "get-foreign-keys";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "ZJSY");
-        req.params.put("table", "orders");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 6, "get-foreign-keys",
+            "conn-id", 7,
+            "schema", "ZJSY",
+            "table", "orders");
 
         assertTrue(response.ok);
         assertTrue(oracle.lastSqlNormalized().contains("user_constraints"),
             "should use Oracle fast path (user_constraints)");
         assertEquals(List.of("ORDERS"), oracle.params);
         assertEquals(5, oracle.queryTimeoutSeconds);
-        @SuppressWarnings("unchecked")
-        List<Map<?, ?>> fks = (List<Map<?, ?>>) ((Map<?, ?>) response.result).get("foreign-keys");
+        List<Map<?, ?>> fks = resultList(response, "foreign-keys");
         assertEquals(1, fks.size());
         assertEquals("CUSTOMER_ID", fks.get(0).get("fk-column"));
         assertEquals("CUSTOMERS",   fks.get(0).get("pk-table"));
@@ -705,57 +525,41 @@ class DispatcherTest {
 
     @Test
     void getReferencingObjectsUsesOracleFastPath() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         Map<String, Object> row = new HashMap<>();
         row.put("name", "ORDERS");
         row.put("schema", "ZJSY");
         oracle.resultRows = List.of(row);
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 33;
-        req.op = "get-referencing-objects";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "ZJSY");
-        req.params.put("table", "customers");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 33, "get-referencing-objects",
+            "conn-id", 7,
+            "schema", "ZJSY",
+            "table", "customers");
 
         assertTrue(response.ok);
         assertTrue(oracle.lastSqlNormalized().contains("user_constraints"));
         assertEquals(List.of("CUSTOMERS"), oracle.params);
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> objects = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("objects");
+        List<Map<String, Object>> objects = resultList(response, "objects");
         assertEquals("ORDERS", objects.get(0).get("name"));
         assertEquals("ZJSY", objects.get(0).get("schema"));
     }
 
     @Test
     void getIndexesUsesOracleFastPath() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         Map<String, Object> indexRow = new HashMap<>();
         indexRow.put("index_name", "ORDER_IDX");
         indexRow.put("table_name", "ORDERS");
         indexRow.put("uniqueness", "UNIQUE");
         oracle.resultRows = List.of(indexRow);
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 31;
-        req.op = "get-indexes";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "ZJSY");
-        req.params.put("table", "orders");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 31, "get-indexes",
+            "conn-id", 7,
+            "schema", "ZJSY",
+            "table", "orders");
 
         assertTrue(response.ok);
         assertTrue(oracle.lastSqlNormalized().contains("user_indexes"));
         assertEquals(List.of("ORDERS", "ORDERS"), oracle.params);
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> indexes = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("indexes");
+        List<Map<String, Object>> indexes = resultList(response, "indexes");
         assertEquals("ORDER_IDX", indexes.get(0).get("name"));
         assertEquals("ORDERS", indexes.get(0).get("table"));
         assertEquals(true, indexes.get(0).get("unique"));
@@ -763,29 +567,94 @@ class DispatcherTest {
 
     @Test
     void getProceduresUsesOracleObjectsFastPath() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         Map<String, Object> procRow = new HashMap<>();
         procRow.put("object_name", "PROCESS_ORDER");
         procRow.put("status", "VALID");
         oracle.resultRows = List.of(procRow);
-        connMgr.connection = oracle.connection();
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        Request req = new Request();
-        req.id = 32;
-        req.op = "get-procedures";
-        req.params.put("conn-id", 7);
-        req.params.put("schema", "ZJSY");
-
-        Response response = dispatcher.dispatch(req);
+        Response response = dispatchOracle(oracle, 32, "get-procedures",
+            "conn-id", 7,
+            "schema", "ZJSY");
 
         assertTrue(response.ok);
         assertTrue(oracle.lastSqlNormalized().contains("user_objects"));
         assertEquals(List.of("PROCEDURE"), oracle.params);
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> procedures = (List<Map<String, Object>>) ((Map<?, ?>) response.result).get("procedures");
+        List<Map<String, Object>> procedures = resultList(response, "procedures");
         assertEquals("PROCESS_ORDER", procedures.get(0).get("name"));
         assertEquals("VALID", procedures.get(0).get("status"));
+    }
+
+    private static Response dispatch(RecordingConnectionManager connMgr, int id, String op,
+                                     Object... params) throws Exception {
+        return new Dispatcher(connMgr, new CursorManager()).dispatch(request(id, op, params));
+    }
+
+    private static Response dispatchOracle(OracleMetadataRecorder oracle, int id, String op,
+                                           Object... params) throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = oracle.connection();
+        return dispatch(connMgr, id, op, params);
+    }
+
+    private static Request request(int id, String op, Object... params) {
+        if (params.length % 2 != 0) {
+            throw new IllegalArgumentException("params must contain key/value pairs");
+        }
+        Request req = new Request();
+        req.id = id;
+        req.op = op;
+        for (int i = 0; i < params.length; i += 2) {
+            req.params.put((String) params[i], params[i + 1]);
+        }
+        return req;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> resultMap(Response response) {
+        return (Map<String, Object>) response.result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> List<T> resultList(Response response, String key) {
+        return (List<T>) resultMap(response).get(key);
+    }
+
+    private static Connection connectionWithNoArgCall(String methodName, Runnable callback) {
+        return (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> {
+                if (method.getName().equals(methodName)) {
+                    callback.run();
+                    return null;
+                }
+                if (method.getName().equals("unwrap")) {
+                    return null;
+                }
+                if (method.getName().equals("isWrapperFor")) {
+                    return false;
+                }
+                throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
+    private static Connection connectionWithBooleanCall(String methodName, Consumer<Boolean> callback) {
+        return (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, args) -> {
+                if (method.getName().equals(methodName)) {
+                    callback.accept((Boolean) args[0]);
+                    return null;
+                }
+                if (method.getName().equals("unwrap")) {
+                    return null;
+                }
+                if (method.getName().equals("isWrapperFor")) {
+                    return false;
+                }
+                throw new UnsupportedOperationException(method.getName());
+            });
     }
 
     private static Connection proxyConnection(RecordingStatementHandler stmt) {
