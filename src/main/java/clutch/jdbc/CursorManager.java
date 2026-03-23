@@ -77,8 +77,8 @@ public class CursorManager {
     public void close(int cursorId) {
         Cursor c = cursors.remove(cursorId);
         if (c == null) return;
-        try { c.rs().close();   } catch (Exception ignored) {}
-        try { c.stmt().close(); } catch (Exception ignored) {}
+        closeResultSetQuietly(c.rs());
+        closeStatementQuietly(c.stmt());
     }
 
     /** Close all cursors belonging to a connection (called on disconnect). */
@@ -94,4 +94,22 @@ public class CursorManager {
 
     public record FetchResult(List<String> columns, List<String> types,
                               List<List<Object>> rows, boolean done) {}
+
+    private void closeResultSetQuietly(ResultSet rs) {
+        try {
+            rs.close();
+        } catch (Exception e) {
+            LOG.log(System.Logger.Level.WARNING,
+                "Failed to close ResultSet during cursor cleanup", e);
+        }
+    }
+
+    private void closeStatementQuietly(Statement stmt) {
+        try {
+            stmt.close();
+        } catch (Exception e) {
+            LOG.log(System.Logger.Level.WARNING,
+                "Failed to close Statement during cursor cleanup", e);
+        }
+    }
 }

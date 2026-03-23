@@ -14,6 +14,8 @@ import java.sql.*;
  */
 public class TypeConverter {
 
+    private static final System.Logger LOG = System.getLogger(TypeConverter.class.getName());
+
     /**
      * Convert a small BLOB's raw bytes to a map preserving the blob origin.
      * If the bytes are valid UTF-8 and look like JSON, includes the text content.
@@ -30,8 +32,9 @@ public class TypeConverter {
                 return java.util.Map.of("__type", "blob", "length", length,
                                         "text", text);
             }
-        } catch (java.nio.charset.CharacterCodingException ignored) {
-            // Not valid UTF-8: fall through to plain blob placeholder.
+        } catch (java.nio.charset.CharacterCodingException e) {
+            LOG.log(System.Logger.Level.DEBUG,
+                "BLOB preview is not valid UTF-8; returning plain blob placeholder", e);
         }
         return java.util.Map.of("__type", "blob", "length", length);
     }
@@ -72,25 +75,17 @@ public class TypeConverter {
         // Large objects: return a placeholder, not the full content.
         if (val instanceof Clob) {
             Clob clob = (Clob) val;
-            try {
-                long len = clob.length();
-                String preview = clob.getSubString(1, (int) Math.min(len, 256));
-                return java.util.Map.of("__type", "clob", "length", len, "preview", preview);
-            } catch (SQLException e) {
-                return java.util.Map.of("__type", "clob", "error", e.getMessage());
-            }
+            long len = clob.length();
+            String preview = clob.getSubString(1, (int) Math.min(len, 256));
+            return java.util.Map.of("__type", "clob", "length", len, "preview", preview);
         }
         if (val instanceof Blob) {
             Blob blob = (Blob) val;
-            try {
-                long len = blob.length();
-                if (len <= 65536) {
-                    return blobBytesToMap(blob.getBytes(1, (int) len), len);
-                }
-                return java.util.Map.of("__type", "blob", "length", len);
-            } catch (SQLException e) {
-                return java.util.Map.of("__type", "blob", "error", e.getMessage());
+            long len = blob.length();
+            if (len <= 65536) {
+                return blobBytesToMap(blob.getBytes(1, (int) len), len);
             }
+            return java.util.Map.of("__type", "blob", "length", len);
         }
         if (val instanceof byte[]) return blobBytesToMap((byte[]) val, ((byte[]) val).length);
 
