@@ -2,6 +2,9 @@ package clutch.jdbc;
 
 import java.math.BigDecimal;
 import java.sql.*;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 
 /**
  * Converts a single JDBC column value to a JSON-safe Java object.
@@ -15,6 +18,10 @@ import java.sql.*;
 public class TypeConverter {
 
     private static final System.Logger LOG = System.getLogger(TypeConverter.class.getName());
+    private static final DateTimeFormatter TIMESTAMP_FORMATTER =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final DateTimeFormatter TIME_FORMATTER =
+        DateTimeFormatter.ofPattern("HH:mm:ss");
 
     /**
      * Convert a small BLOB's raw bytes to a map preserving the blob origin.
@@ -66,11 +73,11 @@ public class TypeConverter {
         // BigDecimal → String to preserve precision (avoids JS float rounding).
         if (val instanceof BigDecimal) return ((BigDecimal) val).toPlainString();
 
-        // Date/Time → ISO-8601 strings.
+        // Date/Time -> local wall-clock strings.
         // Note: Oracle DATE has a time component; getTimestamp() is safer than getDate().
-        if (val instanceof Timestamp) return ((Timestamp) val).toInstant().toString();
+        if (val instanceof Timestamp) return formatTimestamp((Timestamp) val);
         if (val instanceof Date) return ((Date) val).toLocalDate().toString();
-        if (val instanceof Time) return ((Time) val).toLocalTime().toString();
+        if (val instanceof Time) return formatTime((Time) val);
 
         // Large objects: return a placeholder, not the full content.
         if (val instanceof Clob) {
@@ -92,5 +99,23 @@ public class TypeConverter {
         // Fallback: getString() for anything else (e.g. Oracle-specific types).
         String s = rs.getString(col);
         return s != null ? s : val.toString();
+    }
+
+    private static String formatTimestamp(Timestamp value) {
+        LocalDateTime timestamp = value.toLocalDateTime();
+        return formatFractionalValue(TIMESTAMP_FORMATTER.format(timestamp), timestamp.getNano());
+    }
+
+    private static String formatTime(Time value) {
+        LocalTime time = value.toLocalTime();
+        return formatFractionalValue(TIME_FORMATTER.format(time), time.getNano());
+    }
+
+    private static String formatFractionalValue(String base, int nanos) {
+        if (nanos == 0) {
+            return base;
+        }
+        String fraction = String.format("%09d", nanos).replaceFirst("0+$", "");
+        return base + "." + fraction;
     }
 }

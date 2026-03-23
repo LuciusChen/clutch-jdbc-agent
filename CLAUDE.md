@@ -160,15 +160,18 @@ Rules for `TypeConverter.convert()`:
   (NaN/Inf are not valid JSON)
 - `BigDecimal` → **String** (use `toPlainString()`). Preserves precision;
   avoids JavaScript float rounding on the Emacs side.
-- `Timestamp`, `Date`, `Time` → ISO-8601 String via `toInstant()` /
-  `toLocalDate()` / `toLocalTime()`. Oracle `DATE` has a time component —
+- `Timestamp` → local wall-clock String via `toLocalDateTime()` formatted as
+  `yyyy-MM-dd HH:mm:ss[.fraction]`. Fractional seconds are included only when
+  non-zero, with trailing zeros stripped. Oracle `DATE` has a time component —
   always use `getTimestamp()`, never `getDate()`, for Oracle columns.
+- `Date` → `toLocalDate().toString()` (e.g. `2024-06-28`)
+- `Time` → local wall-clock String via `toLocalTime()` formatted as
+  `HH:mm:ss[.fraction]`, same trailing-zero rules as Timestamp.
 - `Clob` → `{"__type":"clob","length":N,"preview":"..."}` (first 256 chars)
 - `Blob`, `byte[]` → `{"__type":"blob","length":N}`
 - Anything else → `rs.getString(col)` fallback
 
-Stability over perfection. The Emacs side (`clutch-db-format-temporal`) handles
-ISO-8601 strings natively.
+Stability over perfection.
 
 ## Method Design
 
