@@ -7,7 +7,9 @@ import java.sql.Blob;
 import java.sql.Clob;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Timestamp;
 import java.util.Map;
+import java.util.TimeZone;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -74,6 +76,28 @@ class TypeConverterTest {
         assertEquals("blob", converted.get("__type"));
         assertEquals(2L, converted.get("length"));
         assertFalse(converted.containsKey("text"));
+    }
+
+    @Test
+    void convertKeepsTimestampInLocalWallClockFormat() throws SQLException {
+        TimeZone original = TimeZone.getDefault();
+        TimeZone.setDefault(TimeZone.getTimeZone("Asia/Shanghai"));
+        try {
+            Object converted = TypeConverter.convert(
+                resultSetReturning(Timestamp.valueOf("2024-06-28 19:30:00")),
+                1);
+            assertEquals("2024-06-28 19:30:00", converted);
+        } finally {
+            TimeZone.setDefault(original);
+        }
+    }
+
+    @Test
+    void convertPreservesNonZeroTimestampFractionWithoutTrailingZeros() throws SQLException {
+        Object converted = TypeConverter.convert(
+            resultSetReturning(Timestamp.valueOf("2024-06-28 19:30:00.120000000")),
+            1);
+        assertEquals("2024-06-28 19:30:00.12", converted);
     }
 
     private static ResultSet resultSetReturning(Object value) {
