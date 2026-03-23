@@ -18,6 +18,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class ConnectionManager {
 
+    private static final System.Logger LOG = System.getLogger(ConnectionManager.class.getName());
+
     private final AtomicInteger nextId = new AtomicInteger(1);
     private final Map<Integer, Session> connections = new ConcurrentHashMap<>();
     private final ExecutorService networkTimeoutExecutor = Executors.newCachedThreadPool(r -> {
@@ -68,8 +70,8 @@ public class ConnectionManager {
         if (!autoCommit) {
             try {
                 conn.setAutoCommit(false);
-            } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
-                // Driver does not support manual-commit mode; proceed with autocommit.
+            } catch (SQLFeatureNotSupportedException | AbstractMethodError e) {
+                logUnsupportedCapability("setAutoCommit(false)", e);
             }
         }
         applyNetworkTimeout(conn, networkTimeoutSeconds);
@@ -79,13 +81,13 @@ public class ConnectionManager {
             throws SQLException {
         try {
             conn.setAutoCommit(true);
-        } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
-            // Driver does not allow autocommit changes; continue.
+        } catch (SQLFeatureNotSupportedException | AbstractMethodError e) {
+            logUnsupportedCapability("setAutoCommit(true)", e);
         }
         try {
             conn.setReadOnly(true);
-        } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
-            // Driver does not implement read-only mode; continue.
+        } catch (SQLFeatureNotSupportedException | AbstractMethodError e) {
+            logUnsupportedCapability("setReadOnly(true)", e);
         }
         applyNetworkTimeout(conn, networkTimeoutSeconds);
     }
@@ -95,10 +97,15 @@ public class ConnectionManager {
         if (networkTimeoutSeconds != null && networkTimeoutSeconds > 0) {
             try {
                 conn.setNetworkTimeout(networkTimeoutExecutor, networkTimeoutSeconds * 1000);
-            } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
-                // Driver does not implement network timeout; continue without it.
+            } catch (SQLFeatureNotSupportedException | AbstractMethodError e) {
+                logUnsupportedCapability("setNetworkTimeout(" + networkTimeoutSeconds + "s)", e);
             }
         }
+    }
+
+    private void logUnsupportedCapability(String capability, Throwable error) {
+        LOG.log(System.Logger.Level.DEBUG,
+            "Driver does not support optional JDBC capability: " + capability, error);
     }
 
     private Connection openConnection(String url, Properties props, Integer connectTimeoutSeconds)
@@ -165,7 +172,10 @@ public class ConnectionManager {
             if (!connection.isClosed()) {
                 connection.close();
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            LOG.log(System.Logger.Level.WARNING,
+                "Failed to close JDBC connection during cleanup", e);
+        }
     }
 
     private record Session(Connection primary, Connection metadata) {}

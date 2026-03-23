@@ -16,6 +16,8 @@ import java.util.stream.Collectors;
  */
 public class Dispatcher {
 
+    private static final System.Logger LOG = System.getLogger(Dispatcher.class.getName());
+
     private static final int DEFAULT_FETCH_SIZE              = 500;
     private static final int ORACLE_TABLES_TIMEOUT_SECONDS   =  15;
     private static final int ORACLE_METADATA_TIMEOUT_SECONDS =   5;
@@ -169,11 +171,11 @@ public class Dispatcher {
             isQuery = future.get(executeTimeout + 1, TimeUnit.SECONDS); // thread-level cancel (suspenders)
         } catch (TimeoutException e) {
             future.cancel(true);
-            try { stmt.cancel(); } catch (Exception ignored) {}
-            try { stmt.close(); } catch (Exception ignored) {}
+            cancelStatementQuietly(stmt);
+            closeStatementQuietly(stmt);
             return Response.error(req.id, "Query timed out after " + executeTimeout + "s");
         } catch (ExecutionException e) {
-            try { stmt.close(); } catch (Exception ignored) {}
+            closeStatementQuietly(stmt);
             Throwable cause = e.getCause();
             throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
         }
@@ -203,7 +205,7 @@ public class Dispatcher {
             result.put("done",      first.done());
             return Response.ok(req.id, result);
         } catch (Exception e) {
-            try { stmt.close(); } catch (Exception ignored) {}
+            closeStatementQuietly(stmt);
             throw e;
         }
     }
@@ -334,7 +336,7 @@ public class Dispatcher {
             result.put("done",      first.done());
             return Response.ok(reqId, result);
         } catch (SQLException e) {
-            try { ps.close(); } catch (Exception ignored) {}
+            closeStatementQuietly(ps);
             throw e;
         }
     }
@@ -1800,6 +1802,24 @@ public class Dispatcher {
         if (v == null) return null;
         if (v instanceof Number n) return n.intValue();
         throw new IllegalArgumentException("Non-integer param: " + key);
+    }
+
+    private void cancelStatementQuietly(Statement stmt) {
+        try {
+            stmt.cancel();
+        } catch (Exception e) {
+            LOG.log(System.Logger.Level.WARNING,
+                "Failed to cancel JDBC statement after timeout", e);
+        }
+    }
+
+    private void closeStatementQuietly(Statement stmt) {
+        try {
+            stmt.close();
+        } catch (Exception e) {
+            LOG.log(System.Logger.Level.WARNING,
+                "Failed to close JDBC statement during cleanup", e);
+        }
     }
 
     private String routinesColumnMode(int columnType, boolean procedures) {

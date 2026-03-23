@@ -4,6 +4,9 @@ import clutch.jdbc.ConnectionManager;
 import clutch.jdbc.CursorManager;
 import clutch.jdbc.model.Request;
 import clutch.jdbc.model.Response;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Proxy;
@@ -18,6 +21,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -27,27 +31,34 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DispatcherTest {
 
-    @Test
-    void connectForwardsExplicitTimeouts() throws Exception {
+    @ParameterizedTest
+    @MethodSource("connectCases")
+    void connectForwardsExplicitTimeouts(String url, String user, String password,
+                                         Map<String, String> props,
+                                         int connectTimeoutSeconds,
+                                         int networkTimeoutSeconds,
+                                         boolean autoCommit,
+                                         int returnedConnId) throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.returnedConnId = returnedConnId;
         Response response = dispatch(connMgr, 1, "connect",
-            "url", "jdbc:test:demo",
-            "user", "scott",
-            "password", "tiger",
-            "props", Map.of("role", "reporting"),
-            "connect-timeout-seconds", 8,
-            "network-timeout-seconds", 9,
-            "auto-commit", false);
+            "url", url,
+            "user", user,
+            "password", password,
+            "props", props,
+            "connect-timeout-seconds", connectTimeoutSeconds,
+            "network-timeout-seconds", networkTimeoutSeconds,
+            "auto-commit", autoCommit);
 
         assertTrue(response.ok);
-        assertEquals("jdbc:test:demo", connMgr.url);
-        assertEquals("scott", connMgr.user);
-        assertEquals("tiger", connMgr.password);
-        assertEquals(Map.of("role", "reporting"), connMgr.props);
-        assertEquals(8, connMgr.connectTimeoutSeconds);
-        assertEquals(9, connMgr.networkTimeoutSeconds);
-        assertFalse(connMgr.autoCommit);
-        assertEquals(42, ((Number) ((Map<?, ?>) response.result).get("conn-id")).intValue());
+        assertEquals(url, connMgr.url);
+        assertEquals(user, connMgr.user);
+        assertEquals(password, connMgr.password);
+        assertEquals(props, connMgr.props);
+        assertEquals(connectTimeoutSeconds, connMgr.connectTimeoutSeconds);
+        assertEquals(networkTimeoutSeconds, connMgr.networkTimeoutSeconds);
+        assertEquals(autoCommit, connMgr.autoCommit);
+        assertEquals(returnedConnId, ((Number) ((Map<?, ?>) response.result).get("conn-id")).intValue());
     }
 
     @Test
@@ -136,22 +147,27 @@ class DispatcherTest {
         assertEquals("CJH_TEST", resultMap(response).get("schema"));
     }
 
-    @Test
-    void executeAppliesQueryTimeoutBeforeRunningStatement() throws Exception {
+    @ParameterizedTest
+    @MethodSource("executeDmlCases")
+    void executeAppliesQueryTimeoutBeforeRunningStatement(String sql,
+                                                          int queryTimeoutSeconds,
+                                                          int updateCount,
+                                                          String expectedSql) throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         RecordingStatementHandler stmt = new RecordingStatementHandler();
+        stmt.updateCount = updateCount;
         connMgr.connection = proxyConnection(stmt);
         Response response = dispatch(connMgr, 2, "execute",
             "conn-id", 7,
-            "sql", "update demo set x = 1;",
-            "query-timeout-seconds", 16);
+            "sql", sql,
+            "query-timeout-seconds", queryTimeoutSeconds);
 
         assertTrue(response.ok);
-        assertEquals(16, stmt.queryTimeoutSeconds);
-        assertEquals("update demo set x = 1", stmt.executedSql);
+        assertEquals(queryTimeoutSeconds, stmt.queryTimeoutSeconds);
+        assertEquals(expectedSql, stmt.executedSql);
         assertTrue(stmt.closed);
         assertEquals("dml", resultMap(response).get("type"));
-        assertEquals(3, ((Number) resultMap(response).get("affected-rows")).intValue());
+        assertEquals(updateCount, ((Number) resultMap(response).get("affected-rows")).intValue());
     }
 
     @Test
@@ -584,6 +600,22 @@ class DispatcherTest {
         assertEquals("VALID", procedures.get(0).get("status"));
     }
 
+    private static Stream<Arguments> connectCases() {
+        return Stream.of(
+            Arguments.of("jdbc:test:demo", "scott", "tiger",
+                Map.of("role", "reporting"), 8, 9, false, 417),
+            Arguments.of("jdbc:test:analytics", "app_reader", "s3cr3t!",
+                Map.of("schema", "warehouse", "ssl", "true"), 3, 27, true, 9021)
+        );
+    }
+
+    private static Stream<Arguments> executeDmlCases() {
+        return Stream.of(
+            Arguments.of("update demo set x = 1;", 16, 17, "update demo set x = 1"),
+            Arguments.of("DELETE FROM audit_log WHERE id = 99;;", 5, 2, "DELETE FROM audit_log WHERE id = 99")
+        );
+    }
+
     private static Response dispatch(RecordingConnectionManager connMgr, int id, String op,
                                      Object... params) throws Exception {
         return new Dispatcher(connMgr, new CursorManager()).dispatch(request(id, op, params));
@@ -751,6 +783,7 @@ class DispatcherTest {
     }
 
     private static final class RecordingConnectionManager extends ConnectionManager {
+        private int returnedConnId = 42;
         private String url;
         private String user;
         private String password;
@@ -772,7 +805,7 @@ class DispatcherTest {
             this.connectTimeoutSeconds = connectTimeoutSeconds;
             this.networkTimeoutSeconds = networkTimeoutSeconds;
             this.autoCommit = autoCommit;
-            return 42;
+            return returnedConnId;
         }
 
         @Override
@@ -796,6 +829,7 @@ class DispatcherTest {
     private static final class RecordingStatementHandler {
         private int queryTimeoutSeconds;
         private String executedSql;
+        private int updateCount = 3;
         private boolean closed;
 
         private Statement proxy() {
@@ -811,7 +845,7 @@ class DispatcherTest {
                         executedSql = (String) args[0];
                         yield false;
                     }
-                    case "getUpdateCount" -> 3;
+                    case "getUpdateCount" -> updateCount;
                     case "close" -> {
                         closed = true;
                         yield null;
