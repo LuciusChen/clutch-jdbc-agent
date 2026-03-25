@@ -30,7 +30,7 @@ agent over a simple JSON protocol on stdin/stdout.
 mvn package
 ```
 
-Produces `target/clutch-jdbc-agent-0.2.0.jar` (fat jar with Jackson bundled).
+Produces `target/clutch-jdbc-agent-<version>.jar` (fat jar with Jackson bundled).
 JDBC driver jars are **not** bundled — they are loaded at runtime from a
 `drivers/` directory next to the jar.
 
@@ -115,9 +115,9 @@ JDBC column values are converted to a stable set of JSON-safe types:
 | `Integer`, `Long`, `Short`, `Byte` | JSON number                          |
 | `Double`, `Float`           | JSON number (NaN/Infinity → string)           |
 | `BigDecimal`                | String (preserves precision)                  |
-| `Timestamp`                 | ISO-8601 string (`2024-01-15T13:45:30Z`)      |
-| `Date`                      | ISO-8601 date string (`2024-01-15`)           |
-| `Time`                      | ISO-8601 time string (`13:45:30`)             |
+| `Timestamp`                 | Local wall-clock string (`2024-01-15 13:45:30`) |
+| `Date`                      | Date string (`2024-01-15`)                    |
+| `Time`                      | Time string (`13:45:30`)                      |
 | `Clob`                      | `{"__type":"clob","length":N,"preview":"..."}` |
 | `Blob` / `byte[]` (≤64 KB)  | `{"__type":"blob","length":N}` or `{"__type":"blob","length":N,"text":"..."}` if valid UTF-8 JSON |
 | Anything else               | `rs.getString(col)` fallback                  |
