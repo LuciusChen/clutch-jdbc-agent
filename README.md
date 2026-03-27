@@ -94,7 +94,6 @@ Error response:
 | `connect`         | Open a JDBC connection, returns `conn-id`        |
 | `disconnect`      | Close a connection and its open cursors          |
 | `execute`         | Execute SQL; returns first batch + `cursor-id`   |
-| `cancel`          | Cancel the currently running request for `conn-id` |
 | `fetch`           | Fetch next batch from an open cursor             |
 | `close-cursor`    | Close a cursor explicitly                        |
 | `get-schemas`     | List schemas via `DatabaseMetaData`              |
@@ -140,19 +139,8 @@ clutch-jdbc-agent (JVM process)
   drivers/*.jar           — JDBC drivers (loaded at runtime via URLClassLoader)
 ```
 
-The agent keeps stdin/stdout as a single ordered RPC channel, but request
-execution is no longer globally serialized.  Long-running `execute` / `fetch`
-work runs on worker threads so the main loop can still accept `cancel` for the
-same `conn-id`.
-
-For foreground SQL, the dispatcher tracks the currently running
-`Statement` per `conn-id`.  `cancel` calls `Statement.cancel()` and reports
-whether a running statement was found and interrupted.  A cancelled request is
-expected to complete with an ordinary error response (typically
-`"Query cancelled"`), after which the connection remains usable.
-
-No connection pooling, no SQL rewriting, and no cross-process async API — by
-design.
+The agent is a single-threaded process; all requests are handled sequentially.
+No connection pooling, no async execution, no SQL rewriting — by design.
 
 ## Driver Setup
 

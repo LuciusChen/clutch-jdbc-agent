@@ -53,7 +53,8 @@ public class CursorManager {
      * Returns null columns list when the cursor is exhausted (done=true).
      */
     public FetchResult fetch(int cursorId, int fetchSize) throws SQLException {
-        Cursor c = cursor(cursorId);
+        Cursor c = cursors.get(cursorId);
+        if (c == null) throw new SQLException("Unknown cursor id: " + cursorId);
 
         List<List<Object>> rows = new ArrayList<>(fetchSize);
         boolean done = false;
@@ -70,16 +71,6 @@ public class CursorManager {
 
         if (done) close(cursorId);
         return new FetchResult(c.columnNames(), c.columnTypes(), rows, done);
-    }
-
-    /** Return the live Statement backing {@code cursorId}. */
-    public Statement statementForCursor(int cursorId) throws SQLException {
-        return cursor(cursorId).stmt();
-    }
-
-    /** Return the owning connection id for {@code cursorId}. */
-    public int connectionIdForCursor(int cursorId) throws SQLException {
-        return cursor(cursorId).connId();
     }
 
     /** Close and remove the cursor for {@code cursorId}. No-op if already closed. */
@@ -103,12 +94,6 @@ public class CursorManager {
 
     public record FetchResult(List<String> columns, List<String> types,
                               List<List<Object>> rows, boolean done) {}
-
-    private Cursor cursor(int cursorId) throws SQLException {
-        Cursor c = cursors.get(cursorId);
-        if (c == null) throw new SQLException("Unknown cursor id: " + cursorId);
-        return c;
-    }
 
     private void closeResultSetQuietly(ResultSet rs) {
         try {

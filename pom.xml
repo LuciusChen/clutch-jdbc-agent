@@ -7,7 +7,7 @@
 
   <groupId>io.github.luciuschen</groupId>
   <artifactId>clutch-jdbc-agent</artifactId>
-  <version>0.2.3</version>
+  <version>0.2.2</version>
   <packaging>jar</packaging>
 
   <properties>
