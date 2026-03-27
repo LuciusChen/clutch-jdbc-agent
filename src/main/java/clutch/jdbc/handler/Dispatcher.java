@@ -255,12 +255,13 @@ public class Dispatcher {
     }
 
     private Response getTables(Request req) throws SQLException {
-        int connId    = getInt(req, "conn-id");
-        String schema = (String) req.params.get("schema");
+        int connId     = getInt(req, "conn-id");
+        String catalog = getOptionalString(req, "catalog");
+        String schema  = getOptionalString(req, "schema");
         Connection conn = metadataConnection(connId);
         return isOracle(conn)
             ? oracleTablesCursor(req.id, connId, conn, schema)
-            : jdbcTablesOneBatch(req.id, conn, schema);
+            : jdbcTablesOneBatch(req.id, conn, catalog, schema);
     }
 
     /**
@@ -346,13 +347,16 @@ public class Dispatcher {
      * Returns the same cursor-format response with done=true so the Emacs side
      * can use a single code path for both Oracle and non-Oracle.
      */
-    private Response jdbcTablesOneBatch(int reqId, Connection conn, String schema)
+    private Response jdbcTablesOneBatch(int reqId, Connection conn, String catalog, String schema)
             throws SQLException {
         String[] types = {"TABLE", "VIEW"};
         DatabaseMetaData meta = conn.getMetaData();
         List<List<Object>> rows = new ArrayList<>();
-        try (ResultSet rs = meta.getTables(null, schema, "%", types)) {
+        try (ResultSet rs = meta.getTables(catalog, schema, "%", types)) {
             while (rs.next()) {
+                if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                    continue;
+                }
                 List<Object> row = new ArrayList<>(3);
                 row.add(rs.getString("TABLE_NAME"));
                 row.add(rs.getString("TABLE_TYPE"));
@@ -369,36 +373,42 @@ public class Dispatcher {
     }
 
     private Response getColumns(Request req) throws SQLException {
-        int connId    = getInt(req, "conn-id");
-        String schema = (String) req.params.get("schema");
-        String table  = getString(req, "table");
+        int connId     = getInt(req, "conn-id");
+        String catalog = getOptionalString(req, "catalog");
+        String schema  = getOptionalString(req, "schema");
+        String table   = getString(req, "table");
 
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> cols = isOracle(conn)
             ? getOracleColumns(conn, schema, table, null)
-            : getJdbcMetadataColumns(conn, schema, table, null);
+            : getJdbcMetadataColumns(conn, catalog, schema, table, null);
         return Response.ok(req.id, Map.of("columns", cols));
     }
 
     private Response searchTables(Request req) throws SQLException {
         int connId      = getInt(req, "conn-id");
-        String schema   = (String) req.params.get("schema");
+        String catalog  = getOptionalString(req, "catalog");
+        String schema   = getOptionalString(req, "schema");
         String prefix   = Objects.toString(req.params.get("prefix"), "");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> tables = isOracle(conn)
             ? searchOracleTables(conn, schema, prefix)
-            : searchJdbcMetadataTables(conn, schema, prefix);
+            : searchJdbcMetadataTables(conn, catalog, schema, prefix);
         return Response.ok(req.id, Map.of("tables", tables));
     }
 
-    private List<Map<String, Object>> searchJdbcMetadataTables(Connection conn, String schema, String prefix)
+    private List<Map<String, Object>> searchJdbcMetadataTables(Connection conn, String catalog,
+                                                               String schema, String prefix)
             throws SQLException {
         String[] types = { "TABLE", "VIEW", "SYNONYM" };
         String pattern = (prefix == null || prefix.isBlank()) ? "%" : prefix + "%";
         DatabaseMetaData meta = conn.getMetaData();
         List<Map<String, Object>> tables = new ArrayList<>();
-        try (ResultSet rs = meta.getTables(null, schema, pattern, types)) {
+        try (ResultSet rs = meta.getTables(catalog, schema, pattern, types)) {
             while (rs.next()) {
+                if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                    continue;
+                }
                 tables.add(Map.of(
                     "name",   rs.getString("TABLE_NAME"),
                     "type",   rs.getString("TABLE_TYPE"),
@@ -515,14 +525,15 @@ public class Dispatcher {
     }
 
     private Response searchColumns(Request req) throws SQLException {
-        int connId    = getInt(req, "conn-id");
-        String schema = (String) req.params.get("schema");
-        String table  = getString(req, "table");
-        String prefix = Objects.toString(req.params.get("prefix"), "");
+        int connId     = getInt(req, "conn-id");
+        String catalog = getOptionalString(req, "catalog");
+        String schema  = getOptionalString(req, "schema");
+        String table   = getString(req, "table");
+        String prefix  = Objects.toString(req.params.get("prefix"), "");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> cols = isOracle(conn)
             ? searchOracleColumns(conn, schema, table, prefix)
-            : getJdbcMetadataColumns(conn, schema, table, prefix);
+            : getJdbcMetadataColumns(conn, catalog, schema, table, prefix);
         return Response.ok(req.id, Map.of("columns", cols));
     }
 
@@ -548,14 +559,17 @@ public class Dispatcher {
         return searchOracleAccessibleColumns(conn, table, prefix);
     }
 
-    private List<Map<String, Object>> getJdbcMetadataColumns(Connection conn, String schema,
+    private List<Map<String, Object>> getJdbcMetadataColumns(Connection conn, String catalog, String schema,
                                                              String table, String prefix)
             throws SQLException {
         DatabaseMetaData meta = conn.getMetaData();
         String pattern = (prefix == null || prefix.isBlank()) ? "%" : prefix + "%";
         List<Map<String, Object>> cols = new ArrayList<>();
-        try (ResultSet rs = meta.getColumns(null, schema, table, pattern)) {
+        try (ResultSet rs = meta.getColumns(catalog, schema, table, pattern)) {
             while (rs.next()) {
+                if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                    continue;
+                }
                 cols.add(Map.of(
                     "name",     rs.getString("COLUMN_NAME"),
                     "type",     rs.getString("TYPE_NAME"),
@@ -694,21 +708,28 @@ public class Dispatcher {
     }
 
     private Response getPrimaryKeys(Request req) throws SQLException {
-        int connId    = getInt(req, "conn-id");
-        String schema = (String) req.params.get("schema");
-        String table  = getString(req, "table");
+        int connId     = getInt(req, "conn-id");
+        String catalog = getOptionalString(req, "catalog");
+        String schema  = getOptionalString(req, "schema");
+        String table   = getString(req, "table");
         Connection conn = metadataConnection(connId);
         List<String> pks = isOracle(conn)
             ? getOraclePrimaryKeys(conn, schema, table)
-            : getJdbcMetadataPrimaryKeys(conn, schema, table);
+            : getJdbcMetadataPrimaryKeys(conn, catalog, schema, table);
         return Response.ok(req.id, Map.of("primary-keys", pks));
     }
 
-    private List<String> getJdbcMetadataPrimaryKeys(Connection conn, String schema, String table)
+    private List<String> getJdbcMetadataPrimaryKeys(Connection conn, String catalog,
+                                                    String schema, String table)
             throws SQLException {
         List<String> pks = new ArrayList<>();
-        try (ResultSet rs = conn.getMetaData().getPrimaryKeys(null, schema, table)) {
-            while (rs.next()) pks.add(rs.getString("COLUMN_NAME"));
+        try (ResultSet rs = conn.getMetaData().getPrimaryKeys(catalog, schema, table)) {
+            while (rs.next()) {
+                if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                    continue;
+                }
+                pks.add(rs.getString("COLUMN_NAME"));
+            }
         }
         return pks;
     }
@@ -754,21 +775,26 @@ public class Dispatcher {
     }
 
     private Response getForeignKeys(Request req) throws SQLException {
-        int connId    = getInt(req, "conn-id");
-        String schema = (String) req.params.get("schema");
-        String table  = getString(req, "table");
+        int connId     = getInt(req, "conn-id");
+        String catalog = getOptionalString(req, "catalog");
+        String schema  = getOptionalString(req, "schema");
+        String table   = getString(req, "table");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> fks = isOracle(conn)
             ? getOracleForeignKeys(conn, schema, table)
-            : getJdbcMetadataForeignKeys(conn, schema, table);
+            : getJdbcMetadataForeignKeys(conn, catalog, schema, table);
         return Response.ok(req.id, Map.of("foreign-keys", fks));
     }
 
-    private List<Map<String, Object>> getJdbcMetadataForeignKeys(Connection conn, String schema, String table)
+    private List<Map<String, Object>> getJdbcMetadataForeignKeys(Connection conn, String catalog,
+                                                                 String schema, String table)
             throws SQLException {
         List<Map<String, Object>> fks = new ArrayList<>();
-        try (ResultSet rs = conn.getMetaData().getImportedKeys(null, schema, table)) {
+        try (ResultSet rs = conn.getMetaData().getImportedKeys(catalog, schema, table)) {
             while (rs.next()) {
+                if (!matchesRequestedCatalog(rs, catalog, "FKTABLE_CAT", "FKTABLE_SCHEM")) {
+                    continue;
+                }
                 fks.add(Map.of(
                     "fk-column",   rs.getString("FKCOLUMN_NAME"),
                     "pk-table",    rs.getString("PKTABLE_NAME"),
@@ -781,22 +807,27 @@ public class Dispatcher {
     }
 
     private Response getReferencingObjects(Request req) throws SQLException {
-        int connId    = getInt(req, "conn-id");
-        String schema = (String) req.params.get("schema");
-        String table  = getString(req, "table");
+        int connId     = getInt(req, "conn-id");
+        String catalog = getOptionalString(req, "catalog");
+        String schema  = getOptionalString(req, "schema");
+        String table   = getString(req, "table");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> objects = isOracle(conn)
             ? getOracleReferencingObjects(conn, schema, table)
-            : getJdbcMetadataReferencingObjects(conn, schema, table);
+            : getJdbcMetadataReferencingObjects(conn, catalog, schema, table);
         return Response.ok(req.id, Map.of("objects", objects));
     }
 
-    private List<Map<String, Object>> getJdbcMetadataReferencingObjects(Connection conn, String schema, String table)
+    private List<Map<String, Object>> getJdbcMetadataReferencingObjects(Connection conn, String catalog,
+                                                                        String schema, String table)
             throws SQLException {
         List<Map<String, Object>> objects = new ArrayList<>();
         Set<String> seen = new LinkedHashSet<>();
-        try (ResultSet rs = conn.getMetaData().getExportedKeys(null, schema, table)) {
+        try (ResultSet rs = conn.getMetaData().getExportedKeys(catalog, schema, table)) {
             while (rs.next()) {
+                if (!matchesRequestedCatalog(rs, catalog, "PKTABLE_CAT", "PKTABLE_SCHEM")) {
+                    continue;
+                }
                 String name = rs.getString("FKTABLE_NAME");
                 if (name == null || !seen.add(Objects.toString(rs.getString("FKTABLE_SCHEM"), "") + "\u0000" + name)) {
                     continue;
@@ -927,23 +958,27 @@ public class Dispatcher {
     }
 
     private Response getIndexes(Request req) throws SQLException {
-        int connId    = getInt(req, "conn-id");
-        String schema = (String) req.params.get("schema");
-        String table  = getOptionalString(req, "table");
+        int connId     = getInt(req, "conn-id");
+        String catalog = getOptionalString(req, "catalog");
+        String schema  = getOptionalString(req, "schema");
+        String table   = getOptionalString(req, "table");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> indexes = isOracle(conn)
             ? getOracleIndexes(conn, schema, table)
-            : getJdbcIndexes(conn, schema, table);
+            : getJdbcIndexes(conn, catalog, schema, table);
         return Response.ok(req.id, Map.of("indexes", indexes));
     }
 
-    private List<Map<String, Object>> getJdbcMetadataTables(Connection conn, String schema)
+    private List<Map<String, Object>> getJdbcMetadataTables(Connection conn, String catalog, String schema)
             throws SQLException {
         String[] types = { "TABLE", "VIEW", "SYNONYM" };
         DatabaseMetaData meta = conn.getMetaData();
         List<Map<String, Object>> tables = new ArrayList<>();
-        try (ResultSet rs = meta.getTables(null, schema, "%", types)) {
+        try (ResultSet rs = meta.getTables(catalog, schema, "%", types)) {
             while (rs.next()) {
+                if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                    continue;
+                }
                 String tableSchema = Objects.toString(rs.getString("TABLE_SCHEM"), "");
                 tables.add(entryMap(
                     "name", rs.getString("TABLE_NAME"),
@@ -954,6 +989,19 @@ public class Dispatcher {
             }
         }
         return tables;
+    }
+
+    private boolean matchesRequestedCatalog(ResultSet rs, String requestedCatalog,
+                                            String primaryColumnLabel, String fallbackColumnLabel)
+            throws SQLException {
+        if (requestedCatalog == null || requestedCatalog.isBlank()) {
+            return true;
+        }
+        String actualCatalog = Objects.toString(rs.getString(primaryColumnLabel), "");
+        if (actualCatalog.isBlank()) {
+            actualCatalog = Objects.toString(rs.getString(fallbackColumnLabel), "");
+        }
+        return actualCatalog.equalsIgnoreCase(requestedCatalog);
     }
 
     private List<Map<String, Object>> getOracleIndexes(Connection conn, String schema, String table)
@@ -1004,19 +1052,20 @@ public class Dispatcher {
         return indexes;
     }
 
-    private List<Map<String, Object>> getJdbcIndexes(Connection conn, String schema, String table)
+    private List<Map<String, Object>> getJdbcIndexes(Connection conn, String catalog,
+                                                     String schema, String table)
             throws SQLException {
         DatabaseMetaData meta = conn.getMetaData();
         List<Map<String, Object>> indexes = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         List<String> tables = table == null
-            ? getJdbcMetadataTables(conn, schema).stream()
+            ? getJdbcMetadataTables(conn, catalog, schema).stream()
                 .filter(entry -> "TABLE".equalsIgnoreCase(Objects.toString(entry.get("type"), "")))
                 .map(entry -> Objects.toString(entry.get("name"), ""))
                 .toList()
             : List.of(table);
         for (String tableName : tables) {
-            try (ResultSet rs = meta.getIndexInfo(null, schema, tableName, false, true)) {
+            try (ResultSet rs = meta.getIndexInfo(catalog, schema, tableName, false, true)) {
                 while (rs.next()) {
                     short type = rs.getShort("TYPE");
                     String indexName = rs.getString("INDEX_NAME");
@@ -1041,14 +1090,15 @@ public class Dispatcher {
     }
 
     private Response getIndexColumns(Request req) throws SQLException {
-        int connId    = getInt(req, "conn-id");
-        String schema = (String) req.params.get("schema");
-        String index  = getString(req, "index");
-        String table  = getOptionalString(req, "table");
+        int connId     = getInt(req, "conn-id");
+        String catalog = getOptionalString(req, "catalog");
+        String schema  = getOptionalString(req, "schema");
+        String index   = getString(req, "index");
+        String table   = getOptionalString(req, "table");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> columns = isOracle(conn)
             ? getOracleIndexColumns(conn, schema, index)
-            : getJdbcIndexColumns(conn, schema, index, table);
+            : getJdbcIndexColumns(conn, catalog, schema, index, table);
         return Response.ok(req.id, Map.of("columns", columns));
     }
 
@@ -1093,13 +1143,13 @@ public class Dispatcher {
         return columns;
     }
 
-    private List<Map<String, Object>> getJdbcIndexColumns(Connection conn, String schema,
+    private List<Map<String, Object>> getJdbcIndexColumns(Connection conn, String catalog, String schema,
                                                           String index, String table)
             throws SQLException {
         DatabaseMetaData meta = conn.getMetaData();
         List<Map<String, Object>> columns = new ArrayList<>();
         List<String> tables = table == null
-            ? getJdbcIndexes(conn, schema, null).stream()
+            ? getJdbcIndexes(conn, catalog, schema, null).stream()
                 .filter(entry -> index.equalsIgnoreCase(Objects.toString(entry.get("name"), "")))
                 .map(entry -> Objects.toString(entry.get("table"), ""))
                 .filter(name -> !name.isBlank())
@@ -1107,7 +1157,7 @@ public class Dispatcher {
                 .toList()
             : List.of(table);
         for (String tableName : tables) {
-            try (ResultSet rs = meta.getIndexInfo(null, schema, tableName, false, true)) {
+            try (ResultSet rs = meta.getIndexInfo(catalog, schema, tableName, false, true)) {
                 while (rs.next()) {
                     short type = rs.getShort("TYPE");
                     String indexName = rs.getString("INDEX_NAME");
@@ -1221,22 +1271,24 @@ public class Dispatcher {
     }
 
     private Response getProcedures(Request req) throws SQLException {
-        int connId    = getInt(req, "conn-id");
-        String schema = (String) req.params.get("schema");
+        int connId     = getInt(req, "conn-id");
+        String catalog = getOptionalString(req, "catalog");
+        String schema  = getOptionalString(req, "schema");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> procedures = isOracle(conn)
             ? getOracleRoutines(conn, schema, "PROCEDURE")
-            : getJdbcRoutines(conn, schema, true);
+            : getJdbcRoutines(conn, catalog, schema, true);
         return Response.ok(req.id, Map.of("procedures", procedures));
     }
 
     private Response getFunctions(Request req) throws SQLException {
-        int connId    = getInt(req, "conn-id");
-        String schema = (String) req.params.get("schema");
+        int connId     = getInt(req, "conn-id");
+        String catalog = getOptionalString(req, "catalog");
+        String schema  = getOptionalString(req, "schema");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> functions = isOracle(conn)
             ? getOracleRoutines(conn, schema, "FUNCTION")
-            : getJdbcRoutines(conn, schema, false);
+            : getJdbcRoutines(conn, catalog, schema, false);
         return Response.ok(req.id, Map.of("functions", functions));
     }
 
@@ -1283,13 +1335,14 @@ public class Dispatcher {
         return routines;
     }
 
-    private List<Map<String, Object>> getJdbcRoutines(Connection conn, String schema, boolean procedures)
+    private List<Map<String, Object>> getJdbcRoutines(Connection conn, String catalog,
+                                                      String schema, boolean procedures)
             throws SQLException {
         DatabaseMetaData meta = conn.getMetaData();
         List<Map<String, Object>> routines = new ArrayList<>();
         try (ResultSet rs = procedures
-                ? meta.getProcedures(null, schema, "%")
-                : meta.getFunctions(null, schema, "%")) {
+                ? meta.getProcedures(catalog, schema, "%")
+                : meta.getFunctions(catalog, schema, "%")) {
             while (rs.next()) {
                 String name = procedures
                     ? rs.getString("PROCEDURE_NAME")
@@ -1308,26 +1361,28 @@ public class Dispatcher {
     }
 
     private Response getProcedureParams(Request req) throws SQLException {
-        int connId     = getInt(req, "conn-id");
-        String schema  = (String) req.params.get("schema");
-        String name    = getString(req, "name");
+        int connId      = getInt(req, "conn-id");
+        String catalog  = getOptionalString(req, "catalog");
+        String schema   = getOptionalString(req, "schema");
+        String name     = getString(req, "name");
         String identity = getOptionalString(req, "identity");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> params = isOracle(conn)
             ? getOracleRoutineParams(conn, schema, name)
-            : getJdbcRoutineParams(conn, schema, name, identity, true);
+            : getJdbcRoutineParams(conn, catalog, schema, name, identity, true);
         return Response.ok(req.id, Map.of("params", params));
     }
 
     private Response getFunctionParams(Request req) throws SQLException {
-        int connId     = getInt(req, "conn-id");
-        String schema  = (String) req.params.get("schema");
-        String name    = getString(req, "name");
+        int connId      = getInt(req, "conn-id");
+        String catalog  = getOptionalString(req, "catalog");
+        String schema   = getOptionalString(req, "schema");
+        String name     = getString(req, "name");
         String identity = getOptionalString(req, "identity");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> params = isOracle(conn)
             ? getOracleRoutineParams(conn, schema, name)
-            : getJdbcRoutineParams(conn, schema, name, identity, false);
+            : getJdbcRoutineParams(conn, catalog, schema, name, identity, false);
         return Response.ok(req.id, Map.of("params", params));
     }
 
@@ -1376,15 +1431,16 @@ public class Dispatcher {
         return params;
     }
 
-    private List<Map<String, Object>> getJdbcRoutineParams(Connection conn, String schema, String name,
+    private List<Map<String, Object>> getJdbcRoutineParams(Connection conn, String catalog,
+                                                           String schema, String name,
                                                            String identity, boolean procedures)
             throws SQLException {
         DatabaseMetaData meta = conn.getMetaData();
         List<Map<String, Object>> params = new ArrayList<>();
         String specificName = specificNameFromIdentity(identity);
         try (ResultSet rs = procedures
-                ? meta.getProcedureColumns(null, schema, name, "%")
-                : meta.getFunctionColumns(null, schema, name, "%")) {
+                ? meta.getProcedureColumns(catalog, schema, name, "%")
+                : meta.getFunctionColumns(catalog, schema, name, "%")) {
             while (rs.next()) {
                 if (specificName != null
                     && !specificName.equals(Objects.toString(rs.getString("SPECIFIC_NAME"), ""))) {
