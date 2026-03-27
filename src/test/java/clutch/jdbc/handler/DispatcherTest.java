@@ -326,6 +326,82 @@ class DispatcherTest {
     }
 
     @Test
+    void getTablesForGenericMetadataUsesCatalogWhenProvided() throws Exception {
+        JdbcMetadataRecorder jdbc = new JdbcMetadataRecorder();
+        jdbc.tableRows = List.of(
+            jdbc.tableRow("clutch_live_smoke", "TABLE", "default", ""),
+            jdbc.tableRow("clutch_live_smoke", "TABLE", "demo", "")
+        );
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = jdbc.connection("ClickHouse");
+
+        Response response = dispatch(connMgr, 34, "get-tables",
+            "conn-id", 7,
+            "catalog", "default");
+
+        assertTrue(response.ok);
+        assertEquals("getTables", jdbc.lastMethod);
+        assertEquals("default", jdbc.lastCatalog);
+        assertEquals(null, jdbc.lastSchema);
+        List<List<Object>> rows = resultList(response, "rows");
+        assertEquals(1, rows.size());
+        assertEquals(List.of("clutch_live_smoke", "TABLE", "default"), rows.get(0));
+    }
+
+    @Test
+    void searchTablesForGenericMetadataUsesCatalogWhenProvided() throws Exception {
+        JdbcMetadataRecorder jdbc = new JdbcMetadataRecorder();
+        jdbc.tableRows = List.of(
+            jdbc.tableRow("clutch_live_smoke", "TABLE", "default", ""),
+            jdbc.tableRow("clutch_live_smoke", "TABLE", "demo", "")
+        );
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = jdbc.connection("ClickHouse");
+
+        Response response = dispatch(connMgr, 35, "search-tables",
+            "conn-id", 7,
+            "catalog", "default",
+            "prefix", "clutch");
+
+        assertTrue(response.ok);
+        assertEquals("getTables", jdbc.lastMethod);
+        assertEquals("default", jdbc.lastCatalog);
+        assertEquals(null, jdbc.lastSchema);
+        assertEquals("clutch%", jdbc.lastPattern);
+        List<Map<String, Object>> tables = resultList(response, "tables");
+        assertEquals(1, tables.size());
+        assertEquals("clutch_live_smoke", tables.get(0).get("name"));
+        assertEquals("default", tables.get(0).get("schema"));
+    }
+
+    @Test
+    void getColumnsForGenericMetadataUsesCatalogWhenProvided() throws Exception {
+        JdbcMetadataRecorder jdbc = new JdbcMetadataRecorder();
+        jdbc.columnRows = List.of(
+            jdbc.columnRow("id", "UInt64", 0, 1, "", "default"),
+            jdbc.columnRow("demo_only", "UInt64", 0, 1, "", "demo"),
+            jdbc.columnRow("name", "String", DatabaseMetaData.columnNullable, 2, "", "default")
+        );
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = jdbc.connection("ClickHouse");
+
+        Response response = dispatch(connMgr, 36, "get-columns",
+            "conn-id", 7,
+            "catalog", "default",
+            "table", "clutch_live_smoke");
+
+        assertTrue(response.ok);
+        assertEquals("getColumns", jdbc.lastMethod);
+        assertEquals("default", jdbc.lastCatalog);
+        assertEquals(null, jdbc.lastSchema);
+        assertEquals("clutch_live_smoke", jdbc.lastTable);
+        List<Map<String, Object>> cols = resultList(response, "columns");
+        assertEquals(2, cols.size());
+        assertEquals("id", cols.get(0).get("name"));
+        assertEquals(false, cols.get(0).get("nullable"));
+    }
+
+    @Test
     void getTablesIncludesOracleSynonyms() throws Exception {
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         oracle.resultRows = List.of(
@@ -1033,6 +1109,135 @@ class DispatcherTest {
 
         private String normalizeSql(String sql) {
             return sql.stripIndent().trim().replace("\r\n", "\n");
+        }
+    }
+
+    private static final class JdbcMetadataRecorder {
+        private String lastMethod;
+        private String lastCatalog;
+        private String lastSchema;
+        private String lastTable;
+        private String lastPattern;
+        List<Map<String, Object>> tableRows = List.of();
+        List<Map<String, Object>> columnRows = List.of();
+
+        private Connection connection(String productName) {
+            DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(),
+                new Class<?>[]{DatabaseMetaData.class},
+                (_proxy, method, args) -> switch (method.getName()) {
+                    case "getDatabaseProductName" -> productName;
+                    case "getTables" -> {
+                        lastMethod = "getTables";
+                        lastCatalog = (String) args[0];
+                        lastSchema = (String) args[1];
+                        lastPattern = (String) args[2];
+                        yield metadataResultSet(
+                            List.of("TABLE_NAME", "TABLE_TYPE", "TABLE_SCHEM", "TABLE_CAT"),
+                            tableRows
+                        );
+                    }
+                    case "getColumns" -> {
+                        lastMethod = "getColumns";
+                        lastCatalog = (String) args[0];
+                        lastSchema = (String) args[1];
+                        lastTable = (String) args[2];
+                        lastPattern = (String) args[3];
+                        yield metadataResultSet(
+                            List.of("COLUMN_NAME", "TYPE_NAME", "NULLABLE", "ORDINAL_POSITION",
+                                    "TABLE_CAT", "TABLE_SCHEM"),
+                            columnRows
+                        );
+                    }
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+            return (Connection) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(),
+                new Class<?>[]{Connection.class},
+                (_proxy, method, _args) -> switch (method.getName()) {
+                    case "getMetaData" -> meta;
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+        }
+
+        private ResultSet metadataResultSet(List<String> columns, List<Map<String, Object>> rows) {
+            final int[] index = {-1};
+            final Object[] lastValue = {null};
+            return (ResultSet) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(),
+                new Class<?>[]{ResultSet.class},
+                (_proxy, method, args) -> switch (method.getName()) {
+                    case "next" -> ++index[0] < rows.size();
+                    case "getString" -> {
+                        Object value = rows.get(index[0]).get((String) args[0]);
+                        lastValue[0] = value;
+                        yield value == null ? null : value.toString();
+                    }
+                    case "getInt" -> {
+                        Object value = rows.get(index[0]).get((String) args[0]);
+                        lastValue[0] = value;
+                        yield value == null ? 0 : ((Number) value).intValue();
+                    }
+                    case "getObject" -> {
+                        Object value = rows.get(index[0]).get((String) args[0]);
+                        lastValue[0] = value;
+                        yield value;
+                    }
+                    case "wasNull" -> lastValue[0] == null;
+                    case "getMetaData" -> resultSetMetaData(columns);
+                    case "close" -> null;
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+        }
+
+        private ResultSetMetaData resultSetMetaData(List<String> columns) {
+            return (ResultSetMetaData) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(),
+                new Class<?>[]{ResultSetMetaData.class},
+                (_proxy, method, args) -> switch (method.getName()) {
+                    case "getColumnCount" -> columns.size();
+                    case "getColumnLabel" -> columns.get(((Integer) args[0]) - 1);
+                    case "getColumnTypeName" -> "VARCHAR";
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+        }
+
+        private Map<String, Object> tableRow(String name, String type, String schema, String catalog) {
+            Map<String, Object> row = new HashMap<>();
+            row.put("TABLE_NAME", name);
+            row.put("TABLE_TYPE", type);
+            row.put("TABLE_SCHEM", schema);
+            row.put("TABLE_CAT", catalog);
+            return row;
+        }
+
+        private Map<String, Object> columnRow(String name, String type, int nullable, int position) {
+            return columnRow(name, type, nullable, position, null, null);
+        }
+
+        private Map<String, Object> columnRow(String name, String type, int nullable, int position,
+                                              String catalog) {
+            return columnRow(name, type, nullable, position, catalog, null);
+        }
+
+        private Map<String, Object> columnRow(String name, String type, int nullable, int position,
+                                              String catalog, String schema) {
+            Map<String, Object> row = new HashMap<>();
+            row.put("COLUMN_NAME", name);
+            row.put("TYPE_NAME", type);
+            row.put("NULLABLE", nullable);
+            row.put("ORDINAL_POSITION", position);
+            row.put("TABLE_CAT", catalog);
+            row.put("TABLE_SCHEM", schema);
+            return row;
         }
     }
 }
