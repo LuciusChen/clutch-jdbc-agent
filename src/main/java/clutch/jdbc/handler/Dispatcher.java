@@ -8,7 +8,6 @@ import clutch.jdbc.model.Response;
 import java.sql.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 /**
@@ -22,7 +21,6 @@ public class Dispatcher {
     private static final int DEFAULT_FETCH_SIZE              = 500;
     private static final int ORACLE_TABLES_TIMEOUT_SECONDS   =  15;
     private static final int ORACLE_METADATA_TIMEOUT_SECONDS =   5;
-    private static final int CANCEL_SETTLE_TIMEOUT_SECONDS   =   5;
     static final int DEFAULT_EXECUTE_TIMEOUT                 =  29; // s; safety net when no client timeout given
     private static final List<String> ORACLE_SYSTEM_OWNERS = List.of(
         "SYS", "SYSTEM", "XDB", "MDSYS", "CTXSYS", "LBACSYS", "OLAPSYS",
@@ -37,60 +35,11 @@ public class Dispatcher {
 
     private final ConnectionManager connMgr;
     private final CursorManager cursorMgr;
-    private final Map<Integer, RunningStatement> runningStatements = new ConcurrentHashMap<>();
     private final ExecutorService executePool = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "clutch-jdbc-execute");
         t.setDaemon(true);
         return t;
     });
-
-    private static final class RunningStatement {
-        private final int requestId;
-        private final Statement stmt;
-        private final CompletableFuture<Void> settled = new CompletableFuture<>();
-        private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
-        private volatile Future<?> future;
-
-        private RunningStatement(int requestId, Statement stmt) {
-            this.requestId = requestId;
-            this.stmt = stmt;
-        }
-
-        private void attachFuture(Future<?> future) {
-            this.future = future;
-            if (cancelRequested.get()) {
-                future.cancel(true);
-            }
-        }
-
-        private void requestCancel() throws SQLException {
-            cancelRequested.set(true);
-            Future<?> current = future;
-            if (current != null) {
-                current.cancel(true);
-            }
-            stmt.cancel();
-        }
-
-        private boolean cancelRequested() {
-            return cancelRequested.get();
-        }
-
-        private boolean awaitSettled(long timeout, TimeUnit unit) throws InterruptedException {
-            try {
-                settled.get(timeout, unit);
-                return true;
-            } catch (ExecutionException e) {
-                return true;
-            } catch (TimeoutException e) {
-                return false;
-            }
-        }
-
-        private void markSettled() {
-            settled.complete(null);
-        }
-    }
 
     /** Create a Dispatcher backed by the given connection and cursor managers. */
     public Dispatcher(ConnectionManager connMgr, CursorManager cursorMgr) {
@@ -100,15 +49,6 @@ public class Dispatcher {
 
     /** Shut down the execute thread pool. Called on agent shutdown. */
     public void shutdown() {
-        runningStatements.values().forEach(running -> {
-            try {
-                running.requestCancel();
-            } catch (SQLException e) {
-                LOG.log(System.Logger.Level.DEBUG,
-                    "Failed to cancel running JDBC statement during shutdown", e);
-            }
-        });
-        runningStatements.clear();
         executePool.shutdownNow();
     }
 
@@ -123,7 +63,6 @@ public class Dispatcher {
             case "set-auto-commit" -> setAutoCommit(req);
             case "execute"         -> execute(req);
             case "fetch"           -> fetch(req);
-            case "cancel"          -> cancel(req);
             case "close-cursor"    -> closeCursor(req);
             case "get-schemas"     -> getSchemas(req);
             case "set-current-schema" -> setCurrentSchema(req);
@@ -182,7 +121,6 @@ public class Dispatcher {
 
     private Response disconnect(Request req) throws SQLException {
         int connId = getInt(req, "conn-id");
-        cancelRunningStatementQuietly(connId);
         cursorMgr.closeForConnection(connId);
         connMgr.disconnect(connId);
         return Response.ok(req.id, Map.of("conn-id", connId));
@@ -224,103 +162,64 @@ public class Dispatcher {
         if (!conn.isValid(3))
             return Response.error(req.id,
                 "Connection lost: the server closed the connection (idle timeout). Please reconnect.");
-        Statement stmt = conn.createStatement();
+        Statement  stmt = conn.createStatement();
         stmt.setQueryTimeout(executeTimeout);   // Oracle-side cancel (belt)
-        RunningStatement running = registerRunningStatement(connId, req.id, stmt);
+
+        Future<Boolean> future = executePool.submit(() -> stmt.execute(sql));
+        boolean isQuery;
         try {
-            Future<Boolean> future = executePool.submit(() -> stmt.execute(sql));
-            running.attachFuture(future);
+            isQuery = future.get(executeTimeout + 1, TimeUnit.SECONDS); // thread-level cancel (suspenders)
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            cancelStatementQuietly(stmt);
+            closeStatementQuietly(stmt);
+            return Response.error(req.id, "Query timed out after " + executeTimeout + "s");
+        } catch (ExecutionException e) {
+            closeStatementQuietly(stmt);
+            Throwable cause = e.getCause();
+            throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
+        }
 
-            boolean isQuery;
-            try {
-                isQuery = future.get(executeTimeout + 1, TimeUnit.SECONDS); // thread-level cancel (suspenders)
-            } catch (TimeoutException e) {
-                running.requestCancel();
-                closeStatementQuietly(stmt);
-                return Response.error(req.id, "Query timed out after " + executeTimeout + "s");
-            } catch (CancellationException e) {
-                closeStatementQuietly(stmt);
-                return Response.error(req.id, "Query cancelled");
-            } catch (ExecutionException e) {
-                closeStatementQuietly(stmt);
-                if (running.cancelRequested()) {
-                    return Response.error(req.id, "Query cancelled");
-                }
-                Throwable cause = e.getCause();
-                throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
-            }
+        if (!isQuery) {
+            // DML: return affected-rows, no cursor.
+            int affected = stmt.getUpdateCount();
+            stmt.close();
+            return Response.ok(req.id, Map.of("type", "dml", "affected-rows", affected));
+        }
 
-            if (!isQuery) {
-                // DML: return affected-rows, no cursor.
-                int affected = stmt.getUpdateCount();
-                stmt.close();
-                return Response.ok(req.id, Map.of("type", "dml", "affected-rows", affected));
-            }
-
-            // SELECT: open cursor, return first batch.
-            // setFetchSize is applied to the ResultSet after execute() succeeds,
-            // not before — setting it on Statement before execute() can cause
-            // Oracle 11g JDBC to hang on parse errors instead of throwing SQLException.
-            try {
-                ResultSet rs = stmt.getResultSet();
-                rs.setFetchSize(fetchSize);
-                int cursorId = cursorMgr.register(connId, stmt, rs);
-                CursorManager.FetchResult first = cursorMgr.fetch(cursorId, fetchSize);
-                Map<String, Object> result = new LinkedHashMap<>();
-                result.put("type",      "query");
-                result.put("cursor-id", first.done() ? null : cursorId);
-                result.put("columns",   first.columns());
-                result.put("col-types", first.types());
-                result.put("rows",      first.rows());
-                result.put("done",      first.done());
-                return Response.ok(req.id, result);
-            } catch (Exception e) {
-                closeStatementQuietly(stmt);
-                if (running.cancelRequested()) {
-                    return Response.error(req.id, "Query cancelled");
-                }
-                throw e;
-            }
-        } finally {
-            clearRunningStatement(connId, running);
+        // SELECT: open cursor, return first batch.
+        // setFetchSize is applied to the ResultSet after execute() succeeds,
+        // not before — setting it on Statement before execute() can cause
+        // Oracle 11g JDBC to hang on parse errors instead of throwing SQLException.
+        try {
+            ResultSet rs = stmt.getResultSet();
+            rs.setFetchSize(fetchSize);
+            int cursorId = cursorMgr.register(connId, stmt, rs);
+            CursorManager.FetchResult first = cursorMgr.fetch(cursorId, fetchSize);
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("type",      "query");
+            result.put("cursor-id", first.done() ? null : cursorId);
+            result.put("columns",   first.columns());
+            result.put("col-types", first.types());
+            result.put("rows",      first.rows());
+            result.put("done",      first.done());
+            return Response.ok(req.id, result);
+        } catch (Exception e) {
+            closeStatementQuietly(stmt);
+            throw e;
         }
     }
 
     private Response fetch(Request req) throws Exception {
         int cursorId  = getInt(req, "cursor-id");
         int fetchSize = (int) req.params.getOrDefault("fetch-size", DEFAULT_FETCH_SIZE);
-        int connId = cursorMgr.connectionIdForCursor(cursorId);
-        Statement stmt = cursorMgr.statementForCursor(cursorId);
-        RunningStatement running = registerRunningStatement(connId, req.id, stmt);
-        try {
-            CursorManager.FetchResult fr = cursorMgr.fetch(cursorId, fetchSize);
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("cursor-id", fr.done() ? null : cursorId);
-            result.put("rows",      fr.rows());
-            result.put("done",      fr.done());
-            return Response.ok(req.id, result);
-        } catch (Exception e) {
-            if (running.cancelRequested()) {
-                return Response.error(req.id, "Query cancelled");
-            }
-            throw e;
-        } finally {
-            clearRunningStatement(connId, running);
-        }
-    }
 
-    private Response cancel(Request req) throws Exception {
-        int connId = getInt(req, "conn-id");
-        RunningStatement running = runningStatements.get(connId);
-        if (running == null) {
-            primaryConnection(connId);
-            return Response.ok(req.id, Map.of("conn-id", connId, "cancelled", false));
-        }
-        running.requestCancel();
-        if (!running.awaitSettled(CANCEL_SETTLE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-            throw new SQLException("Timed out waiting for cancel to settle on connection id: " + connId);
-        }
-        return Response.ok(req.id, Map.of("conn-id", connId, "cancelled", true));
+        CursorManager.FetchResult fr = cursorMgr.fetch(cursorId, fetchSize);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("cursor-id", fr.done() ? null : cursorId);
+        result.put("rows",      fr.rows());
+        result.put("done",      fr.done());
+        return Response.ok(req.id, result);
     }
 
     private Response closeCursor(Request req) {
@@ -1967,35 +1866,6 @@ public class Dispatcher {
         } catch (Exception e) {
             LOG.log(System.Logger.Level.WARNING,
                 "Failed to cancel JDBC statement after timeout", e);
-        }
-    }
-
-    private RunningStatement registerRunningStatement(int connId, int requestId, Statement stmt)
-            throws SQLException {
-        RunningStatement running = new RunningStatement(requestId, stmt);
-        RunningStatement existing = runningStatements.putIfAbsent(connId, running);
-        if (existing != null) {
-            closeStatementQuietly(stmt);
-            throw new SQLException("Connection id " + connId + " already has an active statement");
-        }
-        return running;
-    }
-
-    private void clearRunningStatement(int connId, RunningStatement running) {
-        runningStatements.remove(connId, running);
-        running.markSettled();
-    }
-
-    private void cancelRunningStatementQuietly(int connId) {
-        RunningStatement running = runningStatements.get(connId);
-        if (running == null) {
-            return;
-        }
-        try {
-            running.requestCancel();
-        } catch (SQLException e) {
-            LOG.log(System.Logger.Level.DEBUG,
-                "Failed to cancel running JDBC statement during disconnect", e);
         }
     }
 

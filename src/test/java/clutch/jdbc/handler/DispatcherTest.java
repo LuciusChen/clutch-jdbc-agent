@@ -20,11 +20,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -306,80 +301,6 @@ class DispatcherTest {
         assertEquals(Dispatcher.DEFAULT_EXECUTE_TIMEOUT, capturedTimeout[0],
             "default timeout should be used when none specified");
         assertEquals("dml", resultMap(response).get("type"));
-    }
-
-    @Test
-    void cancelInterruptsRunningExecuteAndKeepsConnectionUsable() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
-        CountDownLatch executeStarted = new CountDownLatch(1);
-        CountDownLatch cancelCalled = new CountDownLatch(1);
-        List<String> executedSql = new ArrayList<>();
-
-        Statement blockingStmt = (Statement) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Statement.class},
-            (_proxy, method, args) -> switch (method.getName()) {
-                case "setQueryTimeout" -> null;
-                case "execute" -> {
-                    executedSql.add((String) args[0]);
-                    executeStarted.countDown();
-                    if (!cancelCalled.await(2, TimeUnit.SECONDS)) {
-                        throw new AssertionError("cancel was not requested");
-                    }
-                    throw new java.sql.SQLException("Query cancelled");
-                }
-                case "cancel" -> {
-                    cancelCalled.countDown();
-                    yield null;
-                }
-                case "close" -> null;
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
-
-        RecordingStatementHandler followupStmt = new RecordingStatementHandler();
-        followupStmt.updateCount = 1;
-        Statement[] statements = {blockingStmt, followupStmt.proxy()};
-        int[] nextStatement = {0};
-        connMgr.connection = (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, _args) -> switch (method.getName()) {
-                case "isValid" -> true;
-                case "createStatement" -> statements[nextStatement[0]++];
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
-
-        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
-        ExecutorService pool = Executors.newSingleThreadExecutor();
-        try {
-            Future<Response> executeFuture = pool.submit(
-                () -> dispatcher.dispatch(request(40, "execute", "conn-id", 7, "sql", "SELECT * FROM t")));
-
-            assertTrue(executeStarted.await(2, TimeUnit.SECONDS), "execute should start before cancel");
-
-            Response cancelResponse = dispatcher.dispatch(request(41, "cancel", "conn-id", 7));
-            assertTrue(cancelResponse.ok);
-            assertEquals(true, resultMap(cancelResponse).get("cancelled"));
-
-            Response interrupted = executeFuture.get(2, TimeUnit.SECONDS);
-            assertFalse(interrupted.ok);
-            assertEquals("Query cancelled", interrupted.error);
-
-            Response followup = dispatcher.dispatch(
-                request(42, "execute", "conn-id", 7, "sql", "UPDATE demo SET x = 1"));
-            assertTrue(followup.ok);
-            assertEquals("dml", resultMap(followup).get("type"));
-            assertEquals(1, ((Number) resultMap(followup).get("affected-rows")).intValue());
-            assertEquals(List.of("SELECT * FROM t"), executedSql);
-            assertEquals("UPDATE demo SET x = 1", followupStmt.executedSql);
-        } finally {
-            pool.shutdownNow();
-            dispatcher.shutdown();
-        }
     }
 
     @Test
