@@ -93,6 +93,11 @@ Error response:
 | `ping`            | Health check                                     |
 | `connect`         | Open a JDBC connection, returns `conn-id`        |
 | `disconnect`      | Close a connection and its open cursors          |
+| `commit`          | Commit the current transaction                   |
+| `rollback`        | Roll back the current transaction                |
+| `set-auto-commit` | Toggle JDBC autocommit on the primary session    |
+| `set-current-schema` | Update current schema on primary + metadata sessions |
+| `cancel`          | Cancel the currently running statement for a connection |
 | `execute`         | Execute SQL; returns first batch + `cursor-id`   |
 | `fetch`           | Fetch next batch from an open cursor             |
 | `close-cursor`    | Close a cursor explicitly                        |
@@ -103,6 +108,13 @@ Error response:
 | `search-columns`  | Prefix-search columns for completion             |
 | `get-primary-keys`| List primary key columns                         |
 | `get-foreign-keys`| List imported foreign keys                       |
+| `get-indexes` / `get-index-columns` | Index metadata                  |
+| `get-sequences`   | Sequence discovery                               |
+| `get-procedures` / `get-functions` | Routine discovery                |
+| `get-procedure-params` / `get-function-params` | Routine parameter metadata |
+| `get-triggers`    | Trigger discovery                                |
+| `get-object-source` / `get-object-ddl` | Source / DDL fetch             |
+| `get-referencing-objects` | Referencing-object discovery              |
 
 ## Type Conversion
 
@@ -139,8 +151,16 @@ clutch-jdbc-agent (JVM process)
   drivers/*.jar           — JDBC drivers (loaded at runtime via URLClassLoader)
 ```
 
-The agent is a single-threaded process; all requests are handled sequentially.
-No connection pooling, no async execution, no SQL rewriting — by design.
+The agent no longer runs requests on one global synchronous lane.  The stdin
+loop parses requests and hands them to a small request pool.  The dispatcher
+still serializes most work per JDBC connection, so one `conn-id` sees one
+foreground operation at a time.  `cancel` is the deliberate exception: it can
+arrive while `execute` or `fetch` is running, locate the live `Statement`, and
+call `Statement.cancel()` without tearing down the whole session.
+
+This is still intentionally much simpler than a fully async server: no
+connection pooling, no SQL rewriting, and no multi-statement scheduling inside
+one JDBC connection.
 
 ## Driver Setup
 

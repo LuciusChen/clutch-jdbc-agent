@@ -237,12 +237,14 @@ done. A record that only restates the code adds no value.
 
 Explicitly deferred — do not add these without a postmortem justifying the need:
 
+Recoverable cancel/interrupt support is no longer deferred; see
+`postmortem/007-cancel-op-and-request-concurrency.md`.
+
 - Connection pooling (HikariCP, c3p0, etc.)
 - Async/reactive execution (CompletableFuture, Project Reactor)
 - Full JSON-RPC framing (jsonrpc id types, batch requests, notifications)
 - SQL parsing or query analysis
 - Schema caching inside the agent
-- Cancel/interrupt support for running queries
 - CLOB/BLOB full content streaming (placeholders are sufficient for v1)
 - Transaction management beyond autocommit
 - Multiple result sets from a single execute (stored procedures)

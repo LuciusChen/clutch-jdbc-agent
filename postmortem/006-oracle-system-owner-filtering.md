@@ -14,7 +14,7 @@ The first implementation left two inconsistencies:
 1. `get-tables` filtered Oracle system owners in SQL, but `search-tables`
    fetched them and discarded them later in Java.
 2. The system-owner list was duplicated in two forms:
-   a SQL string literal and a Java `Set`.
+   a SQL string literal and a separate Java-side owner check.
 
 Both worked, but neither was robust.
 
@@ -39,7 +39,7 @@ Filtering in SQL is the correct boundary here:
 - it removes a class of drift where one path silently diverges from the other
 
 The single-source owner list solves the maintenance problem directly.  If the
-owner set changes, both the Java lookup and the SQL literal change together.
+owner set changes, the generated SQL changes with it.
 
 ## Alternatives considered
 
@@ -47,7 +47,7 @@ owner set changes, both the Java lookup and the SQL literal change together.
   Rejected because it wastes work and leaves path-specific behavior harder to
   reason about.
 
-- **Keep the duplicated SQL string and `Set`**
+- **Keep the duplicated SQL string and Java-side owner check**
   Rejected because it creates an unnecessary consistency hazard with no upside.
 
 - **Parameterize the `NOT IN` list**

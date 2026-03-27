@@ -8,6 +8,8 @@ import clutch.jdbc.model.Response;
 import java.sql.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 /**
@@ -22,12 +24,14 @@ public class Dispatcher {
     private static final int ORACLE_TABLES_TIMEOUT_SECONDS   =  15;
     private static final int ORACLE_METADATA_TIMEOUT_SECONDS =   5;
     static final int DEFAULT_EXECUTE_TIMEOUT                 =  29; // s; safety net when no client timeout given
+    static final int MAX_CONCURRENT_JDBC_TASKS               =  16;
+    private static final String EXECUTOR_OVERLOADED_ERROR =
+        "Agent overloaded: too many concurrent JDBC operations";
     private static final List<String> ORACLE_SYSTEM_OWNERS = List.of(
         "SYS", "SYSTEM", "XDB", "MDSYS", "CTXSYS", "LBACSYS", "OLAPSYS",
         "WMSYS", "DBSNMP", "APPQOSSYS", "AUDSYS", "DVSYS",
         "GSMADMIN_INTERNAL", "OJVMSYS", "OUTLN"
     );
-    private static final Set<String> ORACLE_SYSTEM_OWNER_SET = Set.copyOf(ORACLE_SYSTEM_OWNERS);
     private static final String ORACLE_SYSTEM_OWNERS_SQL =
         ORACLE_SYSTEM_OWNERS.stream()
             .map(owner -> "'" + owner + "'")
@@ -35,11 +39,36 @@ public class Dispatcher {
 
     private final ConnectionManager connMgr;
     private final CursorManager cursorMgr;
-    private final ExecutorService executePool = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "clutch-jdbc-execute");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService executePool = newExecutePool();
+    private final Map<Integer, ReentrantLock> connectionLocks = new ConcurrentHashMap<>();
+    private final Map<Integer, RunningStatement> runningStatements = new ConcurrentHashMap<>();
+
+    private static final class RunningStatement {
+        private final int requestId;
+        private final Statement statement;
+        private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
+
+        private RunningStatement(int requestId, Statement statement) {
+            this.requestId = requestId;
+            this.statement = statement;
+        }
+
+        private int requestId() {
+            return requestId;
+        }
+
+        private Statement statement() {
+            return statement;
+        }
+
+        private void markCancelRequested() {
+            cancelRequested.set(true);
+        }
+
+        private boolean cancelRequested() {
+            return cancelRequested.get();
+        }
+    }
 
     /** Create a Dispatcher backed by the given connection and cursor managers. */
     public Dispatcher(ConnectionManager connMgr, CursorManager cursorMgr) {
@@ -54,6 +83,17 @@ public class Dispatcher {
 
     /** Route {@code req} to the appropriate handler and return its response. */
     public Response dispatch(Request req) throws Exception {
+        if (requestBypassesConnectionLock(req)) {
+            return dispatchUnlocked(req);
+        }
+        Integer connId = lockConnectionId(req);
+        if (connId == null) {
+            return dispatchUnlocked(req);
+        }
+        return withConnectionLock(connId, () -> dispatchUnlocked(req));
+    }
+
+    private Response dispatchUnlocked(Request req) throws Exception {
         return switch (req.op) {
             case "ping"            -> ping(req);
             case "connect"         -> connect(req);
@@ -61,6 +101,7 @@ public class Dispatcher {
             case "commit"          -> commit(req);
             case "rollback"        -> rollback(req);
             case "set-auto-commit" -> setAutoCommit(req);
+            case "cancel"          -> cancel(req);
             case "execute"         -> execute(req);
             case "fetch"           -> fetch(req);
             case "close-cursor"    -> closeCursor(req);
@@ -123,6 +164,8 @@ public class Dispatcher {
         int connId = getInt(req, "conn-id");
         cursorMgr.closeForConnection(connId);
         connMgr.disconnect(connId);
+        runningStatements.remove(connId);
+        connectionLocks.remove(connId);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
@@ -146,6 +189,24 @@ public class Dispatcher {
         return Response.ok(req.id, Map.of("conn-id", connId, "auto-commit", autoCommit));
     }
 
+    private Response cancel(Request req) {
+        int connId = getInt(req, "conn-id");
+        RunningStatement running = runningStatements.get(connId);
+        if (running == null) {
+            return Response.ok(req.id, Map.of("conn-id", connId, "cancelled", false));
+        }
+        try {
+            running.markCancelRequested();
+            running.statement().cancel();
+            return Response.ok(req.id, Map.of(
+                "conn-id", connId,
+                "request-id", running.requestId(),
+                "cancelled", true));
+        } catch (SQLException e) {
+            return Response.error(req.id, e.getMessage());
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Execute / Fetch / Close
     // -------------------------------------------------------------------------
@@ -164,62 +225,93 @@ public class Dispatcher {
                 "Connection lost: the server closed the connection (idle timeout). Please reconnect.");
         Statement  stmt = conn.createStatement();
         stmt.setQueryTimeout(executeTimeout);   // Oracle-side cancel (belt)
-
-        Future<Boolean> future = executePool.submit(() -> stmt.execute(sql));
-        boolean isQuery;
+        RunningStatement running = beginRunningStatement(connId, req.id, stmt);
         try {
-            isQuery = future.get(executeTimeout + 1, TimeUnit.SECONDS); // thread-level cancel (suspenders)
-        } catch (TimeoutException e) {
-            future.cancel(true);
-            cancelStatementQuietly(stmt);
-            closeStatementQuietly(stmt);
-            return Response.error(req.id, "Query timed out after " + executeTimeout + "s");
-        } catch (ExecutionException e) {
-            closeStatementQuietly(stmt);
-            Throwable cause = e.getCause();
-            throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
-        }
+            Future<Boolean> future;
+            try {
+                future = executePool.submit(() -> stmt.execute(sql));
+            } catch (RejectedExecutionException e) {
+                closeStatementQuietly(stmt);
+                return Response.error(req.id, EXECUTOR_OVERLOADED_ERROR);
+            }
+            boolean isQuery;
+            try {
+                isQuery = future.get(executeTimeout + 1, TimeUnit.SECONDS); // thread-level cancel (suspenders)
+            } catch (TimeoutException e) {
+                future.cancel(true);
+                cancelStatementQuietly(stmt);
+                closeStatementQuietly(stmt);
+                return Response.error(req.id, "Query timed out after " + executeTimeout + "s");
+            } catch (ExecutionException e) {
+                closeStatementQuietly(stmt);
+                Throwable cause = e.getCause();
+                if (running.cancelRequested() && cause instanceof SQLException sqlException) {
+                    return Response.error(req.id, sqlException.getMessage());
+                }
+                throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
+            }
 
-        if (!isQuery) {
-            // DML: return affected-rows, no cursor.
-            int affected = stmt.getUpdateCount();
-            stmt.close();
-            return Response.ok(req.id, Map.of("type", "dml", "affected-rows", affected));
-        }
+            if (!isQuery) {
+                // DML: return affected-rows, no cursor.
+                int affected = stmt.getUpdateCount();
+                stmt.close();
+                return Response.ok(req.id, Map.of("type", "dml", "affected-rows", affected));
+            }
 
-        // SELECT: open cursor, return first batch.
-        // setFetchSize is applied to the ResultSet after execute() succeeds,
-        // not before — setting it on Statement before execute() can cause
-        // Oracle 11g JDBC to hang on parse errors instead of throwing SQLException.
-        try {
-            ResultSet rs = stmt.getResultSet();
-            rs.setFetchSize(fetchSize);
-            int cursorId = cursorMgr.register(connId, stmt, rs);
-            CursorManager.FetchResult first = cursorMgr.fetch(cursorId, fetchSize);
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("type",      "query");
-            result.put("cursor-id", first.done() ? null : cursorId);
-            result.put("columns",   first.columns());
-            result.put("col-types", first.types());
-            result.put("rows",      first.rows());
-            result.put("done",      first.done());
-            return Response.ok(req.id, result);
-        } catch (Exception e) {
-            closeStatementQuietly(stmt);
-            throw e;
+            // SELECT: open cursor, return first batch.
+            // setFetchSize is applied to the ResultSet after execute() succeeds,
+            // not before — setting it on Statement before execute() can cause
+            // Oracle 11g JDBC to hang on parse errors instead of throwing SQLException.
+            try {
+                ResultSet rs = stmt.getResultSet();
+                rs.setFetchSize(fetchSize);
+                int cursorId = cursorMgr.register(connId, stmt, rs);
+                CursorManager.FetchResult first;
+                try {
+                    first = fetchCursorBatch(cursorId, fetchSize, stmt, executeTimeout);
+                } catch (SQLException e) {
+                    return Response.error(req.id, e.getMessage());
+                }
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("type",      "query");
+                result.put("cursor-id", first.done() ? null : cursorId);
+                result.put("columns",   first.columns());
+                result.put("col-types", first.types());
+                result.put("rows",      first.rows());
+                result.put("done",      first.done());
+                return Response.ok(req.id, result);
+            } catch (Exception e) {
+                closeStatementQuietly(stmt);
+                throw e;
+            }
+        } finally {
+            finishRunningStatement(connId, running);
         }
     }
 
     private Response fetch(Request req) throws Exception {
         int cursorId  = getInt(req, "cursor-id");
         int fetchSize = (int) req.params.getOrDefault("fetch-size", DEFAULT_FETCH_SIZE);
-
-        CursorManager.FetchResult fr = cursorMgr.fetch(cursorId, fetchSize);
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("cursor-id", fr.done() ? null : cursorId);
-        result.put("rows",      fr.rows());
-        result.put("done",      fr.done());
-        return Response.ok(req.id, result);
+        Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
+        int fetchTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
+                           ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
+        int connId = cursorMgr.connectionId(cursorId);
+        Statement stmt = cursorMgr.statement(cursorId);
+        RunningStatement running = beginRunningStatement(connId, req.id, stmt);
+        try {
+            try {
+                CursorManager.FetchResult fr = fetchCursorBatch(cursorId, fetchSize, stmt, fetchTimeout);
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("cursor-id", fr.done() ? null : cursorId);
+                result.put("rows",      fr.rows());
+                result.put("done",      fr.done());
+                return Response.ok(req.id, result);
+            } catch (SQLException e) {
+                return Response.error(req.id, e.getMessage());
+            }
+        } finally {
+            finishRunningStatement(connId, running);
+        }
     }
 
     private Response closeCursor(Request req) {
@@ -701,10 +793,6 @@ public class Dispatcher {
             "nullable", !"N".equalsIgnoreCase(rs.getString("nullable")),
             "position", rs.getInt("column_id")
         );
-    }
-
-    private boolean isOracleSystemOwner(String owner) {
-        return owner != null && ORACLE_SYSTEM_OWNER_SET.contains(owner.toUpperCase(Locale.ROOT));
     }
 
     private Response getPrimaryKeys(Request req) throws SQLException {
@@ -1791,6 +1879,95 @@ public class Dispatcher {
 
     private Connection metadataConnection(int connId) throws SQLException {
         return connMgr.getMetadata(connId);
+    }
+
+    private boolean requestBypassesConnectionLock(Request req) {
+        return switch (req.op) {
+            case "ping", "connect", "cancel", "close-cursor" -> true;
+            default -> false;
+        };
+    }
+
+    private Integer lockConnectionId(Request req) throws SQLException {
+        return switch (req.op) {
+            case "disconnect", "commit", "rollback", "set-auto-commit",
+                 "execute", "get-schemas", "set-current-schema",
+                 "get-tables", "search-tables", "get-columns", "search-columns",
+                 "get-primary-keys", "get-foreign-keys", "get-referencing-objects",
+                 "get-indexes", "get-index-columns", "get-sequences",
+                 "get-procedures", "get-functions",
+                 "get-procedure-params", "get-function-params",
+                 "get-object-source", "get-object-ddl", "get-triggers"
+                -> getInt(req, "conn-id");
+            case "fetch" -> cursorMgr.connectionId(getInt(req, "cursor-id"));
+            default -> null;
+        };
+    }
+
+    private Response withConnectionLock(int connId, Callable<Response> action) throws Exception {
+        ReentrantLock lock = connectionLocks.computeIfAbsent(connId, _id -> new ReentrantLock());
+        lock.lock();
+        try {
+            return action.call();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private RunningStatement beginRunningStatement(int connId, int requestId, Statement stmt) {
+        RunningStatement running = new RunningStatement(requestId, stmt);
+        RunningStatement previous = runningStatements.putIfAbsent(connId, running);
+        if (previous != null) {
+            throw new IllegalStateException("Connection " + connId + " already has a running statement");
+        }
+        return running;
+    }
+
+    private void finishRunningStatement(int connId, RunningStatement running) {
+        runningStatements.remove(connId, running);
+    }
+
+    private CursorManager.FetchResult fetchCursorBatch(int cursorId, int fetchSize,
+                                                       Statement stmt, int timeoutSeconds)
+            throws Exception {
+        Future<CursorManager.FetchResult> future;
+        try {
+            future = executePool.submit(() -> cursorMgr.fetch(cursorId, fetchSize));
+        } catch (RejectedExecutionException e) {
+            cursorMgr.close(cursorId);
+            throw new SQLException(EXECUTOR_OVERLOADED_ERROR);
+        }
+        try {
+            return future.get(timeoutSeconds + 1L, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            cancelStatementQuietly(stmt);
+            cursorMgr.close(cursorId);
+            throw new SQLException("Query timed out after " + timeoutSeconds + "s");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            cursorMgr.close(cursorId);
+            if (cause instanceof SQLException sqlException) {
+                throw sqlException;
+            }
+            throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
+        }
+    }
+
+    private static ExecutorService newExecutePool() {
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+            MAX_CONCURRENT_JDBC_TASKS,
+            MAX_CONCURRENT_JDBC_TASKS,
+            60L,
+            TimeUnit.SECONDS,
+            new SynchronousQueue<>(),
+            r -> {
+                Thread t = new Thread(r, "clutch-jdbc-execute");
+                t.setDaemon(true);
+                return t;
+            });
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
     }
 
     private void applyCurrentSchema(Connection conn, String schema) throws SQLException {
