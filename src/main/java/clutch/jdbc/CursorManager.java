@@ -73,6 +73,20 @@ public class CursorManager {
         return new FetchResult(c.columnNames(), c.columnTypes(), rows, done);
     }
 
+    /** Return the owning connection id for {@code cursorId}. */
+    public int connectionId(int cursorId) throws SQLException {
+        Cursor c = cursors.get(cursorId);
+        if (c == null) throw new SQLException("Unknown cursor id: " + cursorId);
+        return c.connId();
+    }
+
+    /** Return the live Statement backing {@code cursorId}. */
+    public Statement statement(int cursorId) throws SQLException {
+        Cursor c = cursors.get(cursorId);
+        if (c == null) throw new SQLException("Unknown cursor id: " + cursorId);
+        return c.stmt();
+    }
+
     /** Close and remove the cursor for {@code cursorId}. No-op if already closed. */
     public void close(int cursorId) {
         Cursor c = cursors.remove(cursorId);

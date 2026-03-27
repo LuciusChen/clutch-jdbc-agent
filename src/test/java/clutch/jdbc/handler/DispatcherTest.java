@@ -20,6 +20,11 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -301,6 +306,396 @@ class DispatcherTest {
         assertEquals(Dispatcher.DEFAULT_EXECUTE_TIMEOUT, capturedTimeout[0],
             "default timeout should be used when none specified");
         assertEquals("dml", resultMap(response).get("type"));
+    }
+
+    @Test
+    void cancelInterruptsRunningExecuteAndKeepsConnectionUsable() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        CountDownLatch executeStarted = new CountDownLatch(1);
+        CountDownLatch cancelCalled = new CountDownLatch(1);
+        List<String> executedSql = new ArrayList<>();
+
+        Statement blockingStmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "setQueryTimeout" -> null;
+                case "execute" -> {
+                    executedSql.add((String) args[0]);
+                    executeStarted.countDown();
+                    if (!cancelCalled.await(2, TimeUnit.SECONDS)) {
+                        throw new AssertionError("cancel was not requested");
+                    }
+                    throw new java.sql.SQLException("Query cancelled");
+                }
+                case "cancel" -> {
+                    cancelCalled.countDown();
+                    yield null;
+                }
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        RecordingStatementHandler followupStmt = new RecordingStatementHandler();
+        followupStmt.updateCount = 1;
+        Statement[] statements = {blockingStmt, followupStmt.proxy()};
+        int[] nextStatement = {0};
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "isValid" -> true;
+                case "createStatement" -> statements[nextStatement[0]++];
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<Response> executeFuture = pool.submit(
+                () -> dispatcher.dispatch(request(40, "execute", "conn-id", 7, "sql", "SELECT * FROM t")));
+
+            assertTrue(executeStarted.await(2, TimeUnit.SECONDS), "execute should start before cancel");
+
+            Response cancelResponse = dispatcher.dispatch(request(41, "cancel", "conn-id", 7));
+            assertTrue(cancelResponse.ok);
+            assertEquals(true, resultMap(cancelResponse).get("cancelled"));
+
+            Response interrupted = executeFuture.get(2, TimeUnit.SECONDS);
+            assertFalse(interrupted.ok);
+            assertEquals("Query cancelled", interrupted.error);
+
+            Response followup = dispatcher.dispatch(
+                request(42, "execute", "conn-id", 7, "sql", "UPDATE demo SET x = 1"));
+            assertTrue(followup.ok);
+            assertEquals("dml", resultMap(followup).get("type"));
+            assertEquals(1, ((Number) resultMap(followup).get("affected-rows")).intValue());
+            assertEquals(List.of("SELECT * FROM t"), executedSql);
+            assertEquals("UPDATE demo SET x = 1", followupStmt.executedSql);
+        } finally {
+            pool.shutdownNow();
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void cancelInterruptsRunningFetchAndKeepsConnectionUsable() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        CountDownLatch fetchStarted = new CountDownLatch(1);
+        CountDownLatch cancelCalled = new CountDownLatch(1);
+
+        Statement blockingStmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "cancel" -> {
+                    cancelCalled.countDown();
+                    yield null;
+                }
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        ResultSetMetaData meta = (ResultSetMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{ResultSetMetaData.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "getColumnCount" -> 1;
+                case "getColumnLabel" -> "id";
+                case "getColumnTypeName" -> "INTEGER";
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        ResultSet blockingRs = (ResultSet) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{ResultSet.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "next" -> {
+                    fetchStarted.countDown();
+                    if (!cancelCalled.await(2, TimeUnit.SECONDS)) {
+                        throw new AssertionError("cancel was not requested");
+                    }
+                    throw new java.sql.SQLException("Query cancelled");
+                }
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        RecordingStatementHandler followupStmt = new RecordingStatementHandler();
+        followupStmt.updateCount = 1;
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "isValid" -> true;
+                case "createStatement" -> followupStmt.proxy();
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        CursorManager cursorMgr = new CursorManager();
+        int cursorId = cursorMgr.register(7, blockingStmt, blockingRs);
+        Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<Response> fetchFuture = pool.submit(
+                () -> dispatcher.dispatch(request(43, "fetch", "cursor-id", cursorId, "fetch-size", 10)));
+
+            assertTrue(fetchStarted.await(2, TimeUnit.SECONDS), "fetch should start before cancel");
+
+            Response cancelResponse = dispatcher.dispatch(request(44, "cancel", "conn-id", 7));
+            assertTrue(cancelResponse.ok);
+            assertEquals(true, resultMap(cancelResponse).get("cancelled"));
+
+            Response interrupted = fetchFuture.get(2, TimeUnit.SECONDS);
+            assertFalse(interrupted.ok);
+            assertEquals("Query cancelled", interrupted.error);
+
+            Response followup = dispatcher.dispatch(
+                request(45, "execute", "conn-id", 7, "sql", "UPDATE demo SET x = 1"));
+            assertTrue(followup.ok);
+            assertEquals("dml", resultMap(followup).get("type"));
+            assertEquals(1, ((Number) resultMap(followup).get("affected-rows")).intValue());
+            assertEquals("UPDATE demo SET x = 1", followupStmt.executedSql);
+        } finally {
+            pool.shutdownNow();
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void fetchTimesOutAndCancelsStatementWhenBlocked() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        boolean[] cancelled = {false};
+        boolean[] statementClosed = {false};
+        boolean[] resultSetClosed = {false};
+
+        Statement blockingStmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "cancel" -> {
+                    cancelled[0] = true;
+                    yield null;
+                }
+                case "close" -> {
+                    statementClosed[0] = true;
+                    yield null;
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        ResultSetMetaData meta = (ResultSetMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{ResultSetMetaData.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "getColumnCount" -> 1;
+                case "getColumnLabel" -> "id";
+                case "getColumnTypeName" -> "INTEGER";
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        ResultSet blockingRs = (ResultSet) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{ResultSet.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "next" -> {
+                    try {
+                        Thread.sleep(Long.MAX_VALUE);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    throw new java.sql.SQLException("interrupted");
+                }
+                case "close" -> {
+                    resultSetClosed[0] = true;
+                    yield null;
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        RecordingStatementHandler followupStmt = new RecordingStatementHandler();
+        followupStmt.updateCount = 1;
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "isValid" -> true;
+                case "createStatement" -> followupStmt.proxy();
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        CursorManager cursorMgr = new CursorManager();
+        int cursorId = cursorMgr.register(7, blockingStmt, blockingRs);
+        Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            long start = System.currentTimeMillis();
+            Future<Response> fetchFuture = pool.submit(
+                () -> dispatcher.dispatch(request(46, "fetch",
+                    "cursor-id", cursorId,
+                    "fetch-size", 10,
+                    "query-timeout-seconds", 1)));
+
+            Response timedOut = fetchFuture.get(4, TimeUnit.SECONDS);
+            long elapsed = System.currentTimeMillis() - start;
+
+            assertFalse(timedOut.ok);
+            assertNotNull(timedOut.error);
+            assertTrue(timedOut.error.contains("timed out"),
+                "error should mention timed out: " + timedOut.error);
+            assertTrue(cancelled[0], "stmt.cancel() must be called on fetch timeout");
+            assertTrue(statementClosed[0], "stmt.close() must be called on fetch timeout");
+            assertTrue(resultSetClosed[0], "resultset must be closed on fetch timeout");
+            assertTrue(elapsed < 4000, "test must complete within 4s, took: " + elapsed + "ms");
+
+            Response followup = dispatcher.dispatch(
+                request(47, "execute", "conn-id", 7, "sql", "UPDATE demo SET x = 1"));
+            assertTrue(followup.ok);
+            assertEquals("dml", resultMap(followup).get("type"));
+            assertEquals(1, ((Number) resultMap(followup).get("affected-rows")).intValue());
+            assertEquals("UPDATE demo SET x = 1", followupStmt.executedSql);
+        } finally {
+            pool.shutdownNow();
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void executeTimesOutWhenInitialFetchBlocksAndKeepsConnectionUsable() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        boolean[] cancelled = {false};
+        boolean[] statementClosed = {false};
+        boolean[] resultSetClosed = {false};
+
+        ResultSetMetaData meta = (ResultSetMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{ResultSetMetaData.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "getColumnCount" -> 1;
+                case "getColumnLabel" -> "id";
+                case "getColumnTypeName" -> "INTEGER";
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        ResultSet blockingRs = (ResultSet) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{ResultSet.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "setFetchSize" -> null;
+                case "next" -> {
+                    try {
+                        Thread.sleep(Long.MAX_VALUE);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    throw new java.sql.SQLException("interrupted");
+                }
+                case "close" -> {
+                    resultSetClosed[0] = true;
+                    yield null;
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        Statement[] createdStatement = new Statement[1];
+        Statement queryStmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "setQueryTimeout" -> null;
+                case "execute" -> true;
+                case "getResultSet" -> blockingRs;
+                case "cancel" -> {
+                    cancelled[0] = true;
+                    yield null;
+                }
+                case "close" -> {
+                    statementClosed[0] = true;
+                    yield null;
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        createdStatement[0] = queryStmt;
+
+        RecordingStatementHandler followupStmt = new RecordingStatementHandler();
+        followupStmt.updateCount = 1;
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "isValid" -> true;
+                case "createStatement" -> {
+                    Statement next = createdStatement[0];
+                    createdStatement[0] = followupStmt.proxy();
+                    yield next;
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            long start = System.currentTimeMillis();
+            Future<Response> executeFuture = pool.submit(
+                () -> dispatcher.dispatch(request(48, "execute",
+                    "conn-id", 7,
+                    "sql", "SELECT * FROM t",
+                    "fetch-size", 10,
+                    "query-timeout-seconds", 1)));
+
+            Response timedOut = executeFuture.get(4, TimeUnit.SECONDS);
+            long elapsed = System.currentTimeMillis() - start;
+
+            assertFalse(timedOut.ok);
+            assertNotNull(timedOut.error);
+            assertTrue(timedOut.error.contains("timed out"),
+                "error should mention timed out: " + timedOut.error);
+            assertTrue(cancelled[0], "stmt.cancel() must be called when initial fetch times out");
+            assertTrue(statementClosed[0], "stmt.close() must be called when initial fetch times out");
+            assertTrue(resultSetClosed[0], "resultset must be closed when initial fetch times out");
+            assertTrue(elapsed < 4000, "test must complete within 4s, took: " + elapsed + "ms");
+
+            Response followup = dispatcher.dispatch(
+                request(49, "execute", "conn-id", 7, "sql", "UPDATE demo SET x = 1"));
+            assertTrue(followup.ok);
+            assertEquals("dml", resultMap(followup).get("type"));
+            assertEquals(1, ((Number) resultMap(followup).get("affected-rows")).intValue());
+            assertEquals("UPDATE demo SET x = 1", followupStmt.executedSql);
+        } finally {
+            pool.shutdownNow();
+            dispatcher.shutdown();
+        }
     }
 
     @Test

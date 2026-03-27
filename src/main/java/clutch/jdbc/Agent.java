@@ -8,6 +8,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Main entry point. Reads one JSON request per line from stdin,
@@ -23,6 +28,9 @@ import java.nio.file.Path;
 public class Agent {
 
     private static final System.Logger LOG = System.getLogger(Agent.class.getName());
+    static final int MAX_CONCURRENT_REQUESTS = 48;
+    private static final String REQUEST_OVERLOADED_ERROR =
+        "Agent overloaded: too many concurrent requests";
 
     /** Start the agent: load drivers, emit ready signal, then loop on stdin. */
     public static void main(String[] args) throws Exception {
@@ -43,6 +51,7 @@ public class Agent {
         ConnectionManager connMgr   = new ConnectionManager();
         CursorManager cursorMgr     = new CursorManager();
         Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
+        ExecutorService requestPool = newRequestPool();
 
         // stdout must be line-buffered and UTF-8 for the protocol.
         PrintStream out = new PrintStream(
@@ -61,24 +70,84 @@ public class Agent {
             line = line.strip();
             if (line.isEmpty()) continue;
 
-            Request req = null;
+            Request req;
             try {
                 req = mapper.readValue(line, Request.class);
-                Response resp = dispatcher.dispatch(req);
-                out.println(mapper.writeValueAsString(resp));
             } catch (Exception e) {
-                int id = (req != null) ? req.id : -1;
                 LOG.log(System.Logger.Level.ERROR,
-                        "Error handling request {0}: {1}",
-                        id, e.getMessage());
-                out.println(mapper.writeValueAsString(Response.error(id, e.getMessage())));
+                        "Error parsing request line: {0}",
+                        e.getMessage());
+                synchronized (out) {
+                    out.println(mapper.writeValueAsString(Response.error(-1, e.getMessage())));
+                }
+                continue;
+            }
+
+            try {
+                requestPool.submit(() -> handleRequest(dispatcher, mapper, out, req));
+            } catch (RejectedExecutionException e) {
+                LOG.log(System.Logger.Level.WARNING,
+                        "Rejecting request {0}: request pool saturated",
+                        req.id);
+                synchronized (out) {
+                    out.println(mapper.writeValueAsString(
+                        Response.error(req.id, REQUEST_OVERLOADED_ERROR)));
+                }
+            } catch (Exception e) {
+                LOG.log(System.Logger.Level.ERROR,
+                        "Error submitting request {0}: {1}",
+                        req.id,
+                        e.getMessage());
+                synchronized (out) {
+                    out.println(mapper.writeValueAsString(Response.error(req.id, e.getMessage())));
+                }
             }
         }
 
         // stdin closed — clean up and exit.
         LOG.log(System.Logger.Level.INFO, "stdin closed, shutting down.");
+        requestPool.shutdownNow();
         connMgr.disconnectAll();
         dispatcher.shutdown();
+    }
+
+    private static ExecutorService newRequestPool() {
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+            MAX_CONCURRENT_REQUESTS,
+            MAX_CONCURRENT_REQUESTS,
+            60L,
+            TimeUnit.SECONDS,
+            new SynchronousQueue<>(),
+            r -> {
+                Thread t = new Thread(r, "clutch-jdbc-request");
+                t.setDaemon(true);
+                return t;
+            });
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
+    }
+
+    private static void handleRequest(Dispatcher dispatcher, ObjectMapper mapper,
+                                      PrintStream out, Request req) {
+        try {
+            Response resp = dispatcher.dispatch(req);
+            synchronized (out) {
+                out.println(mapper.writeValueAsString(resp));
+            }
+        } catch (Exception e) {
+            LOG.log(System.Logger.Level.ERROR,
+                    "Error handling request {0}: {1}",
+                    req.id, e.getMessage());
+            try {
+                synchronized (out) {
+                    out.println(mapper.writeValueAsString(Response.error(req.id, e.getMessage())));
+                }
+            } catch (IOException ioException) {
+                LOG.log(System.Logger.Level.ERROR,
+                        "Error writing error response for request {0}: {1}",
+                        req.id, ioException.getMessage());
+            }
+        }
     }
 
     /**

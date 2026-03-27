@@ -38,6 +38,11 @@ statement, and return `Response.error` — main loop is never blocked again.
 A `DEFAULT_EXECUTE_TIMEOUT` of 29s acts as a safety net when the client sends
 no `query-timeout-seconds` (e.g. non-Oracle databases or older clutch clients).
 
+This record is intentionally scoped to "one stuck execute must not wedge the
+whole agent". It does **not** define a user-visible interrupt/cancel protocol.
+Recoverable `C-g` semantics and the formal `cancel` RPC were added later and
+are recorded in postmortem 007.
+
 ## Rationale
 
 The thread approach was chosen over an async/reactive pattern because:
