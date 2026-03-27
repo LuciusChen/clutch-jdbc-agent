@@ -8,6 +8,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Main entry point. Reads one JSON request per line from stdin,
@@ -23,6 +25,31 @@ import java.nio.file.Path;
 public class Agent {
 
     private static final System.Logger LOG = System.getLogger(Agent.class.getName());
+
+    private static final class ResponseEmitter {
+        private final ObjectMapper mapper;
+        private final PrintStream out;
+        private final Object lock = new Object();
+
+        private ResponseEmitter(ObjectMapper mapper, PrintStream out) {
+            this.mapper = mapper;
+            this.out = out;
+        }
+
+        private void emit(Response response) {
+            try {
+                String json = mapper.writeValueAsString(response);
+                synchronized (lock) {
+                    out.println(json);
+                    out.flush();
+                }
+            } catch (Exception e) {
+                LOG.log(System.Logger.Level.ERROR,
+                        "Failed to write response {0}: {1}",
+                        response.id, e.getMessage());
+            }
+        }
+    }
 
     /** Start the agent: load drivers, emit ready signal, then loop on stdin. */
     public static void main(String[] args) throws Exception {
@@ -43,14 +70,19 @@ public class Agent {
         ConnectionManager connMgr   = new ConnectionManager();
         CursorManager cursorMgr     = new CursorManager();
         Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
+        ExecutorService requestPool = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "clutch-jdbc-request");
+            t.setDaemon(true);
+            return t;
+        });
 
         // stdout must be line-buffered and UTF-8 for the protocol.
         PrintStream out = new PrintStream(
             new BufferedOutputStream(System.out), true, StandardCharsets.UTF_8);
+        ResponseEmitter emitter = new ResponseEmitter(mapper, out);
 
         // Signal readiness to Emacs.
-        out.println(mapper.writeValueAsString(
-            Response.ok(0, java.util.Map.of("agent", "clutch-jdbc-agent", "ready", true))));
+        emitter.emit(Response.ok(0, java.util.Map.of("agent", "clutch-jdbc-agent", "ready", true)));
 
         // Main loop: one request per line.
         BufferedReader in = new BufferedReader(
@@ -61,22 +93,29 @@ public class Agent {
             line = line.strip();
             if (line.isEmpty()) continue;
 
-            Request req = null;
             try {
-                req = mapper.readValue(line, Request.class);
-                Response resp = dispatcher.dispatch(req);
-                out.println(mapper.writeValueAsString(resp));
+                Request req = mapper.readValue(line, Request.class);
+                requestPool.submit(() -> {
+                    try {
+                        emitter.emit(dispatcher.dispatch(req));
+                    } catch (Exception e) {
+                        LOG.log(System.Logger.Level.ERROR,
+                                "Error handling request {0}: {1}",
+                                req.id, e.getMessage());
+                        emitter.emit(Response.error(req.id, e.getMessage()));
+                    }
+                });
             } catch (Exception e) {
-                int id = (req != null) ? req.id : -1;
                 LOG.log(System.Logger.Level.ERROR,
-                        "Error handling request {0}: {1}",
-                        id, e.getMessage());
-                out.println(mapper.writeValueAsString(Response.error(id, e.getMessage())));
+                        "Error parsing request: {0}",
+                        e.getMessage());
+                emitter.emit(Response.error(-1, e.getMessage()));
             }
         }
 
         // stdin closed — clean up and exit.
         LOG.log(System.Logger.Level.INFO, "stdin closed, shutting down.");
+        requestPool.shutdownNow();
         connMgr.disconnectAll();
         dispatcher.shutdown();
     }
