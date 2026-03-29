@@ -83,8 +83,19 @@ Timeout-related params are explicit:
 
 Error response:
 ```json
-{"id": 1, "ok": false, "error": "Database error: ORA-00942: table or view does not exist"}
+{"id": 1, "ok": false, "error": "ORA-01435: user does not exist", "diag": {"category": "metadata", "op": "set-current-schema", "request-id": 1, "context": {"schema": "APP", "generated-sql": "ALTER SESSION SET CURRENT_SCHEMA = \"APP\""}}}
 ```
+
+`diag` is optional and is intended for troubleshooting, not for the default
+user-facing error string.  It may include request metadata such as category,
+connection id, exception class, SQLState, vendor code, cause chain, and
+redacted request context.  When a hidden/internal query path fails,
+`diag.context.generated-sql` carries the actual SQL text that the agent ran.
+
+When the client sends `params.debug=true`, failures may also include an
+additional optional `debug` payload.  That payload is still redacted and is
+meant for opt-in troubleshooting only; today it carries the redacted request
+context and a redacted Java stack trace.
 
 ### Operations
 
