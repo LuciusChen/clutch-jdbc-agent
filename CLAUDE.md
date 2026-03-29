@@ -108,8 +108,11 @@ Only split a class when it has a genuinely distinct responsibility. Do not creat
 
 - **Protocol errors** (bad JSON, unknown op, missing param): return `Response.error`,
   never crash the process.
-- **JDBC errors** (`SQLException`): return `Response.error` with
-  `e.getMessage()`. Do not expose stack traces to Emacs.
+- **JDBC errors** (`SQLException`): return `Response.error` with a concise
+  message and, when available, structured diagnostics (`diag`) such as
+  SQLState, vendor code, exception class, cause chain, redacted request
+  context, and generated/internal SQL for hidden query paths. Do not expose
+  stack traces to Emacs.
 - **Resource cleanup**: always use try-with-resources for `ResultSet`, `Statement`,
   `Connection` when the scope is local. For long-lived resources (cursor lifecycle),
   ensure `close()` is called in `finally` or on shutdown.

@@ -15,11 +15,13 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -31,6 +33,7 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -64,6 +67,298 @@ class DispatcherTest {
         assertEquals(networkTimeoutSeconds, connMgr.networkTimeoutSeconds);
         assertEquals(autoCommit, connMgr.autoCommit);
         assertEquals(returnedConnId, ((Number) ((Map<?, ?>) response.result).get("conn-id")).intValue());
+    }
+
+    @Test
+    void connectReturnsDiagnosticErrorWhenConnectionFails() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
+            "reason-61",
+            "08061",
+            new java.net.ConnectException("root-61"));
+
+        Response response = dispatch(connMgr, 61, "connect",
+            "url", "jdbc:clickhouse://127.0.0.1:8123/testdb?password=secret-61&ssl=true",
+            "user", "test",
+            "password", "test",
+            "props", Map.of("http_header_COOKIE", "cookie-secret-61", "socket_timeout", "10"));
+
+        assertFalse(response.ok);
+        assertNotNull(response.error);
+        assertTrue(response.error.contains("SQLNonTransientConnectionException"));
+        assertTrue(response.error.contains("08061"));
+        assertTrue(response.error.contains("reason-61"));
+        assertTrue(response.error.contains("ConnectException"));
+        assertTrue(response.error.contains("root-61"));
+        Object diagObject = response.getClass().getField("diag").get(response);
+        assertTrue(diagObject instanceof Map<?, ?>);
+        Map<?, ?> diag = (Map<?, ?>) diagObject;
+        assertEquals("connect", diag.get("category"));
+        assertEquals("connect", diag.get("op"));
+        assertEquals(61, ((Number) diag.get("request-id")).intValue());
+        assertEquals("java.sql.SQLNonTransientConnectionException", diag.get("exception-class"));
+        assertEquals("08061", diag.get("sql-state"));
+        assertTrue(diag.get("cause-chain") instanceof List<?>);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> context = (Map<String, Object>) diag.get("context");
+        assertEquals("test", context.get("user"));
+        String redactedUrl61 = (String) context.get("redacted-url");
+        assertTrue(redactedUrl61.contains("?password=<redacted>"),
+            "redacted URL must preserve '?' delimiter");
+        assertFalse(redactedUrl61.contains("secret-61"));
+        assertTrue(redactedUrl61.contains("ssl=true"),
+            "non-secret URL parameter 'ssl=true' must be preserved");
+        assertFalse(context.containsKey("password"));
+        assertEquals(List.of("http_header_COOKIE", "socket_timeout"), context.get("property-keys"));
+        assertFalse(diag.toString().contains("cookie-secret-61"));
+    }
+
+    @Test
+    void connectDoesNotReturnDebugPayloadByDefault() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
+            "reason-61",
+            "08061",
+            new java.net.ConnectException("root-61"));
+
+        Response response = dispatch(connMgr, 76, "connect",
+            "url", "jdbc:clickhouse://127.0.0.1:8123/testdb?password=secret-76&ssl=true",
+            "user", "test",
+            "password", "test",
+            "props", Map.of("http_header_COOKIE", "cookie-secret-76", "socket_timeout", "10"));
+
+        assertFalse(response.ok);
+        assertNull(response.getClass().getField("debug").get(response));
+    }
+
+    @Test
+    void connectDebugPayloadIsOptInAndRedacted() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
+            "reason-77 http_header_COOKIE=abc123",
+            "08061",
+            new java.net.ConnectException("root-77 secret-77"));
+
+        Response response = dispatch(connMgr, 77, "connect",
+            "url", "jdbc:clickhouse://127.0.0.1:8123/testdb?password=secret-77&ssl=true",
+            "user", "test",
+            "password", "test",
+            "props", Map.of("http_header_COOKIE", "abc123", "socket_timeout", "10"),
+            "debug", true);
+
+        assertFalse(response.ok);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> debug = (Map<String, Object>) response.getClass().getField("debug").get(response);
+        assertNotNull(debug);
+        assertTrue(debug.get("thread") instanceof String);
+        assertFalse(((String) debug.get("thread")).isBlank());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> requestContext = (Map<String, Object>) debug.get("request-context");
+        assertEquals("test", requestContext.get("user"));
+        assertTrue(Objects.toString(requestContext.get("redacted-url"), "").contains("<redacted>"));
+        String stackTrace = Objects.toString(debug.get("stack-trace"), "");
+        assertTrue(stackTrace.contains("SQLNonTransientConnectionException"));
+        assertFalse(stackTrace.contains("secret-77"));
+        assertFalse(stackTrace.contains("abc123"));
+    }
+
+    @Test
+    void connectDiagnosticsRedactSemicolonStyleUrlAndSecretMessages() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        String url =
+            "jdbc:sqlserver://db.local:1433;encrypt=true;user=sa;password=secret-62;accessToken=token-62";
+        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
+            "connect failed for " + url + " cookie cookie-secret-62",
+            "08001",
+            new SQLException("root cause " + url + " cookie cookie-secret-62"));
+
+        Response response = dispatch(connMgr, 62, "connect",
+            "url", url,
+            "user", "sa",
+            "password", "password-param-62",
+            "props", Map.of("http_header_COOKIE", "cookie-secret-62", "socket_timeout", "10"));
+
+        assertFalse(response.ok);
+        assertFalse(response.error.contains("secret-62"));
+        assertFalse(response.error.contains("token-62"));
+        assertFalse(response.error.contains("cookie-secret-62"));
+        Map<String, Object> diag = diagMap(response);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> context = (Map<String, Object>) diag.get("context");
+        String redactedUrl = (String) context.get("redacted-url");
+        assertTrue(redactedUrl.startsWith("jdbc:sqlserver://db.local:1433;"),
+            "redacted URL must preserve ';' delimiter after host");
+        assertTrue(redactedUrl.contains(";password=<redacted>"));
+        assertTrue(redactedUrl.contains(";accessToken=<redacted>"));
+        assertTrue(redactedUrl.contains("encrypt=true"),
+            "non-secret URL parameter 'encrypt=true' must be preserved");
+        assertTrue(redactedUrl.contains("user=sa"),
+            "non-secret URL parameter 'user=sa' must be preserved");
+        assertFalse(redactedUrl.contains("secret-62"));
+        assertFalse(redactedUrl.contains("token-62"));
+        assertFalse(Objects.toString(diag.get("raw-message"), "").contains("secret-62"));
+        assertFalse(Objects.toString(diag.get("raw-message"), "").contains("token-62"));
+        assertFalse(Objects.toString(diag.get("raw-message"), "").contains("cookie-secret-62"));
+        assertFalse(Objects.toString(diag.get("cause-chain"), "").contains("secret-62"));
+        assertFalse(Objects.toString(diag.get("cause-chain"), "").contains("token-62"));
+        assertFalse(Objects.toString(diag.get("cause-chain"), "").contains("cookie-secret-62"));
+    }
+
+    @Test
+    void shortPasswordDoesNotOverRedactDiagnosticText() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        // Exception message deliberately contains the word "test" in diagnostic context
+        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
+            "test connection refused by testdb host",
+            "08001",
+            new java.net.ConnectException("Connection to test-server timed out"));
+
+        Response response = dispatch(connMgr, 70, "connect",
+            "url", "jdbc:postgresql://localhost:5432/testdb?password=secret-70&sslmode=require",
+            "user", "testuser",
+            "password", "test",
+            "props", Map.of());
+
+        assertFalse(response.ok);
+        // The word "test" must NOT be redacted in diagnostic text
+        assertTrue(response.error.contains("test connection refused"),
+            "diagnostic text 'test connection refused' should not be over-redacted");
+        assertTrue(response.error.contains("testdb"),
+            "database name 'testdb' should not be over-redacted");
+        assertTrue(response.error.contains("test-server"),
+            "hostname 'test-server' should not be over-redacted");
+        // But the URL password must still be redacted
+        Map<String, Object> diag70 = diagMap(response);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> ctx70 = (Map<String, Object>) diag70.get("context");
+        String redactedUrl70 = (String) ctx70.get("redacted-url");
+        assertTrue(redactedUrl70.contains("?password=<redacted>"),
+            "redacted URL must preserve '?' delimiter");
+        assertFalse(redactedUrl70.contains("secret-70"));
+        assertTrue(redactedUrl70.contains("sslmode=require"),
+            "non-secret URL parameter 'sslmode=require' must be preserved");
+    }
+
+    @Test
+    void urlSecretsStillRedactedWithNewSanitization() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        String url = "jdbc:mysql://db:3306/app?password=secret-71&token=tok-71-value&ssl=true";
+        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
+            "Access denied: " + url,
+            "28000");
+
+        Response response = dispatch(connMgr, 71, "connect",
+            "url", url,
+            "user", "admin",
+            "password", "admin-pass-71",
+            "props", Map.of());
+
+        assertFalse(response.ok);
+        assertFalse(response.error.contains("secret-71"),
+            "URL password value must be redacted from error text");
+        assertFalse(response.error.contains("tok-71-value"),
+            "URL token value must be redacted from error text");
+        Map<String, Object> diag71 = diagMap(response);
+        assertFalse(Objects.toString(diag71.get("raw-message"), "").contains("secret-71"));
+        assertFalse(Objects.toString(diag71.get("raw-message"), "").contains("tok-71-value"));
+    }
+
+    @Test
+    void cookieValuesRedactedWithNewSanitization() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
+            "auth failed cookie session-cookie-72 token: header-token-72",
+            "28000",
+            new SQLException("root cookie session-cookie-72"));
+
+        Response response = dispatch(connMgr, 72, "connect",
+            "url", "jdbc:clickhouse://127.0.0.1:8123/db",
+            "user", "user",
+            "password", "pw-72-longenough",
+            "props", Map.of("http_header_COOKIE", "session-cookie-72",
+                            "http_header_Authorization", "header-token-72",
+                            "socket_timeout", "10"));
+
+        assertFalse(response.ok);
+        assertFalse(response.error.contains("session-cookie-72"),
+            "cookie value must be redacted from error text");
+        assertFalse(response.error.contains("header-token-72"),
+            "authorization header value must be redacted from error text");
+        Map<String, Object> diag72 = diagMap(response);
+        assertFalse(Objects.toString(diag72.get("cause-chain"), "").contains("session-cookie-72"));
+    }
+
+    @Test
+    void nonSensitiveMetadataNotRedacted() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        // Exception references schema/table names that happen to contain secret-like substrings
+        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
+            "Cannot find catalog 'tokenizer_db' schema 'auth_service' table 'credentials_log'",
+            "42000");
+
+        Response response = dispatch(connMgr, 73, "connect",
+            "url", "jdbc:postgresql://localhost/tokenizer_db",
+            "user", "app",
+            "password", "real-secret-73-pwd",
+            "props", Map.of());
+
+        assertFalse(response.ok);
+        // These identifiers contain substrings of secret key names but are NOT secrets
+        assertTrue(response.error.contains("tokenizer_db"),
+            "catalog name 'tokenizer_db' must not be redacted");
+        assertTrue(response.error.contains("auth_service"),
+            "schema name 'auth_service' must not be redacted");
+        assertTrue(response.error.contains("credentials_log"),
+            "table name 'credentials_log' must not be redacted");
+    }
+
+    @Test
+    void longSecretInsideSnakeOrKebabIdentifierNotOverRedacted() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        // Password is a long value that also appears as a prefix in identifiers
+        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
+            "Cannot find table 'warehouse01_orders' on host warehouse01-db.local",
+            "42000");
+
+        Response response = dispatch(connMgr, 74, "connect",
+            "url", "jdbc:postgresql://warehouse01-db.local/app",
+            "user", "app",
+            "password", "warehouse01",
+            "props", Map.of());
+
+        assertFalse(response.ok);
+        assertTrue(response.error.contains("warehouse01_orders"),
+            "snake_case identifier containing the password must not be over-redacted");
+        assertTrue(response.error.contains("warehouse01-db"),
+            "kebab-case hostname containing the password must not be over-redacted");
+    }
+
+    @Test
+    void shortPrefixedSecretKeysStillRedactValues() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
+            "connect failed http_header_COOKIE=abc123 proxyAuthorization: xyz789",
+            "28000",
+            new SQLException("root http_header_COOKIE=abc123 proxyAuthorization: xyz789"));
+
+        Response response = dispatch(connMgr, 75, "connect",
+            "url", "jdbc:clickhouse://127.0.0.1:8123/db",
+            "user", "user",
+            "password", "pw-75-longenough",
+            "props", Map.of("http_header_COOKIE", "abc123",
+                            "proxyAuthorization", "xyz789",
+                            "socket_timeout", "10"));
+
+        assertFalse(response.ok);
+        assertFalse(response.error.contains("abc123"),
+            "short cookie value must be redacted from error text");
+        assertFalse(response.error.contains("xyz789"),
+            "short authorization value must be redacted from error text");
+        Map<String, Object> diag75 = diagMap(response);
+        assertFalse(Objects.toString(diag75.get("raw-message"), "").contains("abc123"));
+        assertFalse(Objects.toString(diag75.get("raw-message"), "").contains("xyz789"));
+        assertFalse(Objects.toString(diag75.get("cause-chain"), "").contains("abc123"));
+        assertFalse(Objects.toString(diag75.get("cause-chain"), "").contains("xyz789"));
     }
 
     @Test
@@ -152,6 +447,31 @@ class DispatcherTest {
         assertEquals("CJH_TEST", resultMap(response).get("schema"));
     }
 
+    @Test
+    void setCurrentSchemaFailureCarriesGeneratedSql() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        String token = "MISSING_SCHEMA_13";
+        connMgr.connection = failingOracleSchemaConnection(token);
+        Response response = dispatch(connMgr, 13, "set-current-schema",
+            "conn-id", 7,
+            "schema", token);
+
+        assertFalse(response.ok);
+        Object diagObject = response.getClass().getField("diag").get(response);
+        assertTrue(diagObject instanceof Map<?, ?>);
+        Map<?, ?> diag = (Map<?, ?>) diagObject;
+        assertEquals("metadata", diag.get("category"));
+        assertEquals("set-current-schema", diag.get("op"));
+        assertEquals(13, ((Number) diag.get("request-id")).intValue());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> context = (Map<String, Object>) diag.get("context");
+        assertEquals(token, context.get("schema"));
+        assertTrue(context.get("generated-sql") instanceof String);
+        assertTrue(((String) context.get("generated-sql")).contains("ALTER SESSION SET CURRENT_SCHEMA"));
+        assertTrue(((String) context.get("generated-sql")).contains(token));
+        assertTrue(Objects.toString(diag.get("raw-message"), "").contains(token));
+    }
+
     @ParameterizedTest
     @MethodSource("executeDmlCases")
     void executeAppliesQueryTimeoutBeforeRunningStatement(String sql,
@@ -201,8 +521,9 @@ class DispatcherTest {
                 case "isWrapperFor"    -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
-        assertThrows(java.sql.SQLException.class,
-            () -> dispatch(connMgr, 99, "execute", "conn-id", 7, "sql", "SELECT 1"));
+        Response response = dispatch(connMgr, 99, "execute", "conn-id", 7, "sql", "SELECT 1");
+        assertFalse(response.ok);
+        assertEquals("simulated rs failure", response.error);
         assertTrue(closed[0], "statement must be closed when getResultSet() fails");
     }
 
@@ -225,6 +546,13 @@ class DispatcherTest {
         assertFalse(response.ok);
         assertNotNull(response.error);
         assertTrue(response.error.contains("idle timeout"), "error should mention idle timeout: " + response.error);
+        Object diagObject = response.getClass().getField("diag").get(response);
+        assertTrue(diagObject instanceof Map<?, ?>);
+        Map<?, ?> diag = (Map<?, ?>) diagObject;
+        assertEquals("connection-lost", diag.get("category"));
+        assertEquals("execute", diag.get("op"));
+        assertEquals(19, ((Number) diag.get("request-id")).intValue());
+        assertEquals(7, ((Number) diag.get("conn-id")).intValue());
     }
 
     @Test
@@ -462,6 +790,7 @@ class DispatcherTest {
             Response interrupted = fetchFuture.get(2, TimeUnit.SECONDS);
             assertFalse(interrupted.ok);
             assertEquals("Query cancelled", interrupted.error);
+            assertEquals("cancel", diagMap(interrupted).get("category"));
 
             Response followup = dispatcher.dispatch(
                 request(45, "execute", "conn-id", 7, "sql", "UPDATE demo SET x = 1"));
@@ -565,6 +894,7 @@ class DispatcherTest {
             assertNotNull(timedOut.error);
             assertTrue(timedOut.error.contains("timed out"),
                 "error should mention timed out: " + timedOut.error);
+            assertEquals("timeout", diagMap(timedOut).get("category"));
             assertTrue(cancelled[0], "stmt.cancel() must be called on fetch timeout");
             assertTrue(statementClosed[0], "stmt.close() must be called on fetch timeout");
             assertTrue(resultSetClosed[0], "resultset must be closed on fetch timeout");
@@ -681,6 +1011,7 @@ class DispatcherTest {
             assertNotNull(timedOut.error);
             assertTrue(timedOut.error.contains("timed out"),
                 "error should mention timed out: " + timedOut.error);
+            assertEquals("timeout", diagMap(timedOut).get("category"));
             assertTrue(cancelled[0], "stmt.cancel() must be called when initial fetch times out");
             assertTrue(statementClosed[0], "stmt.close() must be called when initial fetch times out");
             assertTrue(resultSetClosed[0], "resultset must be closed when initial fetch times out");
@@ -1118,6 +1449,11 @@ class DispatcherTest {
     }
 
     @SuppressWarnings("unchecked")
+    private static Map<String, Object> diagMap(Response response) throws Exception {
+        return (Map<String, Object>) response.getClass().getField("diag").get(response);
+    }
+
+    @SuppressWarnings("unchecked")
     private static <T> List<T> resultList(Response response, String key) {
         return (List<T>) resultMap(response).get(key);
     }
@@ -1231,6 +1567,38 @@ class DispatcherTest {
             });
     }
 
+    private static Connection failingOracleSchemaConnection(String token) {
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getDatabaseProductName" -> "Oracle";
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Statement stmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "execute" -> throw new SQLException("schema-switch-" + token);
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        return (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "createStatement" -> stmt;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
     private static ResultSet resultSet(List<String> columns, List<List<Object>> rows) {
         final int[] index = {-1};
         return (ResultSet) Proxy.newProxyInstance(
@@ -1264,11 +1632,12 @@ class DispatcherTest {
         private boolean autoCommit = true;
         private Connection connection;
         private Connection metadataConnection;
+        private SQLException connectFailure;
 
         @Override
         public int connect(String url, String user, String password, Map<String, String> props,
                            Integer connectTimeoutSeconds, Integer networkTimeoutSeconds,
-                           boolean autoCommit) {
+                           boolean autoCommit) throws SQLException {
             this.url = url;
             this.user = user;
             this.password = password;
@@ -1276,6 +1645,9 @@ class DispatcherTest {
             this.connectTimeoutSeconds = connectTimeoutSeconds;
             this.networkTimeoutSeconds = networkTimeoutSeconds;
             this.autoCommit = autoCommit;
+            if (connectFailure != null) {
+                throw connectFailure;
+            }
             return returnedConnId;
         }
 
