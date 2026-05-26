@@ -47,30 +47,18 @@ public class Dispatcher {
     private final DispatcherDiagnostics diagnostics;
     private final MetadataOps metadataOps;
 
-    private static final class RunningStatement {
-        private final int requestId;
-        private final Statement statement;
-        private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
-
+    private record RunningStatement(int requestId, Statement statement,
+                                    AtomicBoolean cancelRequestedFlag) {
         private RunningStatement(int requestId, Statement statement) {
-            this.requestId = requestId;
-            this.statement = statement;
-        }
-
-        private int requestId() {
-            return requestId;
-        }
-
-        private Statement statement() {
-            return statement;
+            this(requestId, statement, new AtomicBoolean(false));
         }
 
         private void markCancelRequested() {
-            cancelRequested.set(true);
+            cancelRequestedFlag.set(true);
         }
 
         private boolean cancelRequested() {
-            return cancelRequested.get();
+            return cancelRequestedFlag.get();
         }
     }
 

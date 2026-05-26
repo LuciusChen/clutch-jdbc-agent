@@ -125,11 +125,6 @@ public class ConnectionManager {
     }
 
     /** Return the live primary Connection for {@code connId}, or throw if unknown. */
-    public Connection get(int connId) throws SQLException {
-        return getPrimary(connId);
-    }
-
-    /** Return the live primary Connection for {@code connId}, or throw if unknown. */
     public Connection getPrimary(int connId) throws SQLException {
         Session session = connections.get(connId);
         if (session == null)

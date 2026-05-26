@@ -1652,11 +1652,6 @@ class DispatcherTest {
         }
 
         @Override
-        public Connection get(int connId) {
-            return getPrimary(connId);
-        }
-
-        @Override
         public Connection getPrimary(int connId) {
             assertEquals(7, connId);
             return connection;
