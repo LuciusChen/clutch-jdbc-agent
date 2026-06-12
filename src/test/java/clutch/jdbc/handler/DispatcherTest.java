@@ -39,6 +39,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DispatcherTest {
 
+    private static final String DRIVER_CLASS = "com.example.Driver";
+
     @ParameterizedTest
     @MethodSource("connectCases")
     void connectForwardsExplicitTimeouts(String url, String user, String password,
@@ -51,6 +53,7 @@ class DispatcherTest {
         connMgr.returnedConnId = returnedConnId;
         Response response = dispatch(connMgr, 1, "connect",
             "url", url,
+            "driver-class", DRIVER_CLASS,
             "user", user,
             "password", password,
             "props", props,
@@ -61,12 +64,23 @@ class DispatcherTest {
         assertTrue(response.ok);
         assertEquals(url, connMgr.url);
         assertEquals(user, connMgr.user);
+        assertEquals(DRIVER_CLASS, connMgr.driverClass);
         assertEquals(password, connMgr.password);
         assertEquals(props, connMgr.props);
         assertEquals(connectTimeoutSeconds, connMgr.connectTimeoutSeconds);
         assertEquals(networkTimeoutSeconds, connMgr.networkTimeoutSeconds);
         assertEquals(autoCommit, connMgr.autoCommit);
         assertEquals(returnedConnId, ((Number) ((Map<?, ?>) response.result).get("conn-id")).intValue());
+    }
+
+    @Test
+    void connectRequiresDriverClass() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        Response response = dispatch(connMgr, 81, "connect",
+            "url", "jdbc:test:demo");
+
+        assertFalse(response.ok);
+        assertEquals("connect: 'driver-class' is required", response.error);
     }
 
     @Test
@@ -79,6 +93,7 @@ class DispatcherTest {
 
         Response response = dispatch(connMgr, 61, "connect",
             "url", "jdbc:clickhouse://127.0.0.1:8123/testdb?password=secret-61&ssl=true",
+            "driver-class", DRIVER_CLASS,
             "user", "test",
             "password", "test",
             "props", Map.of("http_header_COOKIE", "cookie-secret-61", "socket_timeout", "10"));
@@ -123,6 +138,7 @@ class DispatcherTest {
 
         Response response = dispatch(connMgr, 76, "connect",
             "url", "jdbc:clickhouse://127.0.0.1:8123/testdb?password=secret-76&ssl=true",
+            "driver-class", DRIVER_CLASS,
             "user", "test",
             "password", "test",
             "props", Map.of("http_header_COOKIE", "cookie-secret-76", "socket_timeout", "10"));
@@ -141,6 +157,7 @@ class DispatcherTest {
 
         Response response = dispatch(connMgr, 77, "connect",
             "url", "jdbc:clickhouse://127.0.0.1:8123/testdb?password=secret-77&ssl=true",
+            "driver-class", DRIVER_CLASS,
             "user", "test",
             "password", "test",
             "props", Map.of("http_header_COOKIE", "abc123", "socket_timeout", "10"),
@@ -174,6 +191,7 @@ class DispatcherTest {
 
         Response response = dispatch(connMgr, 62, "connect",
             "url", url,
+            "driver-class", DRIVER_CLASS,
             "user", "sa",
             "password", "password-param-62",
             "props", Map.of("http_header_COOKIE", "cookie-secret-62", "socket_timeout", "10"));
@@ -215,6 +233,7 @@ class DispatcherTest {
 
         Response response = dispatch(connMgr, 70, "connect",
             "url", "jdbc:postgresql://localhost:5432/testdb?password=secret-70&sslmode=require",
+            "driver-class", DRIVER_CLASS,
             "user", "testuser",
             "password", "test",
             "props", Map.of());
@@ -249,6 +268,7 @@ class DispatcherTest {
 
         Response response = dispatch(connMgr, 71, "connect",
             "url", url,
+            "driver-class", DRIVER_CLASS,
             "user", "admin",
             "password", "admin-pass-71",
             "props", Map.of());
@@ -273,6 +293,7 @@ class DispatcherTest {
 
         Response response = dispatch(connMgr, 72, "connect",
             "url", "jdbc:clickhouse://127.0.0.1:8123/db",
+            "driver-class", DRIVER_CLASS,
             "user", "user",
             "password", "pw-72-longenough",
             "props", Map.of("http_header_COOKIE", "session-cookie-72",
@@ -298,6 +319,7 @@ class DispatcherTest {
 
         Response response = dispatch(connMgr, 73, "connect",
             "url", "jdbc:postgresql://localhost/tokenizer_db",
+            "driver-class", DRIVER_CLASS,
             "user", "app",
             "password", "real-secret-73-pwd",
             "props", Map.of());
@@ -322,6 +344,7 @@ class DispatcherTest {
 
         Response response = dispatch(connMgr, 74, "connect",
             "url", "jdbc:postgresql://warehouse01-db.local/app",
+            "driver-class", DRIVER_CLASS,
             "user", "app",
             "password", "warehouse01",
             "props", Map.of());
@@ -343,6 +366,7 @@ class DispatcherTest {
 
         Response response = dispatch(connMgr, 75, "connect",
             "url", "jdbc:clickhouse://127.0.0.1:8123/db",
+            "driver-class", DRIVER_CLASS,
             "user", "user",
             "password", "pw-75-longenough",
             "props", Map.of("http_header_COOKIE", "abc123",
@@ -1624,6 +1648,7 @@ class DispatcherTest {
     private static final class RecordingConnectionManager extends ConnectionManager {
         private int returnedConnId = 42;
         private String url;
+        private String driverClass;
         private String user;
         private String password;
         private Map<String, String> props;
@@ -1637,8 +1662,9 @@ class DispatcherTest {
         @Override
         public int connect(String url, String user, String password, Map<String, String> props,
                            Integer connectTimeoutSeconds, Integer networkTimeoutSeconds,
-                           boolean autoCommit) throws SQLException {
+                           boolean autoCommit, String driverClass) throws SQLException {
             this.url = url;
+            this.driverClass = driverClass;
             this.user = user;
             this.password = password;
             this.props = props;

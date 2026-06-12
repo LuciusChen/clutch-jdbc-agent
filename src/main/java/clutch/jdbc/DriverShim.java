@@ -21,6 +21,10 @@ public class DriverShim implements Driver {
         this.delegate = delegate;
     }
 
+    String delegateClassName() {
+        return delegate.getClass().getName();
+    }
+
     @Override public Connection connect(String url, Properties info) throws SQLException {
         return delegate.connect(url, info);
     }

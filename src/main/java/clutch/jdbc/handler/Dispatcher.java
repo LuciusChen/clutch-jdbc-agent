@@ -186,6 +186,7 @@ public class Dispatcher {
     @SuppressWarnings("unchecked")
     private Response connect(Request req) throws SQLException {
         String url = (String) req.params.get("url");
+        String driverClass = (String) req.params.get("driver-class");
         String user = (String) req.params.get("user");
         String password = (String) req.params.get("password");
         Map<String, String> props =
@@ -198,9 +199,12 @@ public class Dispatcher {
         if (url == null) {
             return errorResponse(req, "connect: 'url' is required", "protocol");
         }
+        if (driverClass == null || driverClass.isBlank()) {
+            return errorResponse(req, "connect: 'driver-class' is required", "protocol");
+        }
 
         int connId = connMgr.connect(url, user, password, props,
-            connectTimeoutSeconds, networkTimeoutSeconds, autoCommit);
+            connectTimeoutSeconds, networkTimeoutSeconds, autoCommit, driverClass);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
