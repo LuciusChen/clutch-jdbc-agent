@@ -1,9 +1,11 @@
 package clutch.jdbc;
 
 import java.sql.Connection;
+import java.sql.Driver;
 import java.sql.DriverManager;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLException;
+import java.util.Enumeration;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
@@ -38,17 +40,17 @@ public class ConnectionManager {
      */
     public int connect(String url, String user, String password, Map<String, String> props,
                        Integer connectTimeoutSeconds, Integer networkTimeoutSeconds,
-                       boolean autoCommit)
+                       boolean autoCommit, String driverClass)
             throws SQLException {
         Properties p = new Properties();
         if (props != null) p.putAll(props);
         if (user != null)     p.setProperty("user",     user);
         if (password != null) p.setProperty("password", password);
 
-        Connection primary = openConnection(url, p, connectTimeoutSeconds);
+        Connection primary = openConnection(url, p, connectTimeoutSeconds, driverClass);
         try {
             configurePrimaryConnection(primary, autoCommit, networkTimeoutSeconds);
-            Connection metadata = openConnection(url, p, connectTimeoutSeconds);
+            Connection metadata = openConnection(url, p, connectTimeoutSeconds, driverClass);
             try {
                 configureMetadataConnection(metadata, networkTimeoutSeconds);
                 int id = nextId.getAndIncrement();
@@ -108,20 +110,48 @@ public class ConnectionManager {
             "Driver does not support optional JDBC capability: " + capability, error);
     }
 
-    private Connection openConnection(String url, Properties props, Integer connectTimeoutSeconds)
+    private Connection openConnection(String url, Properties props, Integer connectTimeoutSeconds,
+                                      String driverClass)
             throws SQLException {
         if (connectTimeoutSeconds == null || connectTimeoutSeconds <= 0) {
-            return DriverManager.getConnection(url, props);
+            return connectWithSelectedDriver(url, props, driverClass);
         }
         synchronized (DriverManager.class) {
             int previousTimeout = DriverManager.getLoginTimeout();
             DriverManager.setLoginTimeout(connectTimeoutSeconds);
             try {
-                return DriverManager.getConnection(url, props);
+                return connectWithSelectedDriver(url, props, driverClass);
             } finally {
                 DriverManager.setLoginTimeout(previousTimeout);
             }
         }
+    }
+
+    private Connection connectWithSelectedDriver(String url, Properties props, String driverClass)
+            throws SQLException {
+        if (driverClass == null || driverClass.isBlank()) {
+            throw new SQLException("JDBC driver class is required");
+        }
+
+        Enumeration<Driver> drivers = DriverManager.getDrivers();
+        while (drivers.hasMoreElements()) {
+            Driver driver = drivers.nextElement();
+            if (driverClass.equals(driverClassName(driver))) {
+                Connection connection = driver.connect(url, props);
+                if (connection != null) {
+                    return connection;
+                }
+                throw new SQLException("JDBC driver " + driverClass + " does not accept URL: " + url);
+            }
+        }
+        throw new SQLException("JDBC driver class not registered: " + driverClass);
+    }
+
+    private String driverClassName(Driver driver) {
+        if (driver instanceof DriverShim shim) {
+            return shim.delegateClassName();
+        }
+        return driver.getClass().getName();
     }
 
     /** Return the live primary Connection for {@code connId}, or throw if unknown. */
