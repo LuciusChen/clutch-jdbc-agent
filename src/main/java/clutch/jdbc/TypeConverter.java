@@ -1,23 +1,35 @@
 package clutch.jdbc;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.io.IOException;
 import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.Charset;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.sql.*;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Converts a single JDBC column value to a JSON-safe Java object.
  *
  * Design principle: stability over perfect typing.
  * Emacs receives a predictable set of Java types that Jackson can serialize:
- *   null, Boolean, Integer, Long, Double, String.
+ *   null, Boolean, Integer, Long, Double, String, Map.
  *
  * Problematic types are converted to String to avoid surprises.
  */
 public class TypeConverter {
 
-    private static final System.Logger LOG = System.getLogger(TypeConverter.class.getName());
+    private static final ObjectMapper JSON_VALIDATOR = new ObjectMapper();
+    private static final List<Charset> BLOB_TEXT_CHARSETS =
+        List.of(StandardCharsets.UTF_8, Charset.forName("GB18030"));
     private static final DateTimeFormatter TIMESTAMP_FORMATTER =
         DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter TIME_FORMATTER =
@@ -25,25 +37,53 @@ public class TypeConverter {
 
     /**
      * Convert a small BLOB's raw bytes to a map preserving the blob origin.
-     * If the bytes are valid UTF-8 and look like JSON, includes the text content.
-     * Otherwise returns a plain blob placeholder.
+     * If the bytes decode as supported text and look like JSON/XML, includes
+     * the text content and detected encoding.  Otherwise returns a placeholder.
      */
-    static java.util.Map<String, Object> blobBytesToMap(byte[] bytes, long length) {
-        try {
-            java.nio.charset.CharsetDecoder decoder =
-                java.nio.charset.StandardCharsets.UTF_8.newDecoder()
-                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
-            String text = decoder.decode(java.nio.ByteBuffer.wrap(bytes)).toString().strip();
-            if (!text.isEmpty() && (text.charAt(0) == '{' || text.charAt(0) == '[')) {
-                return java.util.Map.of("__type", "blob", "length", length,
-                                        "text", text);
+    static Map<String, Object> blobBytesToMap(byte[] bytes, long length) {
+        for (Charset charset : BLOB_TEXT_CHARSETS) {
+            String text = decodeBlobText(bytes, charset);
+            if (text != null && structuredBlobText(text)) {
+                return Map.of("__type", "blob",
+                              "length", length,
+                              "text", text,
+                              "encoding", charset.name());
             }
-        } catch (java.nio.charset.CharacterCodingException e) {
-            LOG.log(System.Logger.Level.DEBUG,
-                "BLOB preview is not valid UTF-8; returning plain blob placeholder", e);
         }
-        return java.util.Map.of("__type", "blob", "length", length);
+        return Map.of("__type", "blob", "length", length);
+    }
+
+    private static String decodeBlobText(byte[] bytes, Charset charset) {
+        try {
+            return charset.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes))
+                .toString()
+                .strip();
+        } catch (CharacterCodingException e) {
+            return null;
+        }
+    }
+
+    private static boolean structuredBlobText(String text) {
+        if (text.isEmpty()) return false;
+        return looksLikeJson(text) || looksLikeXml(text);
+    }
+
+    private static boolean looksLikeJson(String text) {
+        char first = text.charAt(0);
+        if (first != '{' && first != '[') return false;
+        try {
+            JSON_VALIDATOR.readTree(text);
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private static boolean looksLikeXml(String text) {
+        return text.charAt(0) == '<' && text.indexOf('>') > 1;
     }
 
     /**

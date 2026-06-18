@@ -123,14 +123,11 @@ public class Dispatcher {
             diagnostics.requestDebugPayload(req, throwable, connId));
     }
 
-    private boolean isMetadataOperation(String op) {
-        return MetadataOps.supports(op);
-    }
-
     private boolean requestUsesDirectConnectionId(String op) {
         return switch (op) {
-            case "disconnect", "commit", "rollback", "set-auto-commit", "execute" -> true;
-            default -> isMetadataOperation(op);
+            case "disconnect", "commit", "rollback", "set-auto-commit",
+                 "set-current-schema", "execute" -> true;
+            default -> false;
         };
     }
 

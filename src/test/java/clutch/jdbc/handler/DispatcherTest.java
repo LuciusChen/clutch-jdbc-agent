@@ -455,6 +455,34 @@ class DispatcherTest {
     }
 
     @Test
+    void metadataRequestsDoNotBlockForegroundExecute() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        RecordingStatementHandler stmt = new RecordingStatementHandler();
+        connMgr.connection = proxyConnection(stmt);
+        CountDownLatch metadataStarted = new CountDownLatch(1);
+        CountDownLatch releaseMetadata = new CountDownLatch(1);
+        connMgr.metadataConnection = blockingMetadataConnectionWithSchemas(
+            List.of("APP"), metadataStarted, releaseMetadata);
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<Response> metadataFuture = executor.submit(
+            () -> dispatcher.dispatch(request(78, "get-schemas", "conn-id", 7)));
+        try {
+            assertTrue(metadataStarted.await(1, TimeUnit.SECONDS));
+            Response executeResponse = dispatcher.dispatch(request(
+                79, "execute", "conn-id", 7, "sql", "DELETE FROM t WHERE 1=0"));
+
+            assertTrue(executeResponse.ok);
+            assertEquals("DELETE FROM t WHERE 1=0", stmt.executedSql);
+            releaseMetadata.countDown();
+            assertTrue(metadataFuture.get(1, TimeUnit.SECONDS).ok);
+        } finally {
+            releaseMetadata.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
     void setCurrentSchemaUpdatesPrimaryAndMetadataConnections() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         List<String> primarySql = new ArrayList<>();
@@ -1541,6 +1569,34 @@ class DispatcherTest {
                 case "getSchemas" -> resultSet(List.of("TABLE_SCHEM"), schemas.stream()
                     .map(schema -> List.<Object>of(schema))
                     .toList());
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        return (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
+    private static Connection blockingMetadataConnectionWithSchemas(
+            List<String> schemas, CountDownLatch started, CountDownLatch release) {
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getSchemas" -> {
+                    started.countDown();
+                    assertTrue(release.await(2, TimeUnit.SECONDS));
+                    yield resultSet(List.of("TABLE_SCHEM"), schemas.stream()
+                        .map(schema -> List.<Object>of(schema))
+                        .toList());
+                }
                 case "unwrap" -> null;
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
