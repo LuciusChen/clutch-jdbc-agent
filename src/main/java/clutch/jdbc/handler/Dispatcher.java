@@ -4,12 +4,16 @@ import clutch.jdbc.ConnectionManager;
 import clutch.jdbc.CursorManager;
 import clutch.jdbc.model.Request;
 import clutch.jdbc.model.Response;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLTimeoutException;
 import java.sql.Statement;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -37,6 +41,7 @@ public class Dispatcher {
     static final int MAX_CONCURRENT_JDBC_TASKS = 16;
     private static final String EXECUTOR_OVERLOADED_ERROR =
         "Agent overloaded: too many concurrent JDBC operations";
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private final ConnectionManager connMgr;
     private final CursorManager cursorMgr;
@@ -126,7 +131,7 @@ public class Dispatcher {
     private boolean requestUsesDirectConnectionId(String op) {
         return switch (op) {
             case "disconnect", "commit", "rollback", "set-auto-commit",
-                 "set-current-schema", "execute" -> true;
+                 "set-current-schema", "execute", "execute-params" -> true;
             default -> false;
         };
     }
@@ -151,7 +156,7 @@ public class Dispatcher {
 
     private Response dispatchUnlocked(Request req) throws Exception {
         if (MetadataOps.supports(req.op)) {
-            return metadataOps.dispatch(req);
+            return dispatchMetadata(req);
         }
         return switch (req.op) {
             case "ping" -> ping(req);
@@ -162,10 +167,24 @@ public class Dispatcher {
             case "set-auto-commit" -> setAutoCommit(req);
             case "cancel" -> cancel(req);
             case "execute" -> execute(req);
+            case "execute-params" -> executeParams(req);
             case "fetch" -> fetch(req);
             case "close-cursor" -> closeCursor(req);
             default -> errorResponse(req, "Unknown op: " + req.op, "protocol");
         };
+    }
+
+    private Response dispatchMetadata(Request req) throws Exception {
+        try {
+            return metadataOps.dispatch(req);
+        } catch (SQLException error) {
+            Integer connId = requestConnectionId(req);
+            if (connId != null && connMgr.reconnectMetadataIfInvalid(connId, error)) {
+                metadataOps.restoreCurrentSchema(connId);
+                return metadataOps.dispatch(req);
+            }
+            throw error;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -190,8 +209,7 @@ public class Dispatcher {
             (Map<String, String>) req.params.getOrDefault("props", Map.of());
         Integer connectTimeoutSeconds = getOptionalInt(req, "connect-timeout-seconds");
         Integer networkTimeoutSeconds = getOptionalInt(req, "network-timeout-seconds");
-        Object autoCommitValue = req.params.get("auto-commit");
-        boolean autoCommit = autoCommitValue == null || Boolean.TRUE.equals(autoCommitValue);
+        boolean autoCommit = getBoolean(req, "auto-commit", true);
 
         if (url == null) {
             return errorResponse(req, "connect: 'url' is required", "protocol");
@@ -228,8 +246,7 @@ public class Dispatcher {
 
     private Response setAutoCommit(Request req) throws SQLException {
         int connId = getInt(req, "conn-id");
-        Object autoCommitValue = req.params.get("auto-commit");
-        boolean autoCommit = autoCommitValue == null || Boolean.TRUE.equals(autoCommitValue);
+        boolean autoCommit = getBoolean(req, "auto-commit", true);
         primaryConnection(connId).setAutoCommit(autoCommit);
         return Response.ok(req.id, Map.of("conn-id", connId, "auto-commit", autoCommit));
     }
@@ -258,7 +275,7 @@ public class Dispatcher {
 
     private Response execute(Request req) throws Exception {
         int connId = getInt(req, "conn-id");
-        String sql = getString(req, "sql").stripTrailing().replaceAll(";+$", "");
+        String sql = normalizedSql(req);
         int fetchSize = (int) req.params.getOrDefault("fetch-size", DEFAULT_FETCH_SIZE);
         Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
         int executeTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
@@ -271,14 +288,47 @@ public class Dispatcher {
                 "connection-lost", null, connId);
         }
         Statement stmt = conn.createStatement();
-        stmt.setQueryTimeout(executeTimeout);
-        RunningStatement running = beginRunningStatement(connId, req.id, stmt);
+        return executeStatement(
+            req, connId, stmt, () -> stmt.execute(sql), fetchSize, executeTimeout);
+    }
+
+    private Response executeParams(Request req) throws Exception {
+        int connId = getInt(req, "conn-id");
+        String sql = normalizedSql(req);
+        int fetchSize = (int) req.params.getOrDefault("fetch-size", DEFAULT_FETCH_SIZE);
+        Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
+        int executeTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
+            ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
+        Connection conn = primaryConnection(connId);
+        if (!conn.isValid(3)) {
+            return errorResponse(req,
+                "Connection lost: the server closed the connection (idle timeout). Please reconnect.",
+                "connection-lost", null, connId);
+        }
+        PreparedStatement stmt = conn.prepareStatement(sql);
         try {
+            bindValues(req, stmt);
+        } catch (Exception error) {
+            closeStatementQuietly(stmt);
+            throw error;
+        }
+        return executeStatement(
+            req, connId, stmt, stmt::execute, fetchSize, executeTimeout);
+    }
+
+    private Response executeStatement(Request req, int connId, Statement stmt,
+                                      Callable<Boolean> executeAction, int fetchSize,
+                                      int executeTimeout) throws Exception {
+        RunningStatement running = null;
+        Integer cursorId = null;
+        boolean cursorResponseReady = false;
+        try {
+            stmt.setQueryTimeout(executeTimeout);
+            running = beginRunningStatement(connId, req.id, stmt);
             Future<Boolean> future;
             try {
-                future = executePool.submit(() -> stmt.execute(sql));
+                future = executePool.submit(executeAction);
             } catch (RejectedExecutionException e) {
-                closeStatementQuietly(stmt);
                 return errorResponse(req, EXECUTOR_OVERLOADED_ERROR, "internal", e, connId);
             }
             boolean isQuery;
@@ -287,11 +337,9 @@ public class Dispatcher {
             } catch (TimeoutException e) {
                 future.cancel(true);
                 cancelStatementQuietly(stmt);
-                closeStatementQuietly(stmt);
                 return errorResponse(req, "Query timed out after " + executeTimeout + "s",
                     "timeout", e, connId);
             } catch (ExecutionException e) {
-                closeStatementQuietly(stmt);
                 Throwable cause = e.getCause();
                 if (running.cancelRequested() && cause instanceof SQLException sqlException) {
                     return errorResponse(req, sqlException.getMessage(), "cancel", sqlException, connId);
@@ -301,35 +349,62 @@ public class Dispatcher {
 
             if (!isQuery) {
                 int affected = stmt.getUpdateCount();
-                stmt.close();
                 return Response.ok(req.id, Map.of("type", "dml", "affected-rows", affected));
             }
 
+            ResultSet rs = stmt.getResultSet();
+            rs.setFetchSize(fetchSize);
+            cursorId = cursorMgr.register(connId, stmt, rs);
+            CursorManager.FetchResult first;
             try {
-                ResultSet rs = stmt.getResultSet();
-                rs.setFetchSize(fetchSize);
-                int cursorId = cursorMgr.register(connId, stmt, rs);
-                CursorManager.FetchResult first;
-                try {
-                    first = fetchCursorBatch(cursorId, fetchSize, stmt, executeTimeout);
-                } catch (SQLException e) {
-                    return errorResponse(req, e.getMessage(),
-                        fetchFailureCategory(running, e), e, connId);
-                }
-                Map<String, Object> result = new java.util.LinkedHashMap<>();
-                result.put("type", "query");
-                result.put("cursor-id", first.done() ? null : cursorId);
-                result.put("columns", first.columns());
-                result.put("col-types", first.types());
-                result.put("rows", first.rows());
-                result.put("done", first.done());
-                return Response.ok(req.id, result);
-            } catch (Exception e) {
-                closeStatementQuietly(stmt);
-                throw e;
+                first = fetchCursorBatch(cursorId, fetchSize, stmt, executeTimeout);
+            } catch (SQLException e) {
+                return errorResponse(req, e.getMessage(),
+                    fetchFailureCategory(running, e), e, connId);
             }
+            Map<String, Object> result = new java.util.LinkedHashMap<>();
+            result.put("type", "query");
+            result.put("cursor-id", first.done() ? null : cursorId);
+            result.put("columns", first.columns());
+            result.put("col-types", first.types());
+            result.put("rows", first.rows());
+            result.put("done", first.done());
+            cursorResponseReady = true;
+            return Response.ok(req.id, result);
         } finally {
-            finishRunningStatement(connId, running);
+            if (running != null) {
+                finishRunningStatement(connId, running);
+            }
+            if (cursorId == null) {
+                closeStatementQuietly(stmt);
+            } else if (!cursorResponseReady) {
+                cursorMgr.close(cursorId);
+            }
+        }
+    }
+
+    private String normalizedSql(Request req) {
+        return getString(req, "sql").stripTrailing().replaceAll(";+$", "");
+    }
+
+    private void bindValues(Request req, PreparedStatement stmt) throws SQLException {
+        Object rawValues = req.params.get("values");
+        if (!(rawValues instanceof List<?> values)) {
+            throw new IllegalArgumentException("execute-params: 'values' must be an array");
+        }
+        for (int i = 0; i < values.size(); i++) {
+            stmt.setObject(i + 1, jdbcValue(values.get(i)));
+        }
+    }
+
+    private Object jdbcValue(Object value) throws SQLException {
+        if (!(value instanceof Map<?, ?>) && !(value instanceof List<?>)) {
+            return value;
+        }
+        try {
+            return JSON.writeValueAsString(value);
+        } catch (JsonProcessingException error) {
+            throw new SQLException("Cannot serialize structured JDBC parameter", error);
         }
     }
 
@@ -491,6 +566,17 @@ public class Dispatcher {
             return number.intValue();
         }
         throw new IllegalArgumentException("Non-integer param: " + key);
+    }
+
+    private boolean getBoolean(Request req, String key, boolean defaultValue) {
+        Object value = req.params.get(key);
+        if (value == null) {
+            return defaultValue;
+        }
+        if (value instanceof Boolean bool) {
+            return bool;
+        }
+        throw new IllegalArgumentException("Non-boolean param: " + key);
     }
 
     private void cancelStatementQuietly(Statement stmt) {

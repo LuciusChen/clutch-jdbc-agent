@@ -4,6 +4,7 @@ import java.sql.Connection;
 import java.sql.Driver;
 import java.sql.DriverManager;
 import java.sql.SQLFeatureNotSupportedException;
+import java.sql.SQLRecoverableException;
 import java.sql.SQLException;
 import java.util.Enumeration;
 import java.util.Map;
@@ -54,7 +55,9 @@ public class ConnectionManager {
             try {
                 configureMetadataConnection(metadata, networkTimeoutSeconds);
                 int id = nextId.getAndIncrement();
-                connections.put(id, new Session(primary, metadata));
+                connections.put(id, new Session(
+                    primary, metadata, url, p, connectTimeoutSeconds,
+                    networkTimeoutSeconds, driverClass));
                 return id;
             } catch (SQLException | RuntimeException e) {
                 closeQuietly(metadata);
@@ -170,6 +173,69 @@ public class ConnectionManager {
         return session.metadata();
     }
 
+    /** Reopen only the metadata connection when FAILURE indicates it is dead. */
+    public boolean reconnectMetadataIfInvalid(int connId, SQLException failure)
+            throws SQLException {
+        Session session = connections.get(connId);
+        if (session == null) {
+            return false;
+        }
+        synchronized (session) {
+            Connection metadata = session.metadata();
+            if (metadataUsable(metadata, failure)) {
+                return false;
+            }
+            Connection replacement = openConnection(
+                session.url, session.props, session.connectTimeoutSeconds,
+                session.driverClass);
+            try {
+                configureMetadataConnection(replacement, session.networkTimeoutSeconds);
+                session.setMetadata(replacement);
+            } catch (SQLException | RuntimeException e) {
+                closeQuietly(replacement);
+                throw e;
+            }
+            closeQuietly(metadata);
+            return true;
+        }
+    }
+
+    /** Reopen only the metadata connection when its JDBC liveness check fails. */
+    public boolean reconnectMetadataIfInvalid(int connId) throws SQLException {
+        return reconnectMetadataIfInvalid(connId, null);
+    }
+
+    /** Remember the logical session schema so metadata recovery can restore it. */
+    public void rememberCurrentSchema(int connId, String schema) throws SQLException {
+        Session session = connections.get(connId);
+        if (session == null) {
+            throw new SQLException("Unknown connection id: " + connId);
+        }
+        session.currentSchema = schema;
+    }
+
+    /** Return the logical session schema last set by the client, or null. */
+    public String currentSchema(int connId) throws SQLException {
+        Session session = connections.get(connId);
+        if (session == null) {
+            throw new SQLException("Unknown connection id: " + connId);
+        }
+        return session.currentSchema;
+    }
+
+    private boolean metadataUsable(Connection connection, SQLException failure) {
+        if (failure instanceof SQLRecoverableException
+            || failure != null && failure.getSQLState() != null
+                && failure.getSQLState().startsWith("08")) {
+            return false;
+        }
+        try {
+            return connection != null && !connection.isClosed() && connection.isValid(1);
+        } catch (SQLException | AbstractMethodError e) {
+            return false;
+        }
+    }
+
     /** Close and remove the connection for {@code connId}. No-op if already closed. */
     public void disconnect(int connId) throws SQLException {
         Session session = connections.remove(connId);
@@ -203,5 +269,39 @@ public class ConnectionManager {
         }
     }
 
-    private record Session(Connection primary, Connection metadata) {}
+    private static final class Session {
+        private final Connection primary;
+        private volatile Connection metadata;
+        private final String url;
+        private final Properties props;
+        private final Integer connectTimeoutSeconds;
+        private final Integer networkTimeoutSeconds;
+        private final String driverClass;
+        private volatile String currentSchema;
+
+        private Session(Connection primary, Connection metadata, String url,
+                        Properties props, Integer connectTimeoutSeconds,
+                        Integer networkTimeoutSeconds, String driverClass) {
+            this.primary = primary;
+            this.metadata = metadata;
+            this.url = url;
+            this.props = new Properties();
+            this.props.putAll(props);
+            this.connectTimeoutSeconds = connectTimeoutSeconds;
+            this.networkTimeoutSeconds = networkTimeoutSeconds;
+            this.driverClass = driverClass;
+        }
+
+        private Connection primary() {
+            return primary;
+        }
+
+        private Connection metadata() {
+            return metadata;
+        }
+
+        private void setMetadata(Connection metadata) {
+            this.metadata = metadata;
+        }
+    }
 }

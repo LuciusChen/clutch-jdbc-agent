@@ -436,6 +436,21 @@ class DispatcherTest {
     }
 
     @Test
+    void setAutoCommitRejectsNonBooleanValues() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        boolean[] called = {false};
+        connMgr.connection = connectionWithBooleanCall(
+            "setAutoCommit", _value -> called[0] = true);
+        Response response = dispatch(connMgr, 82, "set-auto-commit",
+            "conn-id", 7,
+            "auto-commit", "clutch-jdbc-json-false");
+
+        assertFalse(response.ok);
+        assertTrue(response.error.contains("auto-commit"));
+        assertFalse(called[0]);
+    }
+
+    @Test
     void getSchemasUsesMetadataConnection() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         connMgr.connection = (Connection) Proxy.newProxyInstance(
@@ -451,6 +466,28 @@ class DispatcherTest {
         Response response = dispatch(connMgr, 11, "get-schemas", "conn-id", 7);
 
         assertTrue(response.ok);
+        assertEquals(List.of("APP", "REPORTING"), resultMap(response).get("schemas"));
+    }
+
+    @Test
+    void metadataRequestRetriesOnceAfterConnectionRecovery() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.metadataConnection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> {
+                if (method.getName().equals("getMetaData")) {
+                    throw new SQLException("metadata connection closed", "08006");
+                }
+                throw new UnsupportedOperationException(method.getName());
+            });
+        connMgr.reconnectedMetadataConnection =
+            metadataConnectionWithSchemas(List.of("APP", "REPORTING"));
+
+        Response response = dispatch(connMgr, 84, "get-schemas", "conn-id", 7);
+
+        assertTrue(response.ok);
+        assertEquals(1, connMgr.metadataReconnects);
         assertEquals(List.of("APP", "REPORTING"), resultMap(response).get("schemas"));
     }
 
@@ -497,6 +534,7 @@ class DispatcherTest {
         assertEquals(List.of("ALTER SESSION SET CURRENT_SCHEMA = \"CJH_TEST\""), primarySql);
         assertEquals(List.of("ALTER SESSION SET CURRENT_SCHEMA = \"CJH_TEST\""), metadataSql);
         assertEquals("CJH_TEST", resultMap(response).get("schema"));
+        assertEquals("CJH_TEST", connMgr.currentSchema);
     }
 
     @Test
@@ -545,6 +583,21 @@ class DispatcherTest {
         assertTrue(stmt.closed);
         assertEquals("dml", resultMap(response).get("type"));
         assertEquals(updateCount, ((Number) resultMap(response).get("affected-rows")).intValue());
+    }
+
+    @Test
+    void executeClosesStatementWhenTimeoutConfigurationFails() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        RecordingStatementHandler stmt = new RecordingStatementHandler();
+        stmt.queryTimeoutFailure = new SQLException("timeout configuration failed");
+        connMgr.connection = proxyConnection(stmt);
+
+        Response response = dispatch(connMgr, 85, "execute",
+            "conn-id", 7, "sql", "SELECT 1");
+
+        assertFalse(response.ok);
+        assertEquals("timeout configuration failed", response.error);
+        assertTrue(stmt.closed);
     }
 
     @Test
@@ -1758,7 +1811,10 @@ class DispatcherTest {
         private boolean autoCommit = true;
         private Connection connection;
         private Connection metadataConnection;
+        private Connection reconnectedMetadataConnection;
+        private int metadataReconnects;
         private SQLException connectFailure;
+        private String currentSchema;
 
         @Override
         public int connect(String url, String user, String password, Map<String, String> props,
@@ -1789,10 +1845,35 @@ class DispatcherTest {
             assertEquals(7, connId);
             return metadataConnection != null ? metadataConnection : connection;
         }
+
+        @Override
+        public boolean reconnectMetadataIfInvalid(int connId, SQLException failure) {
+            assertEquals(7, connId);
+            if (reconnectedMetadataConnection == null) {
+                return false;
+            }
+            assertTrue(failure.getSQLState().startsWith("08"));
+            metadataConnection = reconnectedMetadataConnection;
+            metadataReconnects++;
+            return true;
+        }
+
+        @Override
+        public void rememberCurrentSchema(int connId, String schema) {
+            assertEquals(7, connId);
+            currentSchema = schema;
+        }
+
+        @Override
+        public String currentSchema(int connId) {
+            assertEquals(7, connId);
+            return currentSchema;
+        }
     }
 
     private static final class RecordingStatementHandler {
         private int queryTimeoutSeconds;
+        private SQLException queryTimeoutFailure;
         private String executedSql;
         private int updateCount = 3;
         private boolean closed;
@@ -1803,6 +1884,7 @@ class DispatcherTest {
                 new Class<?>[]{Statement.class},
                 (_proxy, method, args) -> switch (method.getName()) {
                     case "setQueryTimeout" -> {
+                        if (queryTimeoutFailure != null) throw queryTimeoutFailure;
                         queryTimeoutSeconds = (Integer) args[0];
                         yield null;
                     }

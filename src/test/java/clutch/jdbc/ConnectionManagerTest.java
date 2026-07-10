@@ -16,6 +16,8 @@ import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -120,6 +122,33 @@ class ConnectionManagerTest {
         assertTrue(error.getMessage().contains("not registered"));
     }
 
+    @Test
+    void reconnectMetadataIfInvalidPreservesPrimarySession() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        driver.invalidMetadataConnectionNumber = 1;
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager();
+            int connId = mgr.connect("jdbc:test:metadata-recovery", "reader", "secret",
+                Map.of("role", "reporting"), 5, 9, false,
+                RecordingDriver.class.getName());
+            Connection primary = mgr.getPrimary(connId);
+            Connection failedMetadata = mgr.getMetadata(connId);
+
+            assertTrue(mgr.reconnectMetadataIfInvalid(connId));
+            assertEquals(3, driver.connectCount);
+            assertNotSame(failedMetadata, mgr.getMetadata(connId));
+            assertSame(primary, mgr.getPrimary(connId));
+            assertEquals("reader", driver.seenProps.getProperty("user"));
+            assertEquals("secret", driver.seenProps.getProperty("password"));
+
+            mgr.disconnect(connId);
+            assertEquals(3, driver.closedCount);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
     private static final class RecordingDriver implements Driver {
         private String seenUrl;
         private int seenLoginTimeout = -1;
@@ -132,13 +161,15 @@ class ConnectionManagerTest {
         private boolean throwOnSetAutoCommit;
         private boolean throwOnSetReadOnly;
         private boolean throwOnSetNetworkTimeout;
+        private int invalidMetadataConnectionNumber = -1;
 
         @Override
         public Connection connect(String url, Properties info) {
             if (!acceptsURL(url)) {
                 return null;
             }
-            boolean metadata = connectCount++ > 0;
+            int connectionNumber = connectCount++;
+            boolean metadata = connectionNumber > 0;
             seenUrl = url;
             seenLoginTimeout = DriverManager.getLoginTimeout();
             seenProps = new Properties();
@@ -173,6 +204,7 @@ class ConnectionManagerTest {
                         yield null;
                     }
                     case "isClosed" -> false;
+                    case "isValid" -> connectionNumber != invalidMetadataConnectionNumber;
                     case "close" -> {
                         closedCount++;
                         yield null;

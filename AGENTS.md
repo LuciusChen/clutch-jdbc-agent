@@ -50,7 +50,7 @@ The agent must NOT contain:
 ```
 clutch.jdbc
   Agent.java             ← main(), process loop, driver loading
-  ConnectionManager.java ← connId → Connection map
+  ConnectionManager.java ← connId → primary/metadata JDBC session
   CursorManager.java     ← cursorId → (Statement, ResultSet), fetch pagination
   DriverLoader.java      ← scan drivers/, URLClassLoader + ServiceLoader
   DriverShim.java        ← wrap external Driver for DriverManager acceptance
@@ -58,6 +58,8 @@ clutch.jdbc
 
 clutch.jdbc.handler
   Dispatcher.java        ← route op strings to handler methods
+  DispatcherDiagnostics.java ← error classification, redaction, debug payloads
+  MetadataOps.java       ← DatabaseMetaData and dialect-specific introspection
 
 clutch.jdbc.model
   Request.java           ← {"id", "op", "params"}
@@ -131,16 +133,21 @@ Only split a class when it has a genuinely distinct responsibility. Do not creat
 
 ## State Management
 
-There are exactly two stateful components:
+Long-lived state has three explicit owners:
 
-- `ConnectionManager`: `ConcurrentHashMap<Integer, Connection>`. Each `connect`
-  call gets an auto-incremented integer id. No pooling. One JDBC `Connection`
-  per clutch connection.
+- `ConnectionManager`: `ConcurrentHashMap<Integer, Session>`. Each `connect`
+  call gets an auto-incremented integer id. No pooling. Each logical clutch
+  connection owns a primary JDBC connection for foreground SQL and a metadata
+  connection for introspection. Metadata recovery may replace only the latter.
 - `CursorManager`: `ConcurrentHashMap<Integer, Cursor>`. Each `execute` that
   returns a `ResultSet` gets a cursor id. The `ResultSet` stays open until
   `fetch` returns `done=true` or `close-cursor` is called explicitly.
+- `Dispatcher`: per-connection locks, currently running statements, and bounded
+  request/execution pools. `cancel` deliberately bypasses the connection lock
+  so it can reach the active statement.
 
-No other global state. No singletons beyond these two managers.
+No connection profiles, metadata caches, or database business state belong in
+the agent.
 
 ## Driver Loading
 

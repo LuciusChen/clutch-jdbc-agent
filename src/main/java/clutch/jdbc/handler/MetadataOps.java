@@ -85,6 +85,13 @@ final class MetadataOps {
         };
     }
 
+    void restoreCurrentSchema(int connId) throws SQLException {
+        String schema = connMgr.currentSchema(connId);
+        if (schema != null) {
+            applyCurrentSchema(metadataConnection(connId), schema);
+        }
+    }
+
     private Response getSchemas(Request req) throws SQLException {
         int connId = getInt(req, "conn-id");
         DatabaseMetaData meta = metadataConnection(connId).getMetaData();
@@ -106,6 +113,7 @@ final class MetadataOps {
         if (metadata != primary) {
             applyCurrentSchema(metadata, schema);
         }
+        connMgr.rememberCurrentSchema(connId, schema);
         return Response.ok(req.id, Map.of("conn-id", connId, "schema", schema));
     }
 
