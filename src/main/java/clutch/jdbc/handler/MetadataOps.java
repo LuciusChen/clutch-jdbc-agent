@@ -201,16 +201,19 @@ final class MetadataOps {
                 if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
                     continue;
                 }
-                List<Object> row = new ArrayList<>(3);
+                String tableSchema = Objects.toString(rs.getString("TABLE_SCHEM"), "");
+                List<Object> row = new ArrayList<>(5);
                 row.add(rs.getString("TABLE_NAME"));
                 row.add(rs.getString("TABLE_TYPE"));
-                row.add(Objects.toString(rs.getString("TABLE_SCHEM"), ""));
+                row.add(tableSchema);
+                row.add(tableSchema);
+                row.add(tableComment(rs));
                 rows.add(row);
             }
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("cursor-id", null);
-        result.put("columns", List.of("name", "type", "schema"));
+        result.put("columns", List.of("name", "type", "schema", "source_schema", "comment"));
         result.put("rows", rows);
         result.put("done", true);
         return Response.ok(reqId, result);
@@ -252,11 +255,13 @@ final class MetadataOps {
                 if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
                     continue;
                 }
-                tables.add(Map.of(
+                String tableSchema = Objects.toString(rs.getString("TABLE_SCHEM"), "");
+                tables.add(entryMap(
                     "name", rs.getString("TABLE_NAME"),
                     "type", rs.getString("TABLE_TYPE"),
-                    "schema", Objects.toString(rs.getString("TABLE_SCHEM"), ""),
-                    "source-schema", Objects.toString(rs.getString("TABLE_SCHEM"), "")
+                    "schema", tableSchema,
+                    "source-schema", tableSchema,
+                    "comment", tableComment(rs)
                 ));
             }
         }
@@ -847,6 +852,11 @@ final class MetadataOps {
             actualCatalog = Objects.toString(rs.getString(fallbackColumnLabel), "");
         }
         return actualCatalog.equalsIgnoreCase(requestedCatalog);
+    }
+
+    private String tableComment(ResultSet rs) throws SQLException {
+        String comment = rs.getString("REMARKS");
+        return comment == null || comment.isBlank() ? null : comment;
     }
 
     private List<Map<String, Object>> getOracleIndexes(Connection conn, String schema, String table)

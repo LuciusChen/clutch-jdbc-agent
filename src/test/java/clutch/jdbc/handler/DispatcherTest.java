@@ -1123,7 +1123,32 @@ class DispatcherTest {
         assertEquals(null, jdbc.lastSchema);
         List<List<Object>> rows = resultList(response, "rows");
         assertEquals(1, rows.size());
-        assertEquals(List.of("clutch_live_smoke", "TABLE", "default"), rows.get(0));
+        assertEquals(java.util.Arrays.asList("clutch_live_smoke", "TABLE", "default", "default", null),
+            rows.get(0));
+        assertEquals(List.of("name", "type", "schema", "source_schema", "comment"),
+            resultList(response, "columns"));
+    }
+
+    @Test
+    void getTablesForGenericMetadataIncludesRemarksAsComment() throws Exception {
+        JdbcMetadataRecorder jdbc = new JdbcMetadataRecorder();
+        jdbc.tableRows = List.of(
+            jdbc.tableRow("orders", "TABLE", "app", "", "订单"),
+            jdbc.tableRow("audit_log", "TABLE", "app", "", "   ")
+        );
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = jdbc.connection("Generic SQL");
+
+        Response response = dispatch(connMgr, 36, "get-tables",
+            "conn-id", 7,
+            "schema", "app");
+
+        assertTrue(response.ok);
+        List<List<Object>> rows = resultList(response, "rows");
+        assertEquals(2, rows.size());
+        assertEquals(List.of("orders", "TABLE", "app", "app", "订单"), rows.get(0));
+        assertEquals(java.util.Arrays.asList("audit_log", "TABLE", "app", "app", null),
+            rows.get(1));
     }
 
     @Test
@@ -1150,6 +1175,26 @@ class DispatcherTest {
         assertEquals(1, tables.size());
         assertEquals("clutch_live_smoke", tables.get(0).get("name"));
         assertEquals("default", tables.get(0).get("schema"));
+    }
+
+    @Test
+    void searchTablesForGenericMetadataIncludesRemarksAsComment() throws Exception {
+        JdbcMetadataRecorder jdbc = new JdbcMetadataRecorder();
+        jdbc.tableRows = List.of(
+            jdbc.tableRow("orders", "TABLE", "app", "", "订单")
+        );
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = jdbc.connection("Generic SQL");
+
+        Response response = dispatch(connMgr, 37, "search-tables",
+            "conn-id", 7,
+            "schema", "app",
+            "prefix", "ord");
+
+        assertTrue(response.ok);
+        List<Map<String, Object>> tables = resultList(response, "tables");
+        assertEquals(1, tables.size());
+        assertEquals("订单", tables.get(0).get("comment"));
     }
 
     @Test
@@ -1977,7 +2022,7 @@ class DispatcherTest {
                         lastSchema = (String) args[1];
                         lastPattern = (String) args[2];
                         yield metadataResultSet(
-                            List.of("TABLE_NAME", "TABLE_TYPE", "TABLE_SCHEM", "TABLE_CAT"),
+                            List.of("TABLE_NAME", "TABLE_TYPE", "TABLE_SCHEM", "TABLE_CAT", "REMARKS"),
                             tableRows
                         );
                     }
@@ -2055,11 +2100,17 @@ class DispatcherTest {
         }
 
         private Map<String, Object> tableRow(String name, String type, String schema, String catalog) {
+            return tableRow(name, type, schema, catalog, null);
+        }
+
+        private Map<String, Object> tableRow(String name, String type, String schema,
+                                             String catalog, String remarks) {
             Map<String, Object> row = new HashMap<>();
             row.put("TABLE_NAME", name);
             row.put("TABLE_TYPE", type);
             row.put("TABLE_SCHEM", schema);
             row.put("TABLE_CAT", catalog);
+            row.put("REMARKS", remarks);
             return row;
         }
 
