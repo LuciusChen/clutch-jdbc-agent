@@ -75,6 +75,10 @@ Timeout-related params are explicit:
 - `network-timeout-seconds`: socket/network timeout applied to the JDBC `Connection`
 - `query-timeout-seconds`: statement timeout applied before `execute`
 
+Boolean params are JSON booleans, not strings or numeric sentinels. Staged DML
+uses `execute-params` with a positional JSON `values` array; the agent binds each
+entry through `PreparedStatement` instead of rendering it into SQL text.
+
 ### Response format
 
 ```json
@@ -110,6 +114,7 @@ context and a redacted Java stack trace.
 | `set-current-schema` | Update current schema on primary + metadata sessions |
 | `cancel`          | Cancel the currently running statement for a connection |
 | `execute`         | Execute SQL; returns first batch + `cursor-id`   |
+| `execute-params`  | Execute SQL with positional prepared values      |
 | `fetch`           | Fetch next batch from an open cursor             |
 | `close-cursor`    | Close a cursor explicitly                        |
 | `get-schemas`     | List schemas via `DatabaseMetaData`              |
@@ -153,10 +158,13 @@ clutch-db-jdbc.el (Emacs)
         ▼
 clutch-jdbc-agent (JVM process)
   ├── Agent.java          — main(), stdin loop, driver loading
-  ├── ConnectionManager   — connId → JDBC Connection
+  ├── ConnectionManager   — connId → primary + metadata JDBC session
   ├── CursorManager       — cursorId → (Statement, ResultSet)
   ├── TypeConverter       — JDBC value → JSON-safe Java object
-  └── handler/Dispatcher  — routes op strings to handler methods
+  └── handler/
+      ├── Dispatcher      — request routing and execution lifecycle
+      ├── MetadataOps     — metadata and dialect introspection
+      └── DispatcherDiagnostics — error diagnostics and redaction
         │
         ▼
   drivers/*.jar           — JDBC drivers (loaded at runtime via URLClassLoader)
@@ -164,8 +172,11 @@ clutch-jdbc-agent (JVM process)
 
 The agent no longer runs requests on one global synchronous lane.  The stdin
 loop parses requests and hands them to a small request pool.  The dispatcher
-still serializes most work per JDBC connection, so one `conn-id` sees one
-foreground operation at a time.  `cancel` is the deliberate exception: it can
+still serializes most work per logical connection, while metadata runs on its
+own JDBC session. If that metadata session is closed by an idle timeout, the
+agent replaces only that session, restores the remembered schema, and retries
+the metadata request once; the primary transaction is untouched. `cancel` is
+the deliberate exception to serialization: it can
 arrive while `execute` or `fetch` is running, locate the live `Statement`, and
 call `Statement.cancel()` without tearing down the whole session.
 

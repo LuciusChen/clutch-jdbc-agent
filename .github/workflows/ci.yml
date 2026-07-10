@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Test and package
+        run: mvn --batch-mode --no-transfer-progress verify
+      - name: Protocol smoke test
+        run: |
+          response="$(printf '%s\n' '{"id":1,"op":"ping","params":{}}' | java -jar target/clutch-jdbc-agent-*.jar 2>/dev/null | tail -n 1)"
+          test "$response" = '{"id":1,"ok":true,"result":{"pong":true}}'
