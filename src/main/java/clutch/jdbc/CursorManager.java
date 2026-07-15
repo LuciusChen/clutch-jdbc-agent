@@ -132,6 +132,11 @@ public class CursorManager {
         cursors.entrySet().removeIf(e -> e.getValue().connId() == connId);
     }
 
+    /** Forget one cursor without calling into its possibly blocked JDBC resources. */
+    public void abandon(int cursorId) {
+        cursors.remove(cursorId);
+    }
+
     public record FetchResult(List<String> columns, List<String> types,
                               List<List<Object>> rows, boolean done) {}
 

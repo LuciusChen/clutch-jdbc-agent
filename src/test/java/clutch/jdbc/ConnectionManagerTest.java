@@ -8,10 +8,17 @@ import java.sql.Driver;
 import java.sql.DriverManager;
 import java.sql.DriverPropertyInfo;
 import java.sql.SQLFeatureNotSupportedException;
+import java.sql.SQLRecoverableException;
 import java.sql.SQLException;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -151,6 +158,7 @@ class ConnectionManagerTest {
             assertEquals(4, driver.connectCount);
 
             mgr.disconnect(connId);
+            awaitClosedCount(driver, 4);
             assertEquals(4, driver.closedCount);
         } finally {
             DriverManager.deregisterDriver(driver);
@@ -191,18 +199,65 @@ class ConnectionManagerTest {
             int connId = mgr.connect("jdbc:test:poison", "reader", "secret",
                 Map.of(), null, null, true, RecordingDriver.class.getName());
 
+            assertTrue(mgr.hasConnection(connId));
             mgr.poison(connId);
 
+            assertFalse(mgr.hasConnection(connId));
             SQLException error = assertThrows(SQLException.class, () -> mgr.getPrimary(connId));
             assertTrue(error.getMessage().contains("Unknown connection id"));
-            long deadline = System.nanoTime() + 1_000_000_000L;
-            while (driver.closedCount < 2 && System.nanoTime() < deadline) {
-                Thread.sleep(5);
-            }
+            awaitClosedCount(driver, 2);
             assertEquals(2, driver.closedCount);
             mgr.disconnectAll();
         } finally {
             DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void metadataDetachAndReplacementReturnBeforeBlockedCloseFinishes() throws Exception {
+        for (boolean reconnect : List.of(false, true)) {
+            RecordingDriver driver = new RecordingDriver();
+            driver.blockMetadataClose = true;
+            DriverManager.registerDriver(driver);
+            ConnectionManager mgr = new ConnectionManager();
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try {
+                int connId = mgr.connect("jdbc:test:metadata-detach", "reader", "secret",
+                    Map.of(), null, null, true, RecordingDriver.class.getName());
+                Connection primary = mgr.getPrimary(connId);
+                Connection oldMetadata = mgr.getMetadata(connId);
+
+                Future<Boolean> lifecycle = executor.submit(() -> {
+                    if (reconnect) {
+                        return mgr.reconnectMetadataIfInvalid(connId,
+                            new SQLRecoverableException("metadata transport lost", "08000"));
+                    }
+                    mgr.invalidateMetadata(connId);
+                    return true;
+                });
+
+                assertTrue(driver.metadataCloseStarted.await(1, TimeUnit.SECONDS));
+                assertTrue(lifecycle.get(200, TimeUnit.MILLISECONDS));
+                assertSame(primary, mgr.getPrimary(connId));
+                if (reconnect) {
+                    assertNotSame(oldMetadata, mgr.getMetadata(connId));
+                } else {
+                    assertThrows(SQLException.class, () -> mgr.getMetadata(connId));
+                }
+            } finally {
+                driver.releaseMetadataClose.countDown();
+                executor.shutdownNow();
+                mgr.disconnectAll();
+                DriverManager.deregisterDriver(driver);
+            }
+        }
+    }
+
+    private static void awaitClosedCount(RecordingDriver driver, int expected)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + 1_000_000_000L;
+        while (driver.closedCount < expected && System.nanoTime() < deadline) {
+            Thread.sleep(5);
         }
     }
 
@@ -218,6 +273,9 @@ class ConnectionManagerTest {
         private boolean throwOnSetAutoCommit;
         private boolean throwOnSetReadOnly;
         private boolean throwOnSetNetworkTimeout;
+        private boolean blockMetadataClose;
+        private final CountDownLatch metadataCloseStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseMetadataClose = new CountDownLatch(1);
         private int invalidMetadataConnectionNumber = -1;
 
         @Override
@@ -263,6 +321,16 @@ class ConnectionManagerTest {
                     case "isClosed" -> false;
                     case "isValid" -> connectionNumber != invalidMetadataConnectionNumber;
                     case "close" -> {
+                        if (metadata && blockMetadataClose) {
+                            metadataCloseStarted.countDown();
+                            while (releaseMetadataClose.getCount() > 0) {
+                                try {
+                                    releaseMetadataClose.await();
+                                } catch (InterruptedException ignored) {
+                                    // Simulate a JDBC close that ignores interruption.
+                                }
+                            }
+                        }
                         closedCount++;
                         yield null;
                     }

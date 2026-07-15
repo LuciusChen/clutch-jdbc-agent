@@ -105,6 +105,8 @@ connection id, exception class, SQLState, vendor code, cause chain, and
 redacted request context.  When a hidden/internal query path fails,
 `diag.context.generated-sql` carries the actual SQL text that the agent ran.
 
+`diag.connection-invalidated=true` is also a stable lifecycle signal. It is present when an error response references a local logical connection that the agent no longer owns, including a follow-up request after the original failure response was ignored. The agent derives this from its connection map, not exception text or client-side JDBC error rules. Metadata-session failure alone does not set the marker. Foreground SQL is never replayed automatically because its transaction outcome may be unknown.
+
 When the client sends `params.debug=true`, failures may also include an
 additional optional `debug` payload.  That payload is still redacted and is
 meant for opt-in troubleshooting only; today it carries the redacted request

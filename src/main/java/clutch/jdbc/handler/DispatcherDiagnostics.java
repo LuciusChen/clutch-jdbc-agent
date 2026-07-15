@@ -75,7 +75,7 @@ final class DispatcherDiagnostics {
 
     Map<String, Object> requestDiagnostics(Request req, String category,
                                            Throwable throwable, String rawMessage,
-                                           Integer connId) {
+                                           Integer connId, boolean connectionInvalidated) {
         String raw = (rawMessage != null && !rawMessage.isBlank())
             ? rawMessage
             : throwableMessage(req, throwable);
@@ -92,6 +92,7 @@ final class DispatcherDiagnostics {
             "exception-class", throwable != null ? throwable.getClass().getName() : null,
             "sql-state", sqlState(throwable),
             "vendor-code", vendorCode(throwable),
+            "connection-invalidated", connectionInvalidated ? Boolean.TRUE : null,
             "raw-message", raw,
             "cause-chain", causeChain.isEmpty() ? null : causeChain,
             "context", context.isEmpty() ? null : context);
