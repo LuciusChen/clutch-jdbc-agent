@@ -563,6 +563,60 @@ class DispatcherTest {
     }
 
     @ParameterizedTest
+    @MethodSource("invalidExecuteFetchSizeCases")
+    void executeOperationsRejectInvalidFetchSizeBeforeJdbcAccess(String op, Object fetchSize)
+            throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = request(86, op,
+            "conn-id", 7,
+            "sql", "SELECT 1",
+            "fetch-size", fetchSize);
+        if ("execute-params".equals(op)) {
+            req.params.put("values", List.of());
+        }
+
+        try {
+            Response response = dispatcher.dispatch(req);
+
+            assertFalse(response.ok);
+            assertTrue(response.error.contains("fetch-size"), response.error);
+            assertEquals(0, connMgr.primaryConnectionCalls,
+                "invalid fetch-size must be rejected before JDBC access");
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidFetchSizes")
+    void fetchRejectsInvalidFetchSizeBeforeAdvancingCursor(Object fetchSize) throws Exception {
+        CursorManager cursorMgr = new CursorManager() {
+            @Override
+            public int connectionId(int cursorId) {
+                assertEquals(91, cursorId);
+                return 7;
+            }
+
+            @Override
+            public Statement statement(int cursorId) {
+                throw new AssertionError("invalid fetch-size must not read the statement");
+            }
+        };
+        Dispatcher dispatcher = new Dispatcher(new RecordingConnectionManager(), cursorMgr);
+        try {
+            Response response = dispatcher.dispatch(request(87, "fetch",
+                "cursor-id", 91,
+                "fetch-size", fetchSize));
+
+            assertFalse(response.ok);
+            assertTrue(response.error.contains("fetch-size"), response.error);
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @ParameterizedTest
     @MethodSource("executeDmlCases")
     void executeAppliesQueryTimeoutBeforeRunningStatement(String sql,
                                                           int queryTimeoutSeconds,
@@ -1568,6 +1622,20 @@ class DispatcherTest {
         );
     }
 
+    private static Stream<Arguments> invalidExecuteFetchSizeCases() {
+        return Stream.of("execute", "execute-params")
+            .flatMap(op -> invalidFetchSizeValues()
+                .map(value -> Arguments.of(op, value)));
+    }
+
+    private static Stream<Arguments> invalidFetchSizes() {
+        return invalidFetchSizeValues().map(Arguments::of);
+    }
+
+    private static Stream<Object> invalidFetchSizeValues() {
+        return Stream.<Object>of("500", 1.5d, 0, -1, 10_001, null);
+    }
+
     private static Response dispatch(RecordingConnectionManager connMgr, int id, String op,
                                      Object... params) throws Exception {
         return new Dispatcher(connMgr, new CursorManager()).dispatch(request(id, op, params));
@@ -1815,6 +1883,7 @@ class DispatcherTest {
         private int metadataReconnects;
         private SQLException connectFailure;
         private String currentSchema;
+        private int primaryConnectionCalls;
 
         @Override
         public int connect(String url, String user, String password, Map<String, String> props,
@@ -1837,6 +1906,7 @@ class DispatcherTest {
         @Override
         public Connection getPrimary(int connId) {
             assertEquals(7, connId);
+            primaryConnectionCalls++;
             return connection;
         }
 

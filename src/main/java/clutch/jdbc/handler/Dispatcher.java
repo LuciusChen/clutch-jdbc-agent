@@ -37,6 +37,7 @@ public class Dispatcher {
     private static final System.Logger LOG = System.getLogger(Dispatcher.class.getName());
 
     private static final int DEFAULT_FETCH_SIZE = 500;
+    private static final int MAX_FETCH_SIZE = 10_000;
     static final int DEFAULT_EXECUTE_TIMEOUT = 29; // s; safety net when no client timeout given
     static final int MAX_CONCURRENT_JDBC_TASKS = 16;
     private static final String EXECUTOR_OVERLOADED_ERROR =
@@ -276,7 +277,7 @@ public class Dispatcher {
     private Response execute(Request req) throws Exception {
         int connId = getInt(req, "conn-id");
         String sql = normalizedSql(req);
-        int fetchSize = (int) req.params.getOrDefault("fetch-size", DEFAULT_FETCH_SIZE);
+        int fetchSize = getFetchSize(req);
         Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
         int executeTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
@@ -295,7 +296,7 @@ public class Dispatcher {
     private Response executeParams(Request req) throws Exception {
         int connId = getInt(req, "conn-id");
         String sql = normalizedSql(req);
-        int fetchSize = (int) req.params.getOrDefault("fetch-size", DEFAULT_FETCH_SIZE);
+        int fetchSize = getFetchSize(req);
         Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
         int executeTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
@@ -410,7 +411,7 @@ public class Dispatcher {
 
     private Response fetch(Request req) throws Exception {
         int cursorId = getInt(req, "cursor-id");
-        int fetchSize = (int) req.params.getOrDefault("fetch-size", DEFAULT_FETCH_SIZE);
+        int fetchSize = getFetchSize(req);
         Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
         int fetchTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
@@ -566,6 +567,23 @@ public class Dispatcher {
             return number.intValue();
         }
         throw new IllegalArgumentException("Non-integer param: " + key);
+    }
+
+    private int getFetchSize(Request req) {
+        if (!req.params.containsKey("fetch-size")) {
+            return DEFAULT_FETCH_SIZE;
+        }
+        Object value = req.params.get("fetch-size");
+        if (!(value instanceof Byte || value instanceof Short
+              || value instanceof Integer || value instanceof Long)) {
+            throw new IllegalArgumentException("Non-integer param: fetch-size");
+        }
+        long fetchSize = ((Number) value).longValue();
+        if (fetchSize < 1 || fetchSize > MAX_FETCH_SIZE) {
+            throw new IllegalArgumentException(
+                "fetch-size must be between 1 and " + MAX_FETCH_SIZE);
+        }
+        return (int) fetchSize;
     }
 
     private boolean getBoolean(Request req, String key, boolean defaultValue) {
