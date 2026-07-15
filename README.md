@@ -75,6 +75,10 @@ Timeout-related params are explicit:
 - `network-timeout-seconds`: socket/network timeout applied to the JDBC `Connection`
 - `query-timeout-seconds`: statement timeout applied before `execute`
 
+`execute`, `execute-params`, and `fetch` accept an optional integer
+`fetch-size` from 1 through 10,000. The default is 500. Values outside that
+range are rejected before JDBC work or cursor advancement.
+
 Boolean params are JSON booleans, not strings or numeric sentinels. Staged DML
 uses `execute-params` with a positional JSON `values` array; the agent binds each
 entry through `PreparedStatement` instead of rendering it into SQL text.

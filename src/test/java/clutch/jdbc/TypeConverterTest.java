@@ -257,6 +257,23 @@ class TypeConverterTest {
         assertEquals("getString-result", TypeConverter.convert(rs, 1));
     }
 
+    @Test
+    void convertReturnsStringWithoutCallingGetStringAgain() throws SQLException {
+        ResultSet rs = (ResultSet) Proxy.newProxyInstance(
+            TypeConverterTest.class.getClassLoader(),
+            new Class<?>[]{ResultSet.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getObject" -> "text-value";
+                case "wasNull" -> false;
+                case "getString" -> throw new AssertionError("string value was read twice");
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        assertEquals("text-value", TypeConverter.convert(rs, 1));
+    }
+
     private static ResultSet resultSetReturning(Object value) {
         return (ResultSet) Proxy.newProxyInstance(
             TypeConverterTest.class.getClassLoader(),

@@ -95,6 +95,7 @@ public class TypeConverter {
         if (rs.wasNull() || val == null) return null;
 
         if (val instanceof Boolean) return val;
+        if (val instanceof String) return val;
         if (val instanceof Integer) return val;
         if (val instanceof Long) return val;
         if (val instanceof Short) return ((Short) val).intValue();
