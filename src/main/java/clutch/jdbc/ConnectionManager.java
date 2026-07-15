@@ -12,6 +12,7 @@ import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -240,19 +241,38 @@ public class ConnectionManager {
     public void disconnect(int connId) throws SQLException {
         Session session = connections.remove(connId);
         if (session != null) {
-            closeQuietly(session.metadata());
-            closeQuietly(session.primary());
+            closeSession(session);
+        }
+    }
+
+    /**
+     * Remove an unsafe logical connection immediately, then close its JDBC
+     * sessions off-thread so a non-cooperative driver cannot delay invalidation.
+     */
+    public void poison(int connId) {
+        Session session = connections.remove(connId);
+        if (session == null) {
+            return;
+        }
+        try {
+            networkTimeoutExecutor.execute(() -> closeSession(session));
+        } catch (RejectedExecutionException e) {
+            closeSession(session);
         }
     }
 
     /** Close all connections and shut down the network-timeout executor. */
     public void disconnectAll() {
         for (Map.Entry<Integer, Session> e : connections.entrySet()) {
-            closeQuietly(e.getValue().metadata());
-            closeQuietly(e.getValue().primary());
+            closeSession(e.getValue());
         }
         connections.clear();
         networkTimeoutExecutor.shutdownNow();
+    }
+
+    private void closeSession(Session session) {
+        closeQuietly(session.metadata());
+        closeQuietly(session.primary());
     }
 
     private void closeQuietly(Connection connection) {

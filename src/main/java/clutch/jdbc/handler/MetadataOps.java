@@ -169,6 +169,7 @@ final class MetadataOps {
                 ORDER BY name
                 """;
         PreparedStatement ps = prepareTrackedStatement(conn, sql);
+        Integer cursorId = null;
         try {
             ps.setQueryTimeout(ORACLE_TABLES_TIMEOUT_SECONDS);
             if (os.useUserTables()) {
@@ -185,7 +186,7 @@ final class MetadataOps {
             }
             ResultSet rs = ps.executeQuery();
             rs.setFetchSize(1000);
-            int cursorId = cursorMgr.register(connId, ps, rs);
+            cursorId = cursorMgr.registerMetadata(connId, ps, rs);
             CursorManager.FetchResult first = cursorMgr.fetch(cursorId, 1000);
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("cursor-id", first.done() ? null : cursorId);
@@ -193,8 +194,12 @@ final class MetadataOps {
             result.put("rows", first.rows());
             result.put("done", first.done());
             return Response.ok(reqId, result);
-        } catch (SQLException e) {
-            closeStatementQuietly(ps);
+        } catch (SQLException | RuntimeException e) {
+            if (cursorId == null) {
+                closeStatementQuietly(ps);
+            } else {
+                cursorMgr.close(cursorId);
+            }
             throw e;
         }
     }
@@ -1711,8 +1716,17 @@ final class MetadataOps {
 
     private int getInt(Request req, String key) {
         Object v = req.params.get(key);
-        if (v instanceof Number n) {
-            return n.intValue();
+        if (v instanceof Byte || v instanceof Short || v instanceof Integer) {
+            return ((Number) v).intValue();
+        }
+        if (v instanceof Long longValue
+            && longValue >= Integer.MIN_VALUE && longValue <= Integer.MAX_VALUE) {
+            return longValue.intValue();
+        }
+        if (v instanceof java.math.BigInteger bigInteger
+            && bigInteger.compareTo(java.math.BigInteger.valueOf(Integer.MIN_VALUE)) >= 0
+            && bigInteger.compareTo(java.math.BigInteger.valueOf(Integer.MAX_VALUE)) <= 0) {
+            return bigInteger.intValue();
         }
         throw new IllegalArgumentException("Missing or non-integer param: " + key);
     }

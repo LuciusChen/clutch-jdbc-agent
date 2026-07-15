@@ -7,6 +7,7 @@ import clutch.jdbc.model.Response;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.math.BigInteger;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -17,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
@@ -40,6 +42,7 @@ public class Dispatcher {
     private static final int MAX_FETCH_SIZE = 10_000;
     static final int DEFAULT_EXECUTE_TIMEOUT = 29; // s; safety net when no client timeout given
     static final int MAX_CONCURRENT_JDBC_TASKS = 16;
+    static final long WORKER_CANCEL_GRACE_MILLIS = 250L;
     private static final String EXECUTOR_OVERLOADED_ERROR =
         "Agent overloaded: too many concurrent JDBC operations";
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -47,7 +50,8 @@ public class Dispatcher {
     private final ConnectionManager connMgr;
     private final CursorManager cursorMgr;
     private final ExecutorService executePool = newExecutePool();
-    private final Map<Integer, ReentrantLock> connectionLocks = new ConcurrentHashMap<>();
+    private final Map<Integer, ReentrantLock> foregroundLocks = new ConcurrentHashMap<>();
+    private final Map<Integer, ReentrantLock> metadataLocks = new ConcurrentHashMap<>();
     private final Map<Integer, RunningStatement> runningStatements = new ConcurrentHashMap<>();
     private final ThreadLocal<String> generatedSqlContext = new ThreadLocal<>();
     private final DispatcherDiagnostics diagnostics;
@@ -92,7 +96,20 @@ public class Dispatcher {
             if (connId == null) {
                 return dispatchUnlocked(req);
             }
-            return withConnectionLock(connId, () -> dispatchUnlocked(req));
+            Callable<Response> lockedAction = () -> {
+                try {
+                    return dispatchUnlocked(req);
+                } catch (Exception error) {
+                    poisonOnPrimaryConnectionFailure(req, error);
+                    throw error;
+                }
+            };
+            if (requestUsesBothConnectionLocks(req)) {
+                return withBothConnectionLocks(connId, lockedAction);
+            }
+            Map<Integer, ReentrantLock> locks = requestUsesMetadataLock(req)
+                ? metadataLocks : foregroundLocks;
+            return withConnectionLock(locks, connId, lockedAction);
         } catch (Exception e) {
             return errorResponse(req, e);
         } finally {
@@ -139,14 +156,16 @@ public class Dispatcher {
 
     private Integer requestConnectionId(Request req) {
         Object connId = req.params.get("conn-id");
-        if (connId instanceof Number number) {
-            return number.intValue();
+        Integer exactConnId = exactIntValue(connId);
+        if (exactConnId != null) {
+            return exactConnId;
         }
         if ("fetch".equals(req.op)) {
             Object cursorId = req.params.get("cursor-id");
-            if (cursorId instanceof Number number) {
+            Integer exactCursorId = exactIntValue(cursorId);
+            if (exactCursorId != null) {
                 try {
-                    return cursorMgr.connectionId(number.intValue());
+                    return cursorMgr.connectionId(exactCursorId);
                 } catch (SQLException ignored) {
                     return null;
                 }
@@ -229,7 +248,6 @@ public class Dispatcher {
         cursorMgr.closeForConnection(connId);
         connMgr.disconnect(connId);
         runningStatements.remove(connId);
-        connectionLocks.remove(connId);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
@@ -283,11 +301,6 @@ public class Dispatcher {
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
 
         Connection conn = primaryConnection(connId);
-        if (!conn.isValid(3)) {
-            return errorResponse(req,
-                "Connection lost: the server closed the connection (idle timeout). Please reconnect.",
-                "connection-lost", null, connId);
-        }
         Statement stmt = conn.createStatement();
         return executeStatement(
             req, connId, stmt, () -> stmt.execute(sql), fetchSize, executeTimeout);
@@ -301,11 +314,6 @@ public class Dispatcher {
         int executeTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
         Connection conn = primaryConnection(connId);
-        if (!conn.isValid(3)) {
-            return errorResponse(req,
-                "Connection lost: the server closed the connection (idle timeout). Please reconnect.",
-                "connection-lost", null, connId);
-        }
         PreparedStatement stmt = conn.prepareStatement(sql);
         try {
             bindValues(req, stmt);
@@ -323,12 +331,20 @@ public class Dispatcher {
         RunningStatement running = null;
         Integer cursorId = null;
         boolean cursorResponseReady = false;
+        boolean abandonStatement = false;
         try {
             stmt.setQueryTimeout(executeTimeout);
             running = beginRunningStatement(connId, req.id, stmt);
+            CountDownLatch workerFinished = new CountDownLatch(1);
             Future<Boolean> future;
             try {
-                future = executePool.submit(executeAction);
+                future = executePool.submit(() -> {
+                    try {
+                        return executeAction.call();
+                    } finally {
+                        workerFinished.countDown();
+                    }
+                });
             } catch (RejectedExecutionException e) {
                 return errorResponse(req, EXECUTOR_OVERLOADED_ERROR, "internal", e, connId);
             }
@@ -338,6 +354,10 @@ public class Dispatcher {
             } catch (TimeoutException e) {
                 future.cancel(true);
                 cancelStatementQuietly(stmt);
+                if (!awaitWorkerTermination(workerFinished)) {
+                    abandonStatement = true;
+                    poisonConnection(connId);
+                }
                 return errorResponse(req, "Query timed out after " + executeTimeout + "s",
                     "timeout", e, connId);
             } catch (ExecutionException e) {
@@ -358,8 +378,9 @@ public class Dispatcher {
             cursorId = cursorMgr.register(connId, stmt, rs);
             CursorManager.FetchResult first;
             try {
-                first = fetchCursorBatch(cursorId, fetchSize, stmt, executeTimeout);
+                first = fetchCursorBatch(connId, cursorId, fetchSize, stmt, executeTimeout);
             } catch (SQLException e) {
+                poisonOnConnectionFailure(connId, e);
                 return errorResponse(req, e.getMessage(),
                     fetchFailureCategory(running, e), e, connId);
             }
@@ -377,7 +398,9 @@ public class Dispatcher {
                 finishRunningStatement(connId, running);
             }
             if (cursorId == null) {
-                closeStatementQuietly(stmt);
+                if (!abandonStatement) {
+                    closeStatementQuietly(stmt);
+                }
             } else if (!cursorResponseReady) {
                 cursorMgr.close(cursorId);
             }
@@ -420,13 +443,15 @@ public class Dispatcher {
         RunningStatement running = beginRunningStatement(connId, req.id, stmt);
         try {
             try {
-                CursorManager.FetchResult fr = fetchCursorBatch(cursorId, fetchSize, stmt, fetchTimeout);
+                CursorManager.FetchResult fr = fetchCursorBatch(
+                    connId, cursorId, fetchSize, stmt, fetchTimeout);
                 Map<String, Object> result = new java.util.LinkedHashMap<>();
                 result.put("cursor-id", fr.done() ? null : cursorId);
                 result.put("rows", fr.rows());
                 result.put("done", fr.done());
                 return Response.ok(req.id, result);
             } catch (SQLException e) {
+                poisonOnConnectionFailure(connId, e);
                 return errorResponse(req, e.getMessage(),
                     fetchFailureCategory(running, e), e, connId);
             }
@@ -451,28 +476,69 @@ public class Dispatcher {
 
     private boolean requestBypassesConnectionLock(Request req) {
         return switch (req.op) {
-            case "ping", "connect", "cancel", "close-cursor" -> true;
+            case "ping", "connect", "cancel" -> true;
             default -> false;
         };
     }
 
     private Integer lockConnectionId(Request req) throws SQLException {
+        if (MetadataOps.supports(req.op)) {
+            return getInt(req, "conn-id");
+        }
         if (requestUsesDirectConnectionId(req.op)) {
             return getInt(req, "conn-id");
         }
         return switch (req.op) {
-            case "fetch" -> cursorMgr.connectionId(getInt(req, "cursor-id"));
+            case "fetch" -> {
+                getFetchSize(req);
+                yield cursorMgr.connectionId(getInt(req, "cursor-id"));
+            }
+            case "close-cursor" -> cursorMgr.connectionId(getInt(req, "cursor-id"));
             default -> null;
         };
     }
 
-    private Response withConnectionLock(int connId, Callable<Response> action) throws Exception {
-        ReentrantLock lock = connectionLocks.computeIfAbsent(connId, _id -> new ReentrantLock());
+    private boolean requestUsesBothConnectionLocks(Request req) {
+        return "disconnect".equals(req.op) || "set-current-schema".equals(req.op);
+    }
+
+    private boolean requestUsesMetadataLock(Request req) throws SQLException {
+        if (MetadataOps.supports(req.op)) {
+            return true;
+        }
+        if ("fetch".equals(req.op) || "close-cursor".equals(req.op)) {
+            return cursorMgr.usesMetadataConnection(getInt(req, "cursor-id"));
+        }
+        return false;
+    }
+
+    private Response withConnectionLock(Map<Integer, ReentrantLock> locks, int connId,
+                                        Callable<Response> action) throws Exception {
+        ReentrantLock lock = locks.computeIfAbsent(connId, _id -> new ReentrantLock());
         lock.lock();
         try {
             return action.call();
         } finally {
             lock.unlock();
+        }
+    }
+
+    private Response withBothConnectionLocks(int connId, Callable<Response> action)
+            throws Exception {
+        ReentrantLock foreground = foregroundLocks.computeIfAbsent(
+            connId, _id -> new ReentrantLock());
+        ReentrantLock metadata = metadataLocks.computeIfAbsent(
+            connId, _id -> new ReentrantLock());
+        foreground.lock();
+        try {
+            metadata.lock();
+            try {
+                return action.call();
+            } finally {
+                metadata.unlock();
+            }
+        } finally {
+            foreground.unlock();
         }
     }
 
@@ -489,12 +555,19 @@ public class Dispatcher {
         runningStatements.remove(connId, running);
     }
 
-    private CursorManager.FetchResult fetchCursorBatch(int cursorId, int fetchSize,
+    private CursorManager.FetchResult fetchCursorBatch(int connId, int cursorId, int fetchSize,
                                                        Statement stmt, int timeoutSeconds)
             throws Exception {
+        CountDownLatch workerFinished = new CountDownLatch(1);
         Future<CursorManager.FetchResult> future;
         try {
-            future = executePool.submit(() -> cursorMgr.fetch(cursorId, fetchSize));
+            future = executePool.submit(() -> {
+                try {
+                    return cursorMgr.fetch(cursorId, fetchSize);
+                } finally {
+                    workerFinished.countDown();
+                }
+            });
         } catch (RejectedExecutionException e) {
             cursorMgr.close(cursorId);
             throw new SQLException(EXECUTOR_OVERLOADED_ERROR);
@@ -504,7 +577,11 @@ public class Dispatcher {
         } catch (TimeoutException e) {
             future.cancel(true);
             cancelStatementQuietly(stmt);
-            cursorMgr.close(cursorId);
+            if (awaitWorkerTermination(workerFinished)) {
+                cursorMgr.close(cursorId);
+            } else {
+                poisonConnection(connId);
+            }
             throw new SQLTimeoutException("Query timed out after " + timeoutSeconds + "s");
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
@@ -514,6 +591,53 @@ public class Dispatcher {
             }
             throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
         }
+    }
+
+    private boolean awaitWorkerTermination(CountDownLatch workerFinished) {
+        try {
+            return workerFinished.await(WORKER_CANCEL_GRACE_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private void poisonConnection(int connId) {
+        cursorMgr.abandonForConnection(connId);
+        runningStatements.remove(connId);
+        connMgr.poison(connId);
+    }
+
+    private void poisonOnPrimaryConnectionFailure(Request req, Exception error) {
+        if (MetadataOps.supports(req.op) && !"set-current-schema".equals(req.op)) {
+            return;
+        }
+        Integer connId = requestConnectionId(req);
+        if (connId != null) {
+            poisonOnConnectionFailure(connId, error);
+        }
+    }
+
+    private void poisonOnConnectionFailure(int connId, Throwable error) {
+        if (isConnectionFailure(error)) {
+            poisonConnection(connId);
+        }
+    }
+
+    private boolean isConnectionFailure(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof java.sql.SQLRecoverableException) {
+                return true;
+            }
+            if (current instanceof SQLException sqlException
+                && sqlException.getSQLState() != null
+                && sqlException.getSQLState().startsWith("08")) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     private static ExecutorService newExecutePool() {
@@ -544,8 +668,9 @@ public class Dispatcher {
 
     private int getInt(Request req, String key) {
         Object value = req.params.get(key);
-        if (value instanceof Number number) {
-            return number.intValue();
+        Integer exact = exactIntValue(value);
+        if (exact != null) {
+            return exact;
         }
         throw new IllegalArgumentException("Missing or non-integer param: " + key);
     }
@@ -563,10 +688,27 @@ public class Dispatcher {
         if (value == null) {
             return null;
         }
-        if (value instanceof Number number) {
-            return number.intValue();
+        Integer exact = exactIntValue(value);
+        if (exact != null) {
+            return exact;
         }
         throw new IllegalArgumentException("Non-integer param: " + key);
+    }
+
+    private Integer exactIntValue(Object value) {
+        if (value instanceof Byte || value instanceof Short || value instanceof Integer) {
+            return ((Number) value).intValue();
+        }
+        if (value instanceof Long longValue) {
+            return longValue >= Integer.MIN_VALUE && longValue <= Integer.MAX_VALUE
+                ? longValue.intValue() : null;
+        }
+        if (value instanceof BigInteger bigInteger
+            && bigInteger.compareTo(BigInteger.valueOf(Integer.MIN_VALUE)) >= 0
+            && bigInteger.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) <= 0) {
+            return bigInteger.intValue();
+        }
+        return null;
     }
 
     private int getFetchSize(Request req) {

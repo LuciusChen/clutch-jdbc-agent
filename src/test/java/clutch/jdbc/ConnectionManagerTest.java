@@ -149,6 +149,30 @@ class ConnectionManagerTest {
         }
     }
 
+    @Test
+    void poisonRemovesLogicalConnectionBeforeAsynchronousCleanup() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager();
+            int connId = mgr.connect("jdbc:test:poison", "reader", "secret",
+                Map.of(), null, null, true, RecordingDriver.class.getName());
+
+            mgr.poison(connId);
+
+            SQLException error = assertThrows(SQLException.class, () -> mgr.getPrimary(connId));
+            assertTrue(error.getMessage().contains("Unknown connection id"));
+            long deadline = System.nanoTime() + 1_000_000_000L;
+            while (driver.closedCount < 2 && System.nanoTime() < deadline) {
+                Thread.sleep(5);
+            }
+            assertEquals(2, driver.closedCount);
+            mgr.disconnectAll();
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
     private static final class RecordingDriver implements Driver {
         private String seenUrl;
         private int seenLoginTimeout = -1;
@@ -157,7 +181,7 @@ class ConnectionManagerTest {
         private boolean primaryAutoCommitDisabled;
         private boolean metadataReadOnly;
         private int connectCount;
-        private int closedCount;
+        private volatile int closedCount;
         private boolean throwOnSetAutoCommit;
         private boolean throwOnSetReadOnly;
         private boolean throwOnSetNetworkTimeout;

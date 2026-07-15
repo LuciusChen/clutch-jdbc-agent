@@ -27,6 +27,8 @@ import java.util.Map;
  */
 public class TypeConverter {
 
+    static final int MAX_INLINE_BINARY_BYTES = 65_536;
+    static final int MAX_TEXT_CELL_CHARS = 1_048_576;
     private static final ObjectMapper JSON_VALIDATOR = new ObjectMapper();
     private static final List<Charset> BLOB_TEXT_CHARSETS =
         List.of(StandardCharsets.UTF_8, Charset.forName("GB18030"));
@@ -41,6 +43,9 @@ public class TypeConverter {
      * the text content and detected encoding.  Otherwise returns a placeholder.
      */
     static Map<String, Object> blobBytesToMap(byte[] bytes, long length) {
+        if (bytes.length > MAX_INLINE_BINARY_BYTES) {
+            return Map.of("__type", "blob", "length", length);
+        }
         for (Charset charset : BLOB_TEXT_CHARSETS) {
             String text = decodeBlobText(bytes, charset);
             if (text != null && structuredBlobText(text)) {
@@ -95,7 +100,7 @@ public class TypeConverter {
         if (rs.wasNull() || val == null) return null;
 
         if (val instanceof Boolean) return val;
-        if (val instanceof String) return val;
+        if (val instanceof String string) return boundedTextCell(string);
         if (val instanceof Integer) return val;
         if (val instanceof Long) return val;
         if (val instanceof Short) return ((Short) val).intValue();
@@ -112,7 +117,9 @@ public class TypeConverter {
         }
 
         // BigDecimal → String to preserve precision (avoids JS float rounding).
-        if (val instanceof BigDecimal) return ((BigDecimal) val).toPlainString();
+        if (val instanceof BigDecimal decimal) {
+            return boundedTextCell(decimal.toPlainString());
+        }
 
         // Date/Time -> local wall-clock strings.
         // Note: Oracle DATE has a time component; getTimestamp() is safer than getDate().
@@ -130,16 +137,24 @@ public class TypeConverter {
         if (val instanceof Blob) {
             Blob blob = (Blob) val;
             long len = blob.length();
-            if (len <= 65536) {
+            if (len <= MAX_INLINE_BINARY_BYTES) {
                 return blobBytesToMap(blob.getBytes(1, (int) len), len);
             }
             return java.util.Map.of("__type", "blob", "length", len);
         }
-        if (val instanceof byte[]) return blobBytesToMap((byte[]) val, ((byte[]) val).length);
+        if (val instanceof byte[] bytes) return blobBytesToMap(bytes, bytes.length);
 
         // Fallback: getString() for anything else (e.g. Oracle-specific types).
         String s = rs.getString(col);
-        return s != null ? s : val.toString();
+        return boundedTextCell(s != null ? s : val.toString());
+    }
+
+    private static String boundedTextCell(String value) throws SQLException {
+        if (value.length() > MAX_TEXT_CELL_CHARS) {
+            throw new SQLException(
+                "JDBC text cell exceeds " + MAX_TEXT_CELL_CHARS + " characters");
+        }
+        return value;
     }
 
     private static String formatTimestamp(Timestamp value) {

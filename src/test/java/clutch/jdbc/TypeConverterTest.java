@@ -238,6 +238,32 @@ class TypeConverterTest {
     }
 
     @Test
+    void convertLargeByteArrayReturnsPlaceholderWithoutTextDecoding() throws SQLException {
+        byte[] bytes = new byte[65_537];
+        bytes[0] = '{';
+        bytes[bytes.length - 1] = '}';
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> result = (Map<String, Object>) TypeConverter.convert(
+            resultSetReturning(bytes), 1);
+
+        assertEquals("blob", result.get("__type"));
+        assertEquals((long) bytes.length, result.get("length"));
+        assertFalse(result.containsKey("text"));
+    }
+
+    @Test
+    void convertRejectsTextCellAboveResponseLimit() {
+        String text = "x".repeat(1_048_577);
+
+        SQLException error = assertThrows(SQLException.class,
+            () -> TypeConverter.convert(resultSetReturning(text), 1));
+
+        assertTrue(error.getMessage().contains("text cell exceeds"));
+        assertTrue(error.getMessage().contains("1048576"));
+    }
+
+    @Test
     void convertUnknownTypeFallsBackToGetString() throws SQLException {
         // Use an object whose type doesn't match any known branch
         Object exotic = new Object() {
