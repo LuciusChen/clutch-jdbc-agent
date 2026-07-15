@@ -169,6 +169,11 @@ public class ConnectionManager {
         return session.primary();
     }
 
+    /** Return whether {@code connId} still names a live logical session. */
+    public boolean hasConnection(int connId) {
+        return connections.containsKey(connId);
+    }
+
     /** Return the live metadata Connection for {@code connId}, or throw if unknown. */
     public Connection getMetadata(int connId) throws SQLException {
         Session session = connections.get(connId);
@@ -187,8 +192,9 @@ public class ConnectionManager {
         if (session == null) {
             return false;
         }
+        Connection metadata;
         synchronized (session) {
-            Connection metadata = session.metadata();
+            metadata = session.metadata();
             if (metadataUsable(metadata, failure)) {
                 return false;
             }
@@ -202,9 +208,9 @@ public class ConnectionManager {
                 closeQuietly(replacement);
                 throw e;
             }
-            closeQuietly(metadata);
-            return true;
         }
+        closeAsync(metadata);
+        return true;
     }
 
     /** Reopen only the metadata connection when its JDBC liveness check fails. */
@@ -212,16 +218,28 @@ public class ConnectionManager {
         return reconnectMetadataIfInvalid(connId, null);
     }
 
-    /** Close and invalidate only the metadata connection for {@code connId}. */
+    /** Detach the metadata connection for {@code connId}, then close it off-thread. */
     public void invalidateMetadata(int connId) {
         Session session = connections.get(connId);
         if (session == null) {
             return;
         }
+        Connection metadata;
         synchronized (session) {
-            Connection metadata = session.metadata();
+            metadata = session.metadata();
             session.setMetadata(null);
-            closeQuietly(metadata);
+        }
+        closeAsync(metadata);
+    }
+
+    private void closeAsync(Connection connection) {
+        if (connection == null) {
+            return;
+        }
+        try {
+            networkTimeoutExecutor.execute(() -> closeQuietly(connection));
+        } catch (RejectedExecutionException e) {
+            closeQuietly(connection);
         }
     }
 

@@ -122,7 +122,8 @@ public class Dispatcher {
         Integer connId = requestConnectionId(req);
         Map<String, Object> diag =
             diagnostics.requestDiagnostics(
-                req, diagnostics.requestErrorCategory(req, e), e, message, connId);
+                req, diagnostics.requestErrorCategory(req, e), e, message, connId,
+                connectionInvalidated(req, connId));
         Map<String, Object> debugPayload = diagnostics.requestDebugPayload(req, e, connId);
         if ("connect".equals(req.op)) {
             LOG.log(System.Logger.Level.ERROR,
@@ -142,7 +143,9 @@ public class Dispatcher {
         return Response.error(
             req.id,
             message,
-            diagnostics.requestDiagnostics(req, category, throwable, message, connId),
+            diagnostics.requestDiagnostics(
+                req, category, throwable, message, connId,
+                connectionInvalidated(req, connId)),
             diagnostics.requestDebugPayload(req, throwable, connId));
     }
 
@@ -305,6 +308,7 @@ public class Dispatcher {
                 "request-id", running.requestId(),
                 "cancelled", true));
         } catch (SQLException e) {
+            poisonOnConnectionFailure(connId, e);
             return errorResponse(req, e.getMessage(), "cancel", e, connId);
         }
     }
@@ -384,6 +388,7 @@ public class Dispatcher {
             } catch (ExecutionException e) {
                 Throwable cause = e.getCause();
                 if (running.cancelRequested() && cause instanceof SQLException sqlException) {
+                    poisonOnConnectionFailure(connId, sqlException);
                     return errorResponse(req, sqlException.getMessage(), "cancel", sqlException, connId);
                 }
                 throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
@@ -399,7 +404,8 @@ public class Dispatcher {
             cursorId = cursorMgr.register(connId, stmt, rs);
             CursorManager.FetchResult first;
             try {
-                first = fetchCursorBatch(connId, cursorId, fetchSize, stmt, executeTimeout);
+                first = fetchCursorBatch(
+                    connId, cursorId, fetchSize, stmt, executeTimeout, false);
             } catch (SQLException e) {
                 poisonOnConnectionFailure(connId, e);
                 return errorResponse(req, e.getMessage(),
@@ -460,24 +466,29 @@ public class Dispatcher {
         int fetchTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
         int connId = cursorMgr.connectionId(cursorId);
+        boolean metadata = cursorMgr.usesMetadataConnection(cursorId);
         Statement stmt = cursorMgr.statement(cursorId);
-        RunningStatement running = beginRunningStatement(connId, req.id, stmt);
+        RunningStatement running = metadata
+            ? null
+            : beginRunningStatement(connId, req.id, stmt);
         try {
             try {
                 CursorManager.FetchResult fr = fetchCursorBatch(
-                    connId, cursorId, fetchSize, stmt, fetchTimeout);
+                    connId, cursorId, fetchSize, stmt, fetchTimeout, metadata);
                 Map<String, Object> result = new java.util.LinkedHashMap<>();
                 result.put("cursor-id", fr.done() ? null : cursorId);
                 result.put("rows", fr.rows());
                 result.put("done", fr.done());
                 return Response.ok(req.id, result);
             } catch (SQLException e) {
-                poisonOnConnectionFailure(connId, e);
+                handleFetchConnectionFailure(connId, metadata, e);
                 return errorResponse(req, e.getMessage(),
                     fetchFailureCategory(running, e), e, connId);
             }
         } finally {
-            finishRunningStatement(connId, running);
+            if (running != null) {
+                finishRunningStatement(connId, running);
+            }
         }
     }
 
@@ -577,7 +588,8 @@ public class Dispatcher {
     }
 
     private CursorManager.FetchResult fetchCursorBatch(int connId, int cursorId, int fetchSize,
-                                                       Statement stmt, int timeoutSeconds)
+                                                       Statement stmt, int timeoutSeconds,
+                                                       boolean metadata)
             throws Exception {
         CountDownLatch workerFinished = new CountDownLatch(1);
         Future<CursorManager.FetchResult> future;
@@ -600,15 +612,30 @@ public class Dispatcher {
             cancelStatementQuietly(stmt);
             if (awaitWorkerTermination(workerFinished)) {
                 cursorMgr.close(cursorId);
+            } else if (metadata) {
+                cursorMgr.abandon(cursorId);
+                connMgr.invalidateMetadata(connId);
             } else {
                 poisonConnection(connId);
             }
             throw new SQLTimeoutException("Query timed out after " + timeoutSeconds + "s");
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
-            cursorMgr.close(cursorId);
+            boolean connectionFailure = ConnectionManager.isConnectionFailure(cause);
+            if (connectionFailure) {
+                cursorMgr.abandon(cursorId);
+            } else {
+                cursorMgr.close(cursorId);
+            }
             if (cause instanceof SQLException sqlException) {
                 throw sqlException;
+            }
+            if (connectionFailure) {
+                String message = cause.getMessage();
+                if (message == null || message.isBlank()) {
+                    message = "JDBC connection failed while fetching rows";
+                }
+                throw new SQLException(message, cause);
             }
             throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
         }
@@ -629,6 +656,20 @@ public class Dispatcher {
         connMgr.poison(connId);
     }
 
+    private boolean connectionInvalidated(Request req, Integer connId) {
+        return connId != null
+            && requestReferencesLogicalConnection(req)
+            && !connMgr.hasConnection(connId);
+    }
+
+    private boolean requestReferencesLogicalConnection(Request req) {
+        return requestUsesDirectConnectionId(req.op)
+            || MetadataOps.supports(req.op)
+            || "cancel".equals(req.op)
+            || "fetch".equals(req.op)
+            || "close-cursor".equals(req.op);
+    }
+
     private void poisonOnPrimaryConnectionFailure(Request req, Exception error) {
         if (MetadataOps.supports(req.op) && !"set-current-schema".equals(req.op)) {
             return;
@@ -641,6 +682,17 @@ public class Dispatcher {
 
     private void poisonOnConnectionFailure(int connId, Throwable error) {
         if (ConnectionManager.isConnectionFailure(error)) {
+            poisonConnection(connId);
+        }
+    }
+
+    private void handleFetchConnectionFailure(int connId, boolean metadata, SQLException error) {
+        if (!ConnectionManager.isConnectionFailure(error)) {
+            return;
+        }
+        if (metadata) {
+            connMgr.invalidateMetadata(connId);
+        } else {
             poisonConnection(connId);
         }
     }

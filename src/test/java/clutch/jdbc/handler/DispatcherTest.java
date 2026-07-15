@@ -560,6 +560,8 @@ class DispatcherTest {
             if (retryFails) {
                 assertFalse(response.ok);
                 assertTrue(response.error.contains("unclassified dead connection"), response.error);
+                assertFalse(diagMap(response).containsKey("connection-invalidated"),
+                    "metadata-only recovery must not invalidate the logical connection");
                 assertEquals(1, retryCalls.get());
                 assertEquals(2, connMgr.metadataReconnects,
                     "retry failure must be offered to liveness-aware recovery");
@@ -597,6 +599,8 @@ class DispatcherTest {
             assertFalse(response.ok);
             assertTrue(response.error.contains(
                 failedRestore == 1 ? "schema restore failed" : "ORA-12592"), response.error);
+            assertFalse(diagMap(response).containsKey("connection-invalidated"),
+                "invalidating metadata alone must keep the logical connection live");
             assertEquals(failedRestore, failedCalls.get(),
                 "one request may run at most before and after one recovery");
             assertEquals(failedRestore, connMgr.metadataReconnects);
@@ -770,6 +774,237 @@ class DispatcherTest {
     }
 
     @Test
+    void metadataCursorFetchDoesNotOccupyForegroundCancelSlot() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        CountDownLatch executeStarted = new CountDownLatch(1);
+        CountDownLatch foregroundCancelled = new CountDownLatch(1);
+        CountDownLatch metadataFetchStarted = new CountDownLatch(1);
+        CountDownLatch releaseMetadataFetch = new CountDownLatch(1);
+        AtomicInteger foregroundCancelCalls = new AtomicInteger();
+        AtomicInteger metadataCancelCalls = new AtomicInteger();
+        Statement foregroundStmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Statement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "setQueryTimeout" -> null;
+                case "execute" -> {
+                    executeStarted.countDown();
+                    foregroundCancelled.await();
+                    throw new SQLException("Query cancelled");
+                }
+                case "cancel" -> {
+                    foregroundCancelCalls.incrementAndGet();
+                    foregroundCancelled.countDown();
+                    yield null;
+                }
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement" -> foregroundStmt;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Statement metadataStmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Statement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "cancel" -> {
+                    metadataCancelCalls.incrementAndGet();
+                    yield null;
+                }
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        ResultSetMetaData meta = oneColumnMetadata("name", "VARCHAR");
+        ResultSet metadataRs = (ResultSet) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{ResultSet.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "next" -> {
+                    metadataFetchStarted.countDown();
+                    releaseMetadataFetch.await();
+                    yield false;
+                }
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        CursorManager cursorMgr = new CursorManager();
+        int cursorId = cursorMgr.registerMetadata(7, metadataStmt, metadataRs);
+        Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<Response> execute = executor.submit(() -> dispatcher.dispatch(request(
+                805, "execute", "conn-id", 7, "sql", "SELECT * FROM t")));
+            assertTrue(executeStarted.await(1, TimeUnit.SECONDS));
+            Future<Response> metadataFetch = executor.submit(() -> dispatcher.dispatch(request(
+                806, "fetch", "cursor-id", cursorId, "fetch-size", 10)));
+            assertTrue(metadataFetchStarted.await(1, TimeUnit.SECONDS),
+                "metadata fetch must run while foreground execute is blocked");
+
+            Response cancel = dispatcher.dispatch(request(807, "cancel", "conn-id", 7));
+
+            assertTrue(cancel.ok);
+            assertEquals(805, ((Number) resultMap(cancel).get("request-id")).intValue());
+            assertEquals(1, foregroundCancelCalls.get());
+            assertEquals(0, metadataCancelCalls.get());
+            releaseMetadataFetch.countDown();
+            assertTrue(metadataFetch.get(1, TimeUnit.SECONDS).ok);
+            Response interrupted = execute.get(1, TimeUnit.SECONDS);
+            assertFalse(interrupted.ok);
+            assertFalse(diagMap(interrupted).containsKey("connection-invalidated"));
+            assertFalse(connMgr.disconnected);
+        } finally {
+            foregroundCancelled.countDown();
+            releaseMetadataFetch.countDown();
+            executor.shutdownNow();
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void metadataCursorFatalFetchInvalidatesOnlyMetadataSession() throws Exception {
+        List<SQLException> failures = List.of(
+            new SQLException("metadata transport closed", "08000"),
+            new SQLException("ORA-12592: TNS:bad packet", "66000", 12592));
+        for (int i = 0; i < failures.size(); i++) {
+            int caseIndex = i;
+            RecordingConnectionManager connMgr = new RecordingConnectionManager();
+            RecordingStatementHandler foreground = new RecordingStatementHandler();
+            foreground.updateCount = i + 1;
+            connMgr.connection = proxyConnection(foreground);
+            connMgr.metadataReplacements = List.of(
+                metadataConnectionWithSchemas(List.of("RECOVERED" + i)));
+            CountDownLatch cursorCloseStarted = new CountDownLatch(1);
+            CountDownLatch releaseCursorClose = new CountDownLatch(1);
+            Statement stmt = (Statement) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(), new Class<?>[]{Statement.class},
+                (_proxy, method, _args) -> switch (method.getName()) {
+                    case "close" -> null;
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+            ResultSetMetaData meta = oneColumnMetadata("name", "VARCHAR");
+            SQLException failure = failures.get(i);
+            ResultSet rs = (ResultSet) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(), new Class<?>[]{ResultSet.class},
+                (_proxy, method, _args) -> switch (method.getName()) {
+                    case "getMetaData" -> meta;
+                    case "next" -> throw failure;
+                    case "close" -> {
+                        cursorCloseStarted.countDown();
+                        while (releaseCursorClose.getCount() > 0) {
+                            try {
+                                releaseCursorClose.await();
+                            } catch (InterruptedException ignored) {
+                                // Simulate a broken metadata cursor close.
+                            }
+                        }
+                        yield null;
+                    }
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+            CursorManager cursorMgr = new CursorManager();
+            int cursorId = cursorMgr.registerMetadata(7, stmt, rs);
+            Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try {
+                Future<Response> responseFuture = executor.submit(() -> dispatcher.dispatch(
+                    request(796 + caseIndex, "fetch", "cursor-id", cursorId, "fetch-size", 10)));
+                Response response = responseFuture.get(1, TimeUnit.SECONDS);
+
+                assertFalse(response.ok);
+                assertFalse(cursorCloseStarted.await(100, TimeUnit.MILLISECONDS),
+                    "fatal metadata cursor resources must be abandoned, not closed inline");
+                assertFalse(diagMap(response).containsKey("connection-invalidated"));
+                assertFalse(connMgr.disconnected,
+                    "metadata cursor failure must preserve the primary session");
+                assertEquals(1, connMgr.metadataInvalidations);
+                assertThrows(SQLException.class, () -> cursorMgr.connectionId(cursorId));
+
+                Response foregroundResponse = dispatcher.dispatch(request(
+                    798 + i, "execute", "conn-id", 7, "sql", "UPDATE t SET x = 1"));
+                assertTrue(foregroundResponse.ok);
+                Response metadataResponse = dispatcher.dispatch(request(
+                    800 + i, "get-schemas", "conn-id", 7));
+                assertTrue(metadataResponse.ok);
+                assertEquals(List.of("RECOVERED" + i),
+                    resultMap(metadataResponse).get("schemas"));
+            } finally {
+                releaseCursorClose.countDown();
+                executor.shutdownNow();
+                dispatcher.shutdown();
+            }
+        }
+    }
+
+    @Test
+    void wrappedFatalCursorFetchPreservesConnectionIdAndLane() throws Exception {
+        for (boolean metadata : List.of(false, true)) {
+            RecordingConnectionManager connMgr = new RecordingConnectionManager();
+            Statement stmt = (Statement) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(), new Class<?>[]{Statement.class},
+                (_proxy, method, _args) -> switch (method.getName()) {
+                    case "close" -> null;
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+            ResultSetMetaData meta = oneColumnMetadata("id", "INTEGER");
+            ResultSet rs = (ResultSet) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(), new Class<?>[]{ResultSet.class},
+                (_proxy, method, _args) -> switch (method.getName()) {
+                    case "getMetaData" -> meta;
+                    case "next" -> throw new RuntimeException(
+                        "wrapped fetch failure",
+                        new SQLException("generic JDBC transport failure", "08000"));
+                    case "close" -> throw new AssertionError(
+                        "fatal cursor resources must be abandoned, not closed inline");
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+            CursorManager cursorMgr = new CursorManager();
+            int cursorId = metadata
+                ? cursorMgr.registerMetadata(7, stmt, rs)
+                : cursorMgr.register(7, stmt, rs);
+            Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
+            try {
+                Response response = dispatcher.dispatch(request(
+                    metadata ? 812 : 811,
+                    "fetch", "cursor-id", cursorId, "fetch-size", 10));
+
+                assertFalse(response.ok);
+                Map<String, Object> diag = diagMap(response);
+                assertEquals(7, ((Number) diag.get("conn-id")).intValue(),
+                    "fatal fetch diagnostics must retain the cursor's connection id");
+                assertTrue(((List<?>) diag.get("cause-chain")).stream()
+                    .filter(Map.class::isInstance)
+                    .map(Map.class::cast)
+                    .anyMatch(entry -> "08000".equals(entry.get("sql-state"))),
+                    "the nested generic JDBC SQLState must remain diagnostic evidence");
+                assertEquals(!metadata,
+                    Boolean.TRUE.equals(diag.get("connection-invalidated")));
+                assertEquals(metadata ? 1 : 0, connMgr.metadataInvalidations);
+                assertEquals(!metadata, connMgr.disconnected);
+                assertThrows(SQLException.class, () -> cursorMgr.connectionId(cursorId));
+            } finally {
+                dispatcher.shutdown();
+            }
+        }
+    }
+
+    @Test
     void setCurrentSchemaUpdatesPrimaryAndMetadataConnections() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         List<String> primarySql = new ArrayList<>();
@@ -933,6 +1168,8 @@ class DispatcherTest {
         Response response = dispatch(connMgr, 99, "execute", "conn-id", 7, "sql", "SELECT 1");
         assertFalse(response.ok);
         assertEquals("simulated rs failure", response.error);
+        assertFalse(diagMap(response).containsKey("connection-invalidated"));
+        assertFalse(connMgr.disconnected, "ordinary SQL errors must keep the connection live");
         assertTrue(closed[0], "statement must be closed when getResultSet() fails");
     }
 
@@ -949,7 +1186,7 @@ class DispatcherTest {
                     yield true;
                 }
                 case "createStatement" -> throw new java.sql.SQLRecoverableException(
-                    "server closed connection", "08006");
+                    "No more data to read from socket", "08000", 17410);
                 case "unwrap"       -> null;
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
@@ -960,9 +1197,26 @@ class DispatcherTest {
 
         assertFalse(response.ok);
         assertNotNull(response.error);
-        assertTrue(response.error.contains("server closed connection"), response.error);
+        assertTrue(response.error.contains("No more data to read from socket"), response.error);
+        assertEquals(Boolean.TRUE, diagMap(response).get("connection-invalidated"));
         assertFalse(isValidCalled[0], "execute must not add an isValid network round-trip");
         assertTrue(connMgr.disconnected, "SQLState 08 must poison the logical connection");
+
+        RecordingConnectionManager stateConnMgr = new RecordingConnectionManager();
+        stateConnMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement" -> throw new SQLException(
+                    "transport disconnected", "08000");
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        Response stateResponse = dispatch(stateConnMgr, 191, "execute",
+            "conn-id", 7, "sql", "SELECT 1 FROM dual");
+        assertEquals(Boolean.TRUE, diagMap(stateResponse).get("connection-invalidated"));
+        assertTrue(stateConnMgr.disconnected, "plain SQLState 08 must poison the connection");
 
         SQLException wrapper = new SQLException("statement failed", "42000");
         wrapper.setNextException(new SQLException(
@@ -977,8 +1231,43 @@ class DispatcherTest {
                 default -> throw new UnsupportedOperationException(method.getName());
             });
 
-        dispatch(oracleConnMgr, 190, "execute", "conn-id", 7, "sql", "SELECT 1 FROM dual");
+        Response oracleResponse = dispatch(
+            oracleConnMgr, 190, "execute", "conn-id", 7, "sql", "SELECT 1 FROM dual");
+        assertEquals(Boolean.TRUE, diagMap(oracleResponse).get("connection-invalidated"));
         assertTrue(oracleConnMgr.disconnected, "ORA-12592 must poison the logical connection");
+    }
+
+    @Test
+    void invalidatedConnectionStaysMarkedWithoutLeakingRequestState() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement" -> throw new java.sql.SQLRecoverableException(
+                    "primary connection lost", "08000", 17410);
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response first = dispatcher.dispatch(request(
+                192, "execute", "conn-id", 7, "sql", "SELECT 1"));
+            assertEquals(Boolean.TRUE, diagMap(first).get("connection-invalidated"));
+
+            Response unrelated = dispatcher.dispatch(request(
+                193, "unknown-op", "conn-id", 7));
+            assertFalse(diagMap(unrelated).containsKey("connection-invalidated"),
+                "a reused request thread must not leak invalidation state");
+
+            Response stale = dispatcher.dispatch(request(
+                194, "execute", "conn-id", 7, "sql", "SELECT 2"));
+            assertFalse(stale.ok);
+            assertEquals(Boolean.TRUE, diagMap(stale).get("connection-invalidated"),
+                "later requests for an already removed local connection must remain marked");
+        } finally {
+            dispatcher.shutdown();
+        }
     }
 
     @Test
@@ -1021,6 +1310,8 @@ class DispatcherTest {
         assertFalse(response.ok);
         assertNotNull(response.error);
         assertTrue(response.error.contains("timed out"), "error should mention timed out: " + response.error);
+        assertFalse(diagMap(response).containsKey("connection-invalidated"));
+        assertFalse(connMgr.disconnected, "a stopped worker must leave the connection usable");
         assertTrue(cancelled[0], "stmt.cancel() must be called on timeout");
         assertTrue(closed[0],    "stmt.close() must be called on timeout");
         assertTrue(elapsed < 4000, "test must complete within 4s, took: " + elapsed + "ms");
@@ -1075,6 +1366,7 @@ class DispatcherTest {
             assertFalse(response.ok);
             assertEquals("timeout", diagMap(response).get("category"),
                 response.error + " " + diagMap(response));
+            assertEquals(Boolean.TRUE, diagMap(response).get("connection-invalidated"));
             assertTrue(connMgr.disconnected,
                 "a worker still running after cancellation grace must poison the connection");
             Response followup = dispatcher.dispatch(
@@ -1183,6 +1475,9 @@ class DispatcherTest {
             Response interrupted = executeFuture.get(2, TimeUnit.SECONDS);
             assertFalse(interrupted.ok);
             assertEquals("Query cancelled", interrupted.error);
+            assertFalse(diagMap(interrupted).containsKey("connection-invalidated"));
+            assertFalse(connMgr.disconnected,
+                "an ordinary cancellation error must keep the connection live");
 
             Response followup = dispatcher.dispatch(
                 request(42, "execute", "conn-id", 7, "sql", "UPDATE demo SET x = 1"));
@@ -1194,6 +1489,75 @@ class DispatcherTest {
         } finally {
             pool.shutdownNow();
             dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void fatalCancellationPathsInvalidateTheLogicalConnection() throws Exception {
+        for (boolean cancelCallFails : List.of(true, false)) {
+            RecordingConnectionManager connMgr = new RecordingConnectionManager();
+            CountDownLatch executeStarted = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            SQLException fatal = new java.sql.SQLRecoverableException(
+                "connection lost during cancellation", "08000", 17410);
+            Statement stmt = (Statement) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(), new Class<?>[]{Statement.class},
+                (_proxy, method, _args) -> switch (method.getName()) {
+                    case "setQueryTimeout" -> null;
+                    case "execute" -> {
+                        executeStarted.countDown();
+                        releaseWorker.await();
+                        throw cancelCallFails
+                            ? new SQLException("worker stopped after cancel failure")
+                            : fatal;
+                    }
+                    case "cancel" -> {
+                        if (cancelCallFails) {
+                            throw fatal;
+                        }
+                        releaseWorker.countDown();
+                        yield null;
+                    }
+                    case "close" -> null;
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+            connMgr.connection = (Connection) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(), new Class<?>[]{Connection.class},
+                (_proxy, method, _args) -> switch (method.getName()) {
+                    case "createStatement" -> stmt;
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+            Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try {
+                Future<Response> execute = executor.submit(() -> dispatcher.dispatch(request(
+                    401, "execute", "conn-id", 7, "sql", "SELECT * FROM t")));
+                assertTrue(executeStarted.await(1, TimeUnit.SECONDS));
+                Response cancel = dispatcher.dispatch(request(402, "cancel", "conn-id", 7));
+                if (cancelCallFails) {
+                    assertFalse(cancel.ok);
+                    assertEquals(Boolean.TRUE,
+                        diagMap(cancel).get("connection-invalidated"));
+                    releaseWorker.countDown();
+                } else {
+                    assertTrue(cancel.ok);
+                }
+
+                Response interrupted = execute.get(2, TimeUnit.SECONDS);
+                Response fatalResponse = cancelCallFails ? cancel : interrupted;
+                assertFalse(interrupted.ok);
+                assertEquals(Boolean.TRUE,
+                    diagMap(fatalResponse).get("connection-invalidated"));
+                assertTrue(connMgr.disconnected);
+            } finally {
+                releaseWorker.countDown();
+                executor.shutdownNow();
+                dispatcher.shutdown();
+            }
         }
     }
 
@@ -1382,6 +1746,9 @@ class DispatcherTest {
             assertTrue(timedOut.error.contains("timed out"),
                 "error should mention timed out: " + timedOut.error);
             assertEquals("timeout", diagMap(timedOut).get("category"));
+            assertFalse(diagMap(timedOut).containsKey("connection-invalidated"));
+            assertFalse(connMgr.disconnected,
+                "a stopped fetch worker must leave the connection usable");
             assertTrue(cancelled[0], "stmt.cancel() must be called on fetch timeout");
             assertTrue(statementClosed[0], "stmt.close() must be called on fetch timeout");
             assertTrue(resultSetClosed[0], "resultset must be closed on fetch timeout");
@@ -1459,10 +1826,85 @@ class DispatcherTest {
 
             assertFalse(response.ok);
             assertEquals("timeout", diagMap(response).get("category"));
+            assertEquals(Boolean.TRUE, diagMap(response).get("connection-invalidated"));
             assertTrue(connMgr.disconnected,
                 "an uncooperative fetch worker must poison the logical connection");
             assertThrows(SQLException.class, () -> cursorMgr.connectionId(cursorId),
                 "poisoning must detach every cursor owned by the connection");
+        } finally {
+            releaseDriver.countDown();
+            executor.shutdownNow();
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void metadataCursorTimeoutInvalidatesOnlyMetadataSession() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        RecordingStatementHandler foreground = new RecordingStatementHandler();
+        foreground.updateCount = 1;
+        connMgr.connection = proxyConnection(foreground);
+        connMgr.metadataReplacements = List.of(
+            metadataConnectionWithSchemas(List.of("RECOVERED")));
+        CountDownLatch fetchStarted = new CountDownLatch(1);
+        CountDownLatch releaseDriver = new CountDownLatch(1);
+        Statement stmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Statement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "cancel", "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        ResultSetMetaData meta = oneColumnMetadata("name", "VARCHAR");
+        ResultSet rs = (ResultSet) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{ResultSet.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "next" -> {
+                    fetchStarted.countDown();
+                    while (releaseDriver.getCount() > 0) {
+                        try {
+                            releaseDriver.await();
+                        } catch (InterruptedException ignored) {
+                            // Simulate a metadata driver that ignores interruption.
+                        }
+                    }
+                    yield false;
+                }
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        CursorManager cursorMgr = new CursorManager();
+        int cursorId = cursorMgr.registerMetadata(7, stmt, rs);
+        Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Response> future = executor.submit(() -> dispatcher.dispatch(request(
+                462, "fetch", "cursor-id", cursorId, "fetch-size", 10,
+                "query-timeout-seconds", 1)));
+            assertTrue(fetchStarted.await(1, TimeUnit.SECONDS));
+
+            Response response = future.get(4, TimeUnit.SECONDS);
+
+            assertFalse(response.ok);
+            assertEquals("timeout", diagMap(response).get("category"));
+            assertFalse(diagMap(response).containsKey("connection-invalidated"));
+            assertFalse(connMgr.disconnected,
+                "a stuck metadata cursor must not discard the primary session");
+            assertEquals(1, connMgr.metadataInvalidations);
+            assertThrows(SQLException.class, () -> cursorMgr.connectionId(cursorId));
+
+            releaseDriver.countDown();
+            Response foregroundResponse = dispatcher.dispatch(request(
+                463, "execute", "conn-id", 7, "sql", "UPDATE t SET x = 1"));
+            assertTrue(foregroundResponse.ok);
+            Response metadataResponse = dispatcher.dispatch(request(
+                464, "get-schemas", "conn-id", 7));
+            assertTrue(metadataResponse.ok);
+            assertEquals(List.of("RECOVERED"), resultMap(metadataResponse).get("schemas"));
         } finally {
             releaseDriver.countDown();
             executor.shutdownNow();
@@ -2119,6 +2561,19 @@ class DispatcherTest {
         return (List<T>) resultMap(response).get(key);
     }
 
+    private static ResultSetMetaData oneColumnMetadata(String name, String type) {
+        return (ResultSetMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{ResultSetMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getColumnCount" -> 1;
+                case "getColumnLabel" -> name;
+                case "getColumnTypeName" -> type;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
     private static Connection connectionWithNoArgCall(String methodName, Runnable callback) {
         return (Connection) Proxy.newProxyInstance(
             DispatcherTest.class.getClassLoader(),
@@ -2414,6 +2869,12 @@ class DispatcherTest {
                 throw new SQLException("Unknown connection id: " + connId);
             }
             return connection;
+        }
+
+        @Override
+        public boolean hasConnection(int connId) {
+            assertEquals(7, connId);
+            return !disconnected;
         }
 
         @Override
