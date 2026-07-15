@@ -6,9 +6,12 @@ import java.sql.DriverManager;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLException;
+import java.util.Collections;
 import java.util.Enumeration;
+import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -171,7 +174,10 @@ public class ConnectionManager {
         Session session = connections.get(connId);
         if (session == null)
             throw new SQLException("Unknown connection id: " + connId);
-        return session.metadata();
+        Connection metadata = session.metadata();
+        if (metadata == null)
+            throw new SQLException("Metadata connection is invalid for connection id: " + connId);
+        return metadata;
     }
 
     /** Reopen only the metadata connection when FAILURE indicates it is dead. */
@@ -206,6 +212,19 @@ public class ConnectionManager {
         return reconnectMetadataIfInvalid(connId, null);
     }
 
+    /** Close and invalidate only the metadata connection for {@code connId}. */
+    public void invalidateMetadata(int connId) {
+        Session session = connections.get(connId);
+        if (session == null) {
+            return;
+        }
+        synchronized (session) {
+            Connection metadata = session.metadata();
+            session.setMetadata(null);
+            closeQuietly(metadata);
+        }
+    }
+
     /** Remember the logical session schema so metadata recovery can restore it. */
     public void rememberCurrentSchema(int connId, String schema) throws SQLException {
         Session session = connections.get(connId);
@@ -225,9 +244,7 @@ public class ConnectionManager {
     }
 
     private boolean metadataUsable(Connection connection, SQLException failure) {
-        if (failure instanceof SQLRecoverableException
-            || failure != null && failure.getSQLState() != null
-                && failure.getSQLState().startsWith("08")) {
+        if (isConnectionFailure(failure)) {
             return false;
         }
         try {
@@ -235,6 +252,32 @@ public class ConnectionManager {
         } catch (SQLException | AbstractMethodError e) {
             return false;
         }
+    }
+
+    /** Return whether FAILURE means its JDBC connection must not be reused. */
+    public static boolean isConnectionFailure(Throwable failure) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        return isConnectionFailure(failure, seen);
+    }
+
+    private static boolean isConnectionFailure(Throwable failure, Set<Throwable> seen) {
+        if (failure == null || !seen.add(failure)) {
+            return false;
+        }
+        if (failure instanceof SQLRecoverableException) {
+            return true;
+        }
+        if (failure instanceof SQLException sqlException
+            && (sqlException.getErrorCode() == 12592
+                || sqlException.getSQLState() != null
+                    && sqlException.getSQLState().startsWith("08"))) {
+            return true;
+        }
+        if (isConnectionFailure(failure.getCause(), seen)) {
+            return true;
+        }
+        return failure instanceof SQLException sqlException
+            && isConnectionFailure(sqlException.getNextException(), seen);
     }
 
     /** Close and remove the connection for {@code connId}. No-op if already closed. */

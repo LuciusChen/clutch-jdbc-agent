@@ -1,5 +1,7 @@
 # 012 - Recover metadata without replacing the primary session
 
+Extended by [015](015-oracle-bad-packet-recovery.md) for Oracle bad-packet classification and fail-closed schema restoration.
+
 ## Context
 
 Each logical Clutch JDBC connection owns a primary session and an isolated
