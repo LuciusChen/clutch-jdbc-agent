@@ -28,6 +28,12 @@ final class DispatcherDiagnostics {
     private static final Pattern STRUCTURED_ASSIGNMENT_PATTERN = Pattern.compile(
         "\\b([A-Za-z0-9_.-]+)(\\s*[=:]\\s*)([^&;,\\s]+)");
 
+    private static final Pattern ORACLE_EMBEDDED_CREDENTIAL_PATTERN = Pattern.compile(
+        "(?i)^(jdbc:oracle:[^:]+:)([^/@\\s]+)/([^@\\s]+)(@.*)$");
+
+    private static final Pattern URL_ASSIGNMENT_PATTERN = Pattern.compile(
+        "([?&;:])([A-Za-z0-9_.-]+)(\\s*=\\s*)([^&;\\s]*)");
+
     private static final Set<String> SECRET_PARAM_SUFFIXES = Set.of(
         "password", "passwd", "pwd",
         "secret",
@@ -199,7 +205,19 @@ final class DispatcherDiagnostics {
 
     private Integer optionalIntParam(Request req, String key) {
         Object value = req.params.get(key);
-        return value instanceof Number number ? number.intValue() : null;
+        if (value instanceof Byte || value instanceof Short || value instanceof Integer) {
+            return ((Number) value).intValue();
+        }
+        if (value instanceof Long longValue
+            && longValue >= Integer.MIN_VALUE && longValue <= Integer.MAX_VALUE) {
+            return longValue.intValue();
+        }
+        if (value instanceof java.math.BigInteger bigInteger
+            && bigInteger.compareTo(java.math.BigInteger.valueOf(Integer.MIN_VALUE)) >= 0
+            && bigInteger.compareTo(java.math.BigInteger.valueOf(Integer.MAX_VALUE)) <= 0) {
+            return bigInteger.intValue();
+        }
+        return null;
     }
 
     private boolean debugRequested(Request req) {
@@ -258,23 +276,24 @@ final class DispatcherDiagnostics {
         if (url == null) {
             return null;
         }
-        int queryIndex = url.indexOf('?');
-        if (queryIndex < 0) {
-            if (url.regionMatches(true, 0, "jdbc:sqlserver:", 0, "jdbc:sqlserver:".length())) {
-                int propertyIndex = url.indexOf(';');
-                if (propertyIndex >= 0) {
-                    return redactDelimitedParameters(
-                        url.substring(0, propertyIndex) + ";",
-                        url.substring(propertyIndex + 1),
-                        ";");
-                }
+        Matcher assignments = URL_ASSIGNMENT_PATTERN.matcher(url);
+        StringBuffer rendered = new StringBuffer();
+        while (assignments.find()) {
+            String replacement = assignments.group(0);
+            if (isSecretParameterName(assignments.group(2))) {
+                replacement = assignments.group(1) + assignments.group(2)
+                    + assignments.group(3) + "<redacted>";
             }
-            return url;
+            assignments.appendReplacement(rendered, Matcher.quoteReplacement(replacement));
         }
-        return redactDelimitedParameters(
-            url.substring(0, queryIndex) + "?",
-            url.substring(queryIndex + 1),
-            "&");
+        assignments.appendTail(rendered);
+        String redacted = rendered.toString();
+        Matcher oracleCredentials = ORACLE_EMBEDDED_CREDENTIAL_PATTERN.matcher(redacted);
+        if (oracleCredentials.matches()) {
+            return oracleCredentials.group(1) + oracleCredentials.group(2)
+                + "/<redacted>" + oracleCredentials.group(4);
+        }
+        return redacted;
     }
 
     /**
@@ -383,34 +402,17 @@ final class DispatcherDiagnostics {
 
     private List<SecretBinding> secretUrlBindings(String url) {
         List<SecretBinding> bindings = new ArrayList<>();
-        int queryIndex = url.indexOf('?');
-        if (queryIndex >= 0) {
-            bindings.addAll(secretParameterBindings(url.substring(queryIndex + 1), "&"));
-        }
-        if (url.regionMatches(true, 0, "jdbc:sqlserver:", 0, "jdbc:sqlserver:".length())) {
-            int propertyIndex = url.indexOf(';');
-            if (propertyIndex >= 0) {
-                bindings.addAll(secretParameterBindings(url.substring(propertyIndex + 1), ";"));
-            }
-        }
-        return bindings;
-    }
-
-    private List<SecretBinding> secretParameterBindings(String raw, String separator) {
-        List<SecretBinding> bindings = new ArrayList<>();
-        for (String part : raw.split(Pattern.quote(separator))) {
-            if (part.isBlank()) {
-                continue;
-            }
-            int equalsIndex = part.indexOf('=');
-            if (equalsIndex < 0) {
-                continue;
-            }
-            String key = part.substring(0, equalsIndex);
-            String value = part.substring(equalsIndex + 1);
+        Matcher assignments = URL_ASSIGNMENT_PATTERN.matcher(url);
+        while (assignments.find()) {
+            String key = assignments.group(2);
+            String value = assignments.group(4);
             if (isSecretParameterName(key) && !value.isBlank()) {
                 bindings.add(new SecretBinding(key, value));
             }
+        }
+        Matcher oracleCredentials = ORACLE_EMBEDDED_CREDENTIAL_PATTERN.matcher(url);
+        if (oracleCredentials.matches()) {
+            bindings.add(new SecretBinding("password", oracleCredentials.group(3)));
         }
         return bindings;
     }
@@ -423,33 +425,6 @@ final class DispatcherDiagnostics {
             }
         }
         return false;
-    }
-
-    private String redactDelimitedParameters(String base, String raw, String separator) {
-        if (raw.isBlank()) {
-            return base;
-        }
-        List<String> redacted = new ArrayList<>();
-        for (String part : raw.split(Pattern.quote(separator))) {
-            if (part.isBlank()) {
-                continue;
-            }
-            int equalsIndex = part.indexOf('=');
-            if (equalsIndex < 0) {
-                redacted.add(part);
-            } else {
-                String key = part.substring(0, equalsIndex);
-                if (isSecretParameterName(key)) {
-                    redacted.add(key + "=<redacted>");
-                } else {
-                    redacted.add(part);
-                }
-            }
-        }
-        if (redacted.isEmpty()) {
-            return base;
-        }
-        return base + String.join(separator, redacted);
     }
 
     private Map<String, Object> entryMap(Object... kvs) {

@@ -79,6 +79,11 @@ Timeout-related params are explicit:
 `fetch-size` from 1 through 10,000. The default is 500. Values outside that
 range are rejected before JDBC work or cursor advancement.
 
+Every protocol integer must be represented as an exact signed 32-bit integer;
+fractional and overflowing JSON numbers are rejected instead of truncated.
+If an execute/fetch timeout cannot stop the driver worker within a short grace
+period, the logical connection is closed and cannot be reused concurrently.
+
 Boolean params are JSON booleans, not strings or numeric sentinels. Staged DML
 uses `execute-params` with a positional JSON `values` array; the agent binds each
 entry through `PreparedStatement` instead of rendering it into SQL text.
@@ -152,6 +157,7 @@ JDBC column values are converted to a stable set of JSON-safe types:
 | `Time`                      | Time string (`13:45:30`)                      |
 | `Clob`                      | `{"__type":"clob","length":N,"preview":"..."}` |
 | `Blob` / `byte[]` (≤64 KB)  | `{"__type":"blob","length":N}` or `{"__type":"blob","length":N,"text":"..."}` if valid UTF-8 JSON |
+| String / textual fallback   | String, limited to 1,048,576 characters per cell |
 | Anything else               | `rs.getString(col)` fallback                  |
 
 ## Architecture
@@ -176,11 +182,13 @@ clutch-jdbc-agent (JVM process)
 
 The agent no longer runs requests on one global synchronous lane.  The stdin
 loop parses requests and hands them to a small request pool.  The dispatcher
-still serializes most work per logical connection, while metadata runs on its
-own JDBC session. If that metadata session is closed by an idle timeout, the
-agent replaces only that session, restores the remembered schema, and retries
-the metadata request once; the primary transaction is untouched. `cancel` is
-the deliberate exception to serialization: it can
+uses independent per-connection foreground and metadata locks, so ordinary
+queries and metadata may run in parallel without allowing two operations to
+race on either JDBC session. Schema changes and disconnect acquire both locks
+in foreground-then-metadata order. If the metadata session is closed by an idle
+timeout, the agent replaces only that session, restores the remembered schema,
+and retries the metadata request once; the primary transaction is untouched.
+`cancel` is the deliberate exception to serialization: it can
 arrive while `execute` or `fetch` is running, locate the live `Statement`, and
 call `Statement.cancel()` without tearing down the whole session.
 

@@ -25,7 +25,7 @@ public class CursorManager {
 
     private static final System.Logger LOG = System.getLogger(CursorManager.class.getName());
 
-    private record Cursor(int connId, Statement stmt, ResultSet rs,
+    private record Cursor(int connId, Statement stmt, ResultSet rs, boolean metadata,
                           List<String> columnNames, List<String> columnTypes) {}
 
     private final AtomicInteger nextId = new AtomicInteger(1);
@@ -35,6 +35,16 @@ public class CursorManager {
      * Register a newly-opened Statement + ResultSet and return a cursorId.
      */
     public int register(int connId, Statement stmt, ResultSet rs) throws SQLException {
+        return register(connId, stmt, rs, false);
+    }
+
+    /** Register a cursor backed by the connection's isolated metadata session. */
+    public int registerMetadata(int connId, Statement stmt, ResultSet rs) throws SQLException {
+        return register(connId, stmt, rs, true);
+    }
+
+    private int register(int connId, Statement stmt, ResultSet rs, boolean metadata)
+            throws SQLException {
         ResultSetMetaData meta = rs.getMetaData();
         int colCount = meta.getColumnCount();
         List<String> names = new ArrayList<>(colCount);
@@ -44,7 +54,7 @@ public class CursorManager {
             types.add(meta.getColumnTypeName(i));
         }
         int id = nextId.getAndIncrement();
-        cursors.put(id, new Cursor(connId, stmt, rs, names, types));
+        cursors.put(id, new Cursor(connId, stmt, rs, metadata, names, types));
         return id;
     }
 
@@ -87,6 +97,13 @@ public class CursorManager {
         return c.stmt();
     }
 
+    /** Return whether {@code cursorId} reads from the isolated metadata session. */
+    public boolean usesMetadataConnection(int cursorId) throws SQLException {
+        Cursor c = cursors.get(cursorId);
+        if (c == null) throw new SQLException("Unknown cursor id: " + cursorId);
+        return c.metadata();
+    }
+
     /** Close and remove the cursor for {@code cursorId}. No-op if already closed. */
     public void close(int cursorId) {
         Cursor c = cursors.remove(cursorId);
@@ -104,6 +121,15 @@ public class CursorManager {
             }
             return false;
         });
+    }
+
+    /**
+     * Forget cursors for a poisoned connection without calling into a driver
+     * whose worker is still running. Closing the owning Connection releases
+     * those JDBC resources.
+     */
+    public void abandonForConnection(int connId) {
+        cursors.entrySet().removeIf(e -> e.getValue().connId() == connId);
     }
 
     public record FetchResult(List<String> columns, List<String> types,
