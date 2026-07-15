@@ -142,11 +142,44 @@ class ConnectionManagerTest {
             assertEquals("reader", driver.seenProps.getProperty("user"));
             assertEquals("secret", driver.seenProps.getProperty("password"));
 
+            mgr.invalidateMetadata(connId);
+            SQLException invalid = assertThrows(
+                SQLException.class, () -> mgr.getMetadata(connId));
+            assertTrue(invalid.getMessage().contains("Metadata connection is invalid"));
+            assertSame(primary, mgr.getPrimary(connId));
+            assertTrue(mgr.reconnectMetadataIfInvalid(connId));
+            assertEquals(4, driver.connectCount);
+
             mgr.disconnect(connId);
-            assertEquals(3, driver.closedCount);
+            assertEquals(4, driver.closedCount);
         } finally {
             DriverManager.deregisterDriver(driver);
         }
+    }
+
+    @Test
+    void connectionFailureClassificationTraversesLinksAndRejectsNearbyCode() {
+        SQLException badPacket = new SQLException(
+            "ORA-12592: TNS:bad packet", "66000", 12592);
+        SQLException caused = new SQLException("caused wrapper", "42000");
+        caused.initCause(badPacket);
+        SQLException chained = new SQLException("next wrapper", "42000");
+        chained.setNextException(badPacket);
+        SQLException cycle = new SQLException("cyclic wrapper", "42000", 12591) {
+            @Override
+            public synchronized Throwable getCause() {
+                return this;
+            }
+
+            @Override
+            public SQLException getNextException() {
+                return this;
+            }
+        };
+
+        assertTrue(ConnectionManager.isConnectionFailure(caused));
+        assertTrue(ConnectionManager.isConnectionFailure(chained));
+        assertFalse(ConnectionManager.isConnectionFailure(cycle));
     }
 
     @Test

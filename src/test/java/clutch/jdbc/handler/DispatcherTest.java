@@ -540,25 +540,79 @@ class DispatcherTest {
     }
 
     @Test
-    void metadataRequestRetriesOnceAfterConnectionRecovery() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
-        connMgr.metadataConnection = (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, _args) -> {
-                if (method.getName().equals("getMetaData")) {
-                    throw new SQLException("metadata connection closed", "08006");
-                }
-                throw new UnsupportedOperationException(method.getName());
-            });
-        connMgr.reconnectedMetadataConnection =
-            metadataConnectionWithSchemas(List.of("APP", "REPORTING"));
+    void metadataRequestRetriesOnceAndPreparesDeadRetryReplacement() throws Exception {
+        for (boolean retryFails : List.of(false, true)) {
+            RecordingConnectionManager connMgr = new RecordingConnectionManager();
+            AtomicInteger initialCalls = new AtomicInteger();
+            AtomicInteger retryCalls = new AtomicInteger();
+            AtomicInteger recoveredCalls = new AtomicInteger();
+            Connection recovered = metadataConnection(recoveredCalls, null, "RECOVERED");
+            connMgr.metadataConnection = metadataConnection(initialCalls,
+                new SQLException("metadata connection closed", "08006"), null);
+            connMgr.metadataReplacements = retryFails
+                ? List.of(metadataConnection(retryCalls,
+                              new SQLException("unclassified dead connection", "42000"), null),
+                          recovered)
+                : List.of(recovered);
 
-        Response response = dispatch(connMgr, 84, "get-schemas", "conn-id", 7);
+            Response response = dispatch(connMgr, 84, "get-schemas", "conn-id", 7);
 
-        assertTrue(response.ok);
-        assertEquals(1, connMgr.metadataReconnects);
-        assertEquals(List.of("APP", "REPORTING"), resultMap(response).get("schemas"));
+            if (retryFails) {
+                assertFalse(response.ok);
+                assertTrue(response.error.contains("unclassified dead connection"), response.error);
+                assertEquals(1, retryCalls.get());
+                assertEquals(2, connMgr.metadataReconnects,
+                    "retry failure must be offered to liveness-aware recovery");
+                response = dispatch(connMgr, 85, "get-schemas", "conn-id", 7);
+            }
+            assertTrue(response.ok);
+            assertEquals(List.of("RECOVERED"), resultMap(response).get("schemas"));
+            assertEquals(1, initialCalls.get());
+            assertEquals(1, recoveredCalls.get());
+            assertEquals(retryFails ? 2 : 1, connMgr.metadataReconnects);
+        }
+    }
+
+    @Test
+    void metadataRestoreFailuresInvalidateReplacementForNextRequest() throws Exception {
+        for (int failedRestore = 1; failedRestore <= 2; failedRestore++) {
+            RecordingConnectionManager connMgr = new RecordingConnectionManager();
+            AtomicInteger failedCalls = new AtomicInteger();
+            AtomicInteger wrongSchemaCalls = new AtomicInteger();
+            AtomicInteger recoveredCalls = new AtomicInteger();
+            Connection failed = metadataConnection(failedCalls,
+                new SQLException("ORA-12592: TNS:bad packet", "66000", 12592), null);
+            Connection wrongSchema = metadataConnection(wrongSchemaCalls, null, "WRONG");
+            Connection recovered = metadataConnection(recoveredCalls, null, "RECOVERED");
+            connMgr.metadataConnection = failed;
+            connMgr.metadataReplacements = failedRestore == 1
+                ? List.of(wrongSchema, recovered)
+                : List.of(failed, wrongSchema, recovered);
+            connMgr.currentSchemaFailureAtReconnect = failedRestore;
+            connMgr.currentSchemaFailure = new SQLException("schema restore failed", "42000");
+
+            Response response = dispatch(connMgr, 840 + failedRestore,
+                "get-schemas", "conn-id", 7);
+
+            assertFalse(response.ok);
+            assertTrue(response.error.contains(
+                failedRestore == 1 ? "schema restore failed" : "ORA-12592"), response.error);
+            assertEquals(failedRestore, failedCalls.get(),
+                "one request may run at most before and after one recovery");
+            assertEquals(failedRestore, connMgr.metadataReconnects);
+            assertEquals(0, wrongSchemaCalls.get(), "restore failure must precede dispatch");
+            assertEquals(1, connMgr.metadataInvalidations);
+
+            connMgr.currentSchemaFailure = null;
+            Response nextResponse = dispatch(connMgr, 850 + failedRestore,
+                "get-schemas", "conn-id", 7);
+
+            assertTrue(nextResponse.ok);
+            assertEquals(List.of("RECOVERED"), resultMap(nextResponse).get("schemas"));
+            assertEquals(0, wrongSchemaCalls.get(), "invalidated metadata must not be reused");
+            assertEquals(1, recoveredCalls.get());
+            assertEquals(failedRestore + 1, connMgr.metadataReconnects);
+        }
     }
 
     @Test
@@ -909,6 +963,22 @@ class DispatcherTest {
         assertTrue(response.error.contains("server closed connection"), response.error);
         assertFalse(isValidCalled[0], "execute must not add an isValid network round-trip");
         assertTrue(connMgr.disconnected, "SQLState 08 must poison the logical connection");
+
+        SQLException wrapper = new SQLException("statement failed", "42000");
+        wrapper.setNextException(new SQLException(
+            "ORA-12592: TNS:bad packet", "66000", 12592));
+        RecordingConnectionManager oracleConnMgr = new RecordingConnectionManager();
+        oracleConnMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement" -> throw wrapper;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        dispatch(oracleConnMgr, 190, "execute", "conn-id", 7, "sql", "SELECT 1 FROM dual");
+        assertTrue(oracleConnMgr.disconnected, "ORA-12592 must poison the logical connection");
     }
 
     @Test
@@ -2123,6 +2193,28 @@ class DispatcherTest {
             });
     }
 
+    private static Connection metadataConnection(
+            AtomicInteger calls, SQLException failure, String schema) {
+        Connection delegate = failure == null
+            ? metadataConnectionWithSchemas(List.of(schema))
+            : null;
+        return (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> {
+                    calls.incrementAndGet();
+                    if (failure != null) {
+                        throw failure;
+                    }
+                    yield delegate.getMetaData();
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
     private static Connection blockingMetadataConnectionWithSchemas(
             List<String> schemas, CountDownLatch started, CountDownLatch release) {
         DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
@@ -2285,9 +2377,13 @@ class DispatcherTest {
         private boolean autoCommit = true;
         private Connection connection;
         private Connection metadataConnection;
-        private Connection reconnectedMetadataConnection;
+        private List<Connection> metadataReplacements = List.of();
         private int metadataReconnects;
+        private int metadataInvalidations;
+        private boolean metadataInvalid;
         private SQLException connectFailure;
+        private int currentSchemaFailureAtReconnect = -1;
+        private SQLException currentSchemaFailure;
         private String currentSchema;
         private int primaryConnectionCalls;
         private volatile boolean disconnected;
@@ -2321,21 +2417,32 @@ class DispatcherTest {
         }
 
         @Override
-        public Connection getMetadata(int connId) {
+        public Connection getMetadata(int connId) throws SQLException {
             assertEquals(7, connId);
+            if (metadataInvalid) {
+                throw new SQLException("Metadata connection is invalid");
+            }
             return metadataConnection != null ? metadataConnection : connection;
         }
 
         @Override
         public boolean reconnectMetadataIfInvalid(int connId, SQLException failure) {
             assertEquals(7, connId);
-            if (reconnectedMetadataConnection == null) {
+            if (metadataReconnects >= metadataReplacements.size()) {
                 return false;
             }
-            assertTrue(failure.getSQLState().startsWith("08"));
-            metadataConnection = reconnectedMetadataConnection;
+            assertNotNull(failure);
+            metadataConnection = metadataReplacements.get(metadataReconnects);
             metadataReconnects++;
+            metadataInvalid = false;
             return true;
+        }
+
+        @Override
+        public void invalidateMetadata(int connId) {
+            assertEquals(7, connId);
+            metadataInvalid = true;
+            metadataInvalidations++;
         }
 
         @Override
@@ -2345,8 +2452,12 @@ class DispatcherTest {
         }
 
         @Override
-        public String currentSchema(int connId) {
+        public String currentSchema(int connId) throws SQLException {
             assertEquals(7, connId);
+            if (metadataReconnects == currentSchemaFailureAtReconnect
+                && currentSchemaFailure != null) {
+                throw currentSchemaFailure;
+            }
             return currentSchema;
         }
 

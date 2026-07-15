@@ -199,11 +199,32 @@ public class Dispatcher {
             return metadataOps.dispatch(req);
         } catch (SQLException error) {
             Integer connId = requestConnectionId(req);
-            if (connId != null && connMgr.reconnectMetadataIfInvalid(connId, error)) {
-                metadataOps.restoreCurrentSchema(connId);
-                return metadataOps.dispatch(req);
+            if (connId != null && recoverMetadata(connId, error)) {
+                try {
+                    return metadataOps.dispatch(req);
+                } catch (SQLException retryError) {
+                    try {
+                        recoverMetadata(connId, retryError);
+                    } catch (SQLException recoveryError) {
+                        retryError.addSuppressed(recoveryError);
+                    }
+                    throw retryError;
+                }
             }
             throw error;
+        }
+    }
+
+    private boolean recoverMetadata(int connId, SQLException failure) throws SQLException {
+        try {
+            if (!connMgr.reconnectMetadataIfInvalid(connId, failure)) {
+                return false;
+            }
+            metadataOps.restoreCurrentSchema(connId);
+            return true;
+        } catch (SQLException recoveryError) {
+            connMgr.invalidateMetadata(connId);
+            throw recoveryError;
         }
     }
 
@@ -619,25 +640,9 @@ public class Dispatcher {
     }
 
     private void poisonOnConnectionFailure(int connId, Throwable error) {
-        if (isConnectionFailure(error)) {
+        if (ConnectionManager.isConnectionFailure(error)) {
             poisonConnection(connId);
         }
-    }
-
-    private boolean isConnectionFailure(Throwable error) {
-        Throwable current = error;
-        while (current != null) {
-            if (current instanceof java.sql.SQLRecoverableException) {
-                return true;
-            }
-            if (current instanceof SQLException sqlException
-                && sqlException.getSQLState() != null
-                && sqlException.getSQLState().startsWith("08")) {
-                return true;
-            }
-            current = current.getCause();
-        }
-        return false;
     }
 
     private static ExecutorService newExecutePool() {

@@ -180,17 +180,7 @@ clutch-jdbc-agent (JVM process)
   drivers/*.jar           — JDBC drivers (loaded at runtime via URLClassLoader)
 ```
 
-The agent no longer runs requests on one global synchronous lane.  The stdin
-loop parses requests and hands them to a small request pool.  The dispatcher
-uses independent per-connection foreground and metadata locks, so ordinary
-queries and metadata may run in parallel without allowing two operations to
-race on either JDBC session. Schema changes and disconnect acquire both locks
-in foreground-then-metadata order. If the metadata session is closed by an idle
-timeout, the agent replaces only that session, restores the remembered schema,
-and retries the metadata request once; the primary transaction is untouched.
-`cancel` is the deliberate exception to serialization: it can
-arrive while `execute` or `fetch` is running, locate the live `Statement`, and
-call `Statement.cancel()` without tearing down the whole session.
+The agent no longer runs requests on one global synchronous lane. The stdin loop parses requests and hands them to a small request pool. The dispatcher uses independent per-connection foreground and metadata locks, so ordinary queries and metadata may run in parallel without allowing two operations to race on either JDBC session. Schema changes and disconnect acquire both locks in foreground-then-metadata order. If an idle timeout or Oracle `ORA-12592` makes the metadata session unsafe, the agent replaces only that session, restores the remembered schema, and retries the metadata request once; a failed retry or schema restore invalidates that replacement for the next request instead of reusing uncertain state. The primary transaction is untouched. `cancel` is the deliberate exception to serialization: it can arrive while `execute` or `fetch` is running, locate the live `Statement`, and call `Statement.cancel()` without tearing down the whole session.
 
 This is still intentionally much simpler than a fully async server: no
 connection pooling, no SQL rewriting, and no multi-statement scheduling inside
