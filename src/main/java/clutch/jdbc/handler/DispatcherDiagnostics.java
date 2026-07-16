@@ -44,10 +44,13 @@ final class DispatcherDiagnostics {
 
     private final Set<String> metadataOps;
     private final ThreadLocal<String> generatedSqlContext;
+    private final ThreadLocal<Boolean> executionNotStartedContext;
 
-    DispatcherDiagnostics(Set<String> metadataOps, ThreadLocal<String> generatedSqlContext) {
+    DispatcherDiagnostics(Set<String> metadataOps, ThreadLocal<String> generatedSqlContext,
+                          ThreadLocal<Boolean> executionNotStartedContext) {
         this.metadataOps = metadataOps;
         this.generatedSqlContext = generatedSqlContext;
+        this.executionNotStartedContext = executionNotStartedContext;
     }
 
     String requestErrorMessage(Request req, Exception e) {
@@ -66,7 +69,7 @@ final class DispatcherDiagnostics {
         }
         return switch (req.op) {
             case "connect" -> "connect";
-            case "execute" -> "query";
+            case "execute", "execute-params" -> "query";
             case "fetch" -> "fetch";
             case "cancel" -> "cancel";
             default -> "internal";
@@ -93,6 +96,9 @@ final class DispatcherDiagnostics {
             "sql-state", sqlState(throwable),
             "vendor-code", vendorCode(throwable),
             "connection-invalidated", connectionInvalidated ? Boolean.TRUE : null,
+            "execution-not-started",
+                connectionInvalidated && Boolean.TRUE.equals(executionNotStartedContext.get())
+                    ? Boolean.TRUE : null,
             "raw-message", raw,
             "cause-chain", causeChain.isEmpty() ? null : causeChain,
             "context", context.isEmpty() ? null : context);
@@ -175,7 +181,7 @@ final class DispatcherDiagnostics {
                 "connect-timeout-seconds", optionalIntParam(req, "connect-timeout-seconds"),
                 "network-timeout-seconds", optionalIntParam(req, "network-timeout-seconds"));
         }
-        if ("execute".equals(req.op)) {
+        if ("execute".equals(req.op) || "execute-params".equals(req.op)) {
             String sql = (String) req.params.get("sql");
             return entryMap(
                 "sql-length", sql != null ? sql.length() : null,
