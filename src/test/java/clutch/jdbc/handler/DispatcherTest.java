@@ -42,6 +42,16 @@ class DispatcherTest {
 
     private static final String DRIVER_CLASS = "com.example.Driver";
 
+    private record ConnectRedactionCase(
+            String name, SQLException failure, String url, String user, String password,
+            Map<String, String> props, List<String> visibleError,
+            List<String> visibleDiagnostics, List<String> hidden) {
+        @Override
+        public String toString() {
+            return name;
+        }
+    }
+
     @ParameterizedTest
     @MethodSource("connectCases")
     void connectForwardsExplicitTimeouts(String url, String user, String password,
@@ -225,194 +235,102 @@ class DispatcherTest {
         assertFalse(Objects.toString(diag.get("cause-chain"), "").contains("cookie-secret-62"));
     }
 
-    @Test
-    void connectDiagnosticsRedactDb2AndOracleCredentialUrls() throws Exception {
-        List<String> urls = List.of(
-            "jdbc:db2://db.local:50000/sample:user=report;password=db2-secret-63;sslConnection=true;",
-            "jdbc:oracle:thin:report/oracle-secret-63@//db.local:1521/ORCL"
-        );
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("connectRedactionCases")
+    void connectDiagnosticsRedactSecretsWithoutHidingIdentifiers(
+            ConnectRedactionCase testCase) throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connectFailure = testCase.failure();
 
-        for (int index = 0; index < urls.size(); index++) {
-            String url = urls.get(index);
-            RecordingConnectionManager connMgr = new RecordingConnectionManager();
-            connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
-                "connect failed for " + url, "08001");
+        Response response = dispatch(connMgr, 70, "connect",
+            "url", testCase.url(),
+            "driver-class", DRIVER_CLASS,
+            "user", testCase.user(),
+            "password", testCase.password(),
+            "props", testCase.props());
 
-            Response response = dispatch(connMgr, 630 + index, "connect",
-                "url", url,
-                "driver-class", DRIVER_CLASS,
-                "user", "report",
-                "props", Map.of());
-
-            assertFalse(response.ok);
-            String rendered = response.error + " " + diagMap(response);
-            assertFalse(rendered.contains("db2-secret-63"), rendered);
-            assertFalse(rendered.contains("oracle-secret-63"), rendered);
-            assertTrue(rendered.contains("<redacted>"), rendered);
+        assertFalse(response.ok);
+        for (String visible : testCase.visibleError()) {
+            assertTrue(response.error.contains(visible),
+                testCase.name() + ": expected visible error text " + visible);
+        }
+        String rendered = response.error + " " + diagMap(response);
+        for (String visible : testCase.visibleDiagnostics()) {
+            assertTrue(rendered.contains(visible),
+                testCase.name() + ": expected visible diagnostic text " + visible);
+        }
+        for (String hidden : testCase.hidden()) {
+            assertFalse(rendered.contains(hidden),
+                testCase.name() + ": leaked secret " + hidden);
         }
     }
 
-    @Test
-    void shortPasswordDoesNotOverRedactDiagnosticText() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
-        // Exception message deliberately contains the word "test" in diagnostic context
-        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
-            "test connection refused by testdb host",
-            "08001",
-            new java.net.ConnectException("Connection to test-server timed out"));
-
-        Response response = dispatch(connMgr, 70, "connect",
-            "url", "jdbc:postgresql://localhost:5432/testdb?password=secret-70&sslmode=require",
-            "driver-class", DRIVER_CLASS,
-            "user", "testuser",
-            "password", "test",
-            "props", Map.of());
-
-        assertFalse(response.ok);
-        // The word "test" must NOT be redacted in diagnostic text
-        assertTrue(response.error.contains("test connection refused"),
-            "diagnostic text 'test connection refused' should not be over-redacted");
-        assertTrue(response.error.contains("testdb"),
-            "database name 'testdb' should not be over-redacted");
-        assertTrue(response.error.contains("test-server"),
-            "hostname 'test-server' should not be over-redacted");
-        // But the URL password must still be redacted
-        Map<String, Object> diag70 = diagMap(response);
-        @SuppressWarnings("unchecked")
-        Map<String, Object> ctx70 = (Map<String, Object>) diag70.get("context");
-        String redactedUrl70 = (String) ctx70.get("redacted-url");
-        assertTrue(redactedUrl70.contains("?password=<redacted>"),
-            "redacted URL must preserve '?' delimiter");
-        assertFalse(redactedUrl70.contains("secret-70"));
-        assertTrue(redactedUrl70.contains("sslmode=require"),
-            "non-secret URL parameter 'sslmode=require' must be preserved");
-    }
-
-    @Test
-    void urlSecretsStillRedactedWithNewSanitization() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
-        String url = "jdbc:mysql://db:3306/app?password=secret-71&token=tok-71-value&ssl=true";
-        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
-            "Access denied: " + url,
-            "28000");
-
-        Response response = dispatch(connMgr, 71, "connect",
-            "url", url,
-            "driver-class", DRIVER_CLASS,
-            "user", "admin",
-            "password", "admin-pass-71",
-            "props", Map.of());
-
-        assertFalse(response.ok);
-        assertFalse(response.error.contains("secret-71"),
-            "URL password value must be redacted from error text");
-        assertFalse(response.error.contains("tok-71-value"),
-            "URL token value must be redacted from error text");
-        Map<String, Object> diag71 = diagMap(response);
-        assertFalse(Objects.toString(diag71.get("raw-message"), "").contains("secret-71"));
-        assertFalse(Objects.toString(diag71.get("raw-message"), "").contains("tok-71-value"));
-    }
-
-    @Test
-    void cookieValuesRedactedWithNewSanitization() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
-        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
-            "auth failed cookie session-cookie-72 token: header-token-72",
-            "28000",
-            new SQLException("root cookie session-cookie-72"));
-
-        Response response = dispatch(connMgr, 72, "connect",
-            "url", "jdbc:clickhouse://127.0.0.1:8123/db",
-            "driver-class", DRIVER_CLASS,
-            "user", "user",
-            "password", "pw-72-longenough",
-            "props", Map.of("http_header_COOKIE", "session-cookie-72",
-                            "http_header_Authorization", "header-token-72",
-                            "socket_timeout", "10"));
-
-        assertFalse(response.ok);
-        assertFalse(response.error.contains("session-cookie-72"),
-            "cookie value must be redacted from error text");
-        assertFalse(response.error.contains("header-token-72"),
-            "authorization header value must be redacted from error text");
-        Map<String, Object> diag72 = diagMap(response);
-        assertFalse(Objects.toString(diag72.get("cause-chain"), "").contains("session-cookie-72"));
-    }
-
-    @Test
-    void nonSensitiveMetadataNotRedacted() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
-        // Exception references schema/table names that happen to contain secret-like substrings
-        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
-            "Cannot find catalog 'tokenizer_db' schema 'auth_service' table 'credentials_log'",
-            "42000");
-
-        Response response = dispatch(connMgr, 73, "connect",
-            "url", "jdbc:postgresql://localhost/tokenizer_db",
-            "driver-class", DRIVER_CLASS,
-            "user", "app",
-            "password", "real-secret-73-pwd",
-            "props", Map.of());
-
-        assertFalse(response.ok);
-        // These identifiers contain substrings of secret key names but are NOT secrets
-        assertTrue(response.error.contains("tokenizer_db"),
-            "catalog name 'tokenizer_db' must not be redacted");
-        assertTrue(response.error.contains("auth_service"),
-            "schema name 'auth_service' must not be redacted");
-        assertTrue(response.error.contains("credentials_log"),
-            "table name 'credentials_log' must not be redacted");
-    }
-
-    @Test
-    void longSecretInsideSnakeOrKebabIdentifierNotOverRedacted() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
-        // Password is a long value that also appears as a prefix in identifiers
-        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
-            "Cannot find table 'warehouse01_orders' on host warehouse01-db.local",
-            "42000");
-
-        Response response = dispatch(connMgr, 74, "connect",
-            "url", "jdbc:postgresql://warehouse01-db.local/app",
-            "driver-class", DRIVER_CLASS,
-            "user", "app",
-            "password", "warehouse01",
-            "props", Map.of());
-
-        assertFalse(response.ok);
-        assertTrue(response.error.contains("warehouse01_orders"),
-            "snake_case identifier containing the password must not be over-redacted");
-        assertTrue(response.error.contains("warehouse01-db"),
-            "kebab-case hostname containing the password must not be over-redacted");
-    }
-
-    @Test
-    void shortPrefixedSecretKeysStillRedactValues() throws Exception {
-        RecordingConnectionManager connMgr = new RecordingConnectionManager();
-        connMgr.connectFailure = new java.sql.SQLNonTransientConnectionException(
-            "connect failed http_header_COOKIE=abc123 proxyAuthorization: xyz789",
-            "28000",
-            new SQLException("root http_header_COOKIE=abc123 proxyAuthorization: xyz789"));
-
-        Response response = dispatch(connMgr, 75, "connect",
-            "url", "jdbc:clickhouse://127.0.0.1:8123/db",
-            "driver-class", DRIVER_CLASS,
-            "user", "user",
-            "password", "pw-75-longenough",
-            "props", Map.of("http_header_COOKIE", "abc123",
-                            "proxyAuthorization", "xyz789",
-                            "socket_timeout", "10"));
-
-        assertFalse(response.ok);
-        assertFalse(response.error.contains("abc123"),
-            "short cookie value must be redacted from error text");
-        assertFalse(response.error.contains("xyz789"),
-            "short authorization value must be redacted from error text");
-        Map<String, Object> diag75 = diagMap(response);
-        assertFalse(Objects.toString(diag75.get("raw-message"), "").contains("abc123"));
-        assertFalse(Objects.toString(diag75.get("raw-message"), "").contains("xyz789"));
-        assertFalse(Objects.toString(diag75.get("cause-chain"), "").contains("abc123"));
-        assertFalse(Objects.toString(diag75.get("cause-chain"), "").contains("xyz789"));
+    private static Stream<ConnectRedactionCase> connectRedactionCases() {
+        String db2Url =
+            "jdbc:db2://db.local:50000/sample:user=report;password=db2-secret-63;sslConnection=true;";
+        String oracleUrl =
+            "jdbc:oracle:thin:report/oracle-secret-63@//db.local:1521/ORCL";
+        String mysqlUrl =
+            "jdbc:mysql://db:3306/app?password=secret-71&token=tok-71-value&ssl=true";
+        return Stream.of(
+            new ConnectRedactionCase(
+                "DB2 credential URL",
+                new java.sql.SQLNonTransientConnectionException("connect failed for " + db2Url, "08001"),
+                db2Url, "report", null, Map.of(), List.of(), List.of("<redacted>"),
+                List.of("db2-secret-63")),
+            new ConnectRedactionCase(
+                "Oracle credential URL",
+                new java.sql.SQLNonTransientConnectionException("connect failed for " + oracleUrl, "08001"),
+                oracleUrl, "report", null, Map.of(), List.of(), List.of("<redacted>"),
+                List.of("oracle-secret-63")),
+            new ConnectRedactionCase(
+                "short password and URL secret",
+                new java.sql.SQLNonTransientConnectionException(
+                    "test connection refused by testdb host", "08001",
+                    new java.net.ConnectException("Connection to test-server timed out")),
+                "jdbc:postgresql://localhost:5432/testdb?password=secret-70&sslmode=require",
+                "testuser", "test", Map.of(),
+                List.of("test connection refused", "testdb", "test-server"),
+                List.of("?password=<redacted>", "sslmode=require"), List.of("secret-70")),
+            new ConnectRedactionCase(
+                "URL query secrets",
+                new java.sql.SQLNonTransientConnectionException("Access denied: " + mysqlUrl, "28000"),
+                mysqlUrl, "admin", "admin-pass-71", Map.of(), List.of(),
+                List.of("<redacted>", "ssl=true"), List.of("secret-71", "tok-71-value")),
+            new ConnectRedactionCase(
+                "header property secrets",
+                new java.sql.SQLNonTransientConnectionException(
+                    "auth failed cookie session-cookie-72 token: header-token-72", "28000",
+                    new SQLException("root cookie session-cookie-72")),
+                "jdbc:clickhouse://127.0.0.1:8123/db", "user", "pw-72-longenough",
+                Map.of("http_header_COOKIE", "session-cookie-72",
+                       "http_header_Authorization", "header-token-72", "socket_timeout", "10"),
+                List.of(), List.of("socket_timeout"),
+                List.of("session-cookie-72", "header-token-72")),
+            new ConnectRedactionCase(
+                "secret-like metadata identifiers",
+                new java.sql.SQLNonTransientConnectionException(
+                    "Cannot find catalog 'tokenizer_db' schema 'auth_service' table 'credentials_log'",
+                    "42000"),
+                "jdbc:postgresql://localhost/tokenizer_db", "app", "real-secret-73-pwd",
+                Map.of(), List.of("tokenizer_db", "auth_service", "credentials_log"),
+                List.of(), List.of("real-secret-73-pwd")),
+            new ConnectRedactionCase(
+                "secret inside identifier boundaries",
+                new java.sql.SQLNonTransientConnectionException(
+                    "Cannot find table 'warehouse01_orders' on host warehouse01-db.local", "42000"),
+                "jdbc:postgresql://warehouse01-db.local/app", "app", "warehouse01", Map.of(),
+                List.of("warehouse01_orders", "warehouse01-db"), List.of(), List.of()),
+            new ConnectRedactionCase(
+                "short prefixed property secrets",
+                new java.sql.SQLNonTransientConnectionException(
+                    "connect failed http_header_COOKIE=abc123 proxyAuthorization: xyz789", "28000",
+                    new SQLException("root http_header_COOKIE=abc123 proxyAuthorization: xyz789")),
+                "jdbc:clickhouse://127.0.0.1:8123/db", "user", "pw-75-longenough",
+                Map.of("http_header_COOKIE", "abc123", "proxyAuthorization", "xyz789",
+                       "socket_timeout", "10"),
+                List.of(), List.of("<redacted>"), List.of("abc123", "xyz789"))
+        );
     }
 
     @Test

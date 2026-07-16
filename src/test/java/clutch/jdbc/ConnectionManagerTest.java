@@ -83,6 +83,34 @@ class ConnectionManagerTest {
     }
 
     @Test
+    void connectFailsWhenManualCommitIsUnsupported() throws Exception {
+        for (Throwable unsupported : List.of(
+                new SQLFeatureNotSupportedException("setAutoCommit unsupported"),
+                new AbstractMethodError("legacy setAutoCommit"))) {
+            RecordingDriver driver = new RecordingDriver();
+            driver.primarySetAutoCommitFailure = unsupported;
+            DriverManager.registerDriver(driver);
+            ConnectionManager mgr = new ConnectionManager();
+            try {
+                SQLException failure = assertThrows(SQLException.class,
+                    () -> mgr.connect("jdbc:test:manual-commit-unsupported", "analyst", "secret",
+                        Map.of(), null, null, null, false,
+                        RecordingDriver.class.getName()));
+
+                assertTrue(failure.getMessage().contains("setAutoCommit")
+                    || failure.getMessage().contains("manual commit"));
+                assertEquals(1, driver.connectCount,
+                    "metadata connection must not open after manual-commit setup fails");
+                assertEquals(1, driver.closedCount,
+                    "failed primary connection must be closed");
+            } finally {
+                mgr.disconnectAll();
+                DriverManager.deregisterDriver(driver);
+            }
+        }
+    }
+
+    @Test
     void connectIgnoresUnsupportedOptionalConnectionTuning() throws Exception {
         RecordingDriver driver = new RecordingDriver();
         driver.throwOnSetAutoCommit = true;
@@ -92,7 +120,7 @@ class ConnectionManagerTest {
         try {
             ConnectionManager mgr = new ConnectionManager();
             int connId = mgr.connect("jdbc:test:fallbacks", "svc_user", "pw",
-                Map.of("module", "sync"), 5, 13, null, false,
+                Map.of("module", "sync"), 5, 13, null, true,
                 RecordingDriver.class.getName());
             assertEquals(1, connId);
             assertEquals("jdbc:test:fallbacks", driver.seenUrl);
@@ -148,7 +176,7 @@ class ConnectionManagerTest {
             Connection primary = mgr.getPrimary(connId);
             Connection failedMetadata = mgr.getMetadata(connId);
 
-            assertTrue(mgr.reconnectMetadataIfInvalid(connId));
+            assertTrue(mgr.reconnectMetadataIfInvalid(connId, null));
             assertEquals(3, driver.connectCount);
             assertNotSame(failedMetadata, mgr.getMetadata(connId));
             assertSame(primary, mgr.getPrimary(connId));
@@ -160,7 +188,7 @@ class ConnectionManagerTest {
                 SQLException.class, () -> mgr.getMetadata(connId));
             assertTrue(invalid.getMessage().contains("Metadata connection is invalid"));
             assertSame(primary, mgr.getPrimary(connId));
-            assertTrue(mgr.reconnectMetadataIfInvalid(connId));
+            assertTrue(mgr.reconnectMetadataIfInvalid(connId, null));
             assertEquals(4, driver.connectCount);
 
             mgr.disconnect(connId);
@@ -370,6 +398,32 @@ class ConnectionManagerTest {
         }
     }
 
+    @Test
+    void unsupportedMetadataValidationKeepsOpenSessionAfterOrdinaryError() throws Exception {
+        for (Throwable unsupported : List.of(
+                new SQLFeatureNotSupportedException("isValid unsupported"),
+                new AbstractMethodError("legacy isValid"))) {
+            RecordingDriver driver = new RecordingDriver();
+            driver.metadataValidationFailure = unsupported;
+            DriverManager.registerDriver(driver);
+            try {
+                ConnectionManager mgr = new ConnectionManager();
+                int connId = mgr.connect("jdbc:test:metadata-validation-unsupported",
+                    "reader", "secret", Map.of(), null, null, null, true,
+                    RecordingDriver.class.getName());
+                Connection metadata = mgr.getMetadata(connId);
+
+                assertFalse(mgr.reconnectMetadataIfInvalid(connId,
+                    new SQLException("ordinary metadata query error", "42000")));
+                assertSame(metadata, mgr.getMetadata(connId));
+                assertEquals(2, driver.connectCount);
+                mgr.disconnectAll();
+            } finally {
+                DriverManager.deregisterDriver(driver);
+            }
+        }
+    }
+
     private static void awaitClosedCount(RecordingDriver driver, int expected)
             throws InterruptedException {
         long deadline = System.nanoTime() + 1_000_000_000L;
@@ -391,6 +445,8 @@ class ConnectionManagerTest {
         private int primaryValidationTimeoutSeconds;
         private boolean primaryValidationResult = true;
         private Throwable primaryValidationFailure;
+        private Throwable primarySetAutoCommitFailure;
+        private Throwable metadataValidationFailure;
         private boolean metadataReadOnly;
         private int connectCount;
         private volatile int closedCount;
@@ -425,6 +481,9 @@ class ConnectionManagerTest {
                         yield null;
                     }
                     case "setAutoCommit" -> {
+                        if (!metadata && primarySetAutoCommitFailure != null) {
+                            throw primarySetAutoCommitFailure;
+                        }
                         if (throwOnSetAutoCommit) {
                             throw new SQLFeatureNotSupportedException("setAutoCommit");
                         }
@@ -460,6 +519,9 @@ class ConnectionManagerTest {
                                 throw primaryValidationFailure;
                             }
                             yield primaryValidationResult;
+                        }
+                        if (metadataValidationFailure != null) {
+                            throw metadataValidationFailure;
                         }
                         yield connectionNumber != invalidMetadataConnectionNumber;
                     }
