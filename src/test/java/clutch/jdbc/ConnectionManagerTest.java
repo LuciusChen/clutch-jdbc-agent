@@ -10,6 +10,10 @@ import java.sql.DriverPropertyInfo;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLException;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -39,7 +43,8 @@ class ConnectionManagerTest {
         try {
             ConnectionManager mgr = new ConnectionManager();
             int connId = mgr.connect("jdbc:test:inventory", "scott", "tiger",
-                Map.of("role", "reporting"), 7, 11, true, RecordingDriver.class.getName());
+                Map.of("role", "reporting"), 7, 11, null, true,
+                RecordingDriver.class.getName());
             assertEquals(1, connId);
             assertEquals("jdbc:test:inventory", driver.seenUrl);
             assertEquals(2, driver.connectCount);
@@ -64,7 +69,7 @@ class ConnectionManagerTest {
         try {
             ConnectionManager mgr = new ConnectionManager();
             int connId = mgr.connect("jdbc:test:manual-commit", "analyst", "secret",
-                Map.of("applicationName", "clutch"), null, null, false,
+                Map.of("applicationName", "clutch"), null, null, null, false,
                 RecordingDriver.class.getName());
             assertEquals(1, connId);
             assertEquals("jdbc:test:manual-commit", driver.seenUrl);
@@ -87,7 +92,8 @@ class ConnectionManagerTest {
         try {
             ConnectionManager mgr = new ConnectionManager();
             int connId = mgr.connect("jdbc:test:fallbacks", "svc_user", "pw",
-                Map.of("module", "sync"), 5, 13, false, RecordingDriver.class.getName());
+                Map.of("module", "sync"), 5, 13, null, false,
+                RecordingDriver.class.getName());
             assertEquals(1, connId);
             assertEquals("jdbc:test:fallbacks", driver.seenUrl);
             assertEquals(2, driver.connectCount);
@@ -107,7 +113,7 @@ class ConnectionManagerTest {
         try {
             ConnectionManager mgr = new ConnectionManager();
             int connId = mgr.connect("jdbc:test:explicit", "svc_user", "pw",
-                Map.of(), null, null, true, RecordingDriver.class.getName());
+                Map.of(), null, null, null, true, RecordingDriver.class.getName());
 
             assertEquals(1, connId);
             assertEquals(0, poison.connectCount);
@@ -124,7 +130,7 @@ class ConnectionManagerTest {
         ConnectionManager mgr = new ConnectionManager();
         SQLException error = assertThrows(SQLException.class,
             () -> mgr.connect("jdbc:test:missing", "svc_user", "pw",
-                Map.of(), null, null, true, "example.MissingDriver"));
+                Map.of(), null, null, null, true, "example.MissingDriver"));
 
         assertTrue(error.getMessage().contains("not registered"));
     }
@@ -137,7 +143,7 @@ class ConnectionManagerTest {
         try {
             ConnectionManager mgr = new ConnectionManager();
             int connId = mgr.connect("jdbc:test:metadata-recovery", "reader", "secret",
-                Map.of("role", "reporting"), 5, 9, false,
+                Map.of("role", "reporting"), 5, 9, null, false,
                 RecordingDriver.class.getName());
             Connection primary = mgr.getPrimary(connId);
             Connection failedMetadata = mgr.getMetadata(connId);
@@ -197,7 +203,7 @@ class ConnectionManagerTest {
         try {
             ConnectionManager mgr = new ConnectionManager();
             int connId = mgr.connect("jdbc:test:poison", "reader", "secret",
-                Map.of(), null, null, true, RecordingDriver.class.getName());
+                Map.of(), null, null, null, true, RecordingDriver.class.getName());
 
             assertTrue(mgr.hasConnection(connId));
             mgr.poison(connId);
@@ -223,7 +229,7 @@ class ConnectionManagerTest {
             ExecutorService executor = Executors.newSingleThreadExecutor();
             try {
                 int connId = mgr.connect("jdbc:test:metadata-detach", "reader", "secret",
-                    Map.of(), null, null, true, RecordingDriver.class.getName());
+                    Map.of(), null, null, null, true, RecordingDriver.class.getName());
                 Connection primary = mgr.getPrimary(connId);
                 Connection oldMetadata = mgr.getMetadata(connId);
 
@@ -253,6 +259,117 @@ class ConnectionManagerTest {
         }
     }
 
+    @Test
+    void primaryValidationUsesSessionWallClockAndForegroundActivity() throws Exception {
+        MutableClock clock = new MutableClock();
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(clock);
+            int connId = mgr.connect("jdbc:test:idle-validation", "reader", "secret",
+                Map.of(), null, null, 300, false, RecordingDriver.class.getName());
+            int setAutoCommitCalls = driver.primarySetAutoCommitCalls;
+
+            clock.advanceSeconds(299);
+            assertTrue(mgr.validatePrimaryIfIdle(connId, 3));
+            assertEquals(0, driver.primaryValidationCalls);
+
+            mgr.getMetadata(connId);
+            clock.advanceSeconds(1);
+            assertTrue(mgr.validatePrimaryIfIdle(connId, 3));
+            assertEquals(1, driver.primaryValidationCalls,
+                "metadata access must not refresh primary activity");
+            assertEquals(3, driver.primaryValidationTimeoutSeconds);
+            assertEquals(setAutoCommitCalls, driver.primarySetAutoCommitCalls);
+            assertEquals(0, driver.primaryCommitCalls);
+            assertEquals(0, driver.primaryRollbackCalls);
+
+            mgr.getPrimary(connId);
+            clock.advanceSeconds(299);
+            assertTrue(mgr.validatePrimaryIfIdle(connId, 3));
+            assertEquals(1, driver.primaryValidationCalls);
+            clock.advanceSeconds(1);
+            assertTrue(mgr.validatePrimaryIfIdle(connId, 3));
+            assertEquals(2, driver.primaryValidationCalls);
+            mgr.disconnectAll();
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void disabledPrimaryValidationNeverCallsDriver() throws Exception {
+        for (Integer threshold : java.util.Arrays.asList(null, 0)) {
+            MutableClock clock = new MutableClock();
+            RecordingDriver driver = new RecordingDriver();
+            DriverManager.registerDriver(driver);
+            try {
+                ConnectionManager mgr = new ConnectionManager(clock);
+                int connId = mgr.connect("jdbc:test:validation-disabled", "reader", "secret",
+                    Map.of(), null, null, threshold, true,
+                    RecordingDriver.class.getName());
+
+                clock.advanceSeconds(86_400);
+                assertTrue(mgr.validatePrimaryIfIdle(connId, 3));
+                assertEquals(0, driver.primaryValidationCalls);
+                mgr.poison(connId);
+                SQLException unknown = assertThrows(
+                    SQLException.class, () -> mgr.validatePrimaryIfIdle(connId, 3));
+                assertTrue(unknown.getMessage().contains("Unknown connection id"));
+                assertEquals(0, driver.primaryValidationCalls,
+                    "authoritative lookup must precede the disabled threshold check");
+                mgr.disconnectAll();
+            } finally {
+                DriverManager.deregisterDriver(driver);
+            }
+        }
+    }
+
+    @Test
+    void unsupportedPrimaryValidationIsSkippedButOtherErrorsPropagate() throws Exception {
+        for (Throwable unsupported : List.of(
+                new SQLFeatureNotSupportedException("isValid unsupported"),
+                new AbstractMethodError("legacy isValid"))) {
+            MutableClock clock = new MutableClock();
+            RecordingDriver driver = new RecordingDriver();
+            driver.primaryValidationFailure = unsupported;
+            DriverManager.registerDriver(driver);
+            try {
+                ConnectionManager mgr = new ConnectionManager(clock);
+                int connId = mgr.connect("jdbc:test:validation-unsupported", "reader", "secret",
+                    Map.of(), null, null, 1, true, RecordingDriver.class.getName());
+                clock.advanceSeconds(1);
+
+                assertTrue(mgr.validatePrimaryIfIdle(connId, 3));
+                assertEquals(1, driver.primaryValidationCalls);
+                assertTrue(mgr.hasConnection(connId));
+                mgr.disconnectAll();
+            } finally {
+                DriverManager.deregisterDriver(driver);
+            }
+        }
+
+        MutableClock clock = new MutableClock();
+        RecordingDriver driver = new RecordingDriver();
+        driver.primaryValidationFailure = new SQLException("generic validation failure", "HY000");
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(clock);
+            int connId = mgr.connect("jdbc:test:validation-error", "reader", "secret",
+                Map.of(), null, null, 1, true, RecordingDriver.class.getName());
+            clock.advanceSeconds(1);
+
+            SQLException failure = assertThrows(
+                SQLException.class, () -> mgr.validatePrimaryIfIdle(connId, 3));
+            assertEquals("HY000", failure.getSQLState());
+            assertTrue(mgr.hasConnection(connId),
+                "ConnectionManager reports validation; Dispatcher owns poisoning");
+            mgr.disconnectAll();
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
     private static void awaitClosedCount(RecordingDriver driver, int expected)
             throws InterruptedException {
         long deadline = System.nanoTime() + 1_000_000_000L;
@@ -267,6 +384,13 @@ class ConnectionManagerTest {
         private Properties seenProps;
         private int seenNetworkTimeoutMillis = -1;
         private boolean primaryAutoCommitDisabled;
+        private int primarySetAutoCommitCalls;
+        private int primaryCommitCalls;
+        private int primaryRollbackCalls;
+        private int primaryValidationCalls;
+        private int primaryValidationTimeoutSeconds;
+        private boolean primaryValidationResult = true;
+        private Throwable primaryValidationFailure;
         private boolean metadataReadOnly;
         private int connectCount;
         private volatile int closedCount;
@@ -305,6 +429,7 @@ class ConnectionManagerTest {
                             throw new SQLFeatureNotSupportedException("setAutoCommit");
                         }
                         if (!metadata) {
+                            primarySetAutoCommitCalls++;
                             primaryAutoCommitDisabled = !((Boolean) args[0]);
                         }
                         yield null;
@@ -318,8 +443,26 @@ class ConnectionManagerTest {
                         }
                         yield null;
                     }
+                    case "commit" -> {
+                        if (!metadata) primaryCommitCalls++;
+                        yield null;
+                    }
+                    case "rollback" -> {
+                        if (!metadata) primaryRollbackCalls++;
+                        yield null;
+                    }
                     case "isClosed" -> false;
-                    case "isValid" -> connectionNumber != invalidMetadataConnectionNumber;
+                    case "isValid" -> {
+                        if (!metadata) {
+                            primaryValidationCalls++;
+                            primaryValidationTimeoutSeconds = (Integer) args[0];
+                            if (primaryValidationFailure != null) {
+                                throw primaryValidationFailure;
+                            }
+                            yield primaryValidationResult;
+                        }
+                        yield connectionNumber != invalidMetadataConnectionNumber;
+                    }
                     case "close" -> {
                         if (metadata && blockMetadataClose) {
                             metadataCloseStarted.countDown();
@@ -368,6 +511,29 @@ class ConnectionManagerTest {
         @Override
         public Logger getParentLogger() {
             return Logger.getGlobal();
+        }
+    }
+
+    private static final class MutableClock extends Clock {
+        private Instant instant = Instant.parse("2026-01-01T00:00:00Z");
+
+        private void advanceSeconds(long seconds) {
+            instant = instant.plusSeconds(seconds);
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return instant;
         }
     }
 

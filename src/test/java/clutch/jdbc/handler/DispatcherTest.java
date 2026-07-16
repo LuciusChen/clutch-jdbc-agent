@@ -60,6 +60,7 @@ class DispatcherTest {
             "props", props,
             "connect-timeout-seconds", connectTimeoutSeconds,
             "network-timeout-seconds", networkTimeoutSeconds,
+            "validate-after-idle-seconds", 300,
             "auto-commit", autoCommit);
 
         assertTrue(response.ok);
@@ -70,6 +71,7 @@ class DispatcherTest {
         assertEquals(props, connMgr.props);
         assertEquals(connectTimeoutSeconds, connMgr.connectTimeoutSeconds);
         assertEquals(networkTimeoutSeconds, connMgr.networkTimeoutSeconds);
+        assertEquals(300, connMgr.validateAfterIdleSeconds);
         assertEquals(autoCommit, connMgr.autoCommit);
         assertEquals(returnedConnId, ((Number) ((Map<?, ?>) response.result).get("conn-id")).intValue());
     }
@@ -503,6 +505,48 @@ class DispatcherTest {
         assertFalse(response.ok);
         assertTrue(response.error.contains("connect-timeout-seconds"), response.error);
         assertNull(connMgr.url, "invalid timeout must fail before ConnectionManager.connect");
+    }
+
+    @Test
+    void connectRejectsNegativeValidationIdleThreshold() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+
+        Response response = dispatch(connMgr, 823, "connect",
+            "url", "jdbc:test:demo",
+            "driver-class", DRIVER_CLASS,
+            "validate-after-idle-seconds", -1);
+
+        assertFalse(response.ok);
+        assertTrue(response.error.contains("validate-after-idle-seconds"), response.error);
+        assertNull(connMgr.url, "invalid threshold must fail before ConnectionManager.connect");
+    }
+
+    @ParameterizedTest
+    @MethodSource("nonExactIntegerParams")
+    void connectRejectsNonExactValidationIdleThreshold(Object threshold) throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+
+        Response response = dispatch(connMgr, 825, "connect",
+            "url", "jdbc:test:demo",
+            "driver-class", DRIVER_CLASS,
+            "validate-after-idle-seconds", threshold);
+
+        assertFalse(response.ok);
+        assertTrue(response.error.contains("validate-after-idle-seconds"), response.error);
+        assertNull(connMgr.url, "invalid threshold must fail before ConnectionManager.connect");
+    }
+
+    @Test
+    void connectAcceptsDisabledValidationIdleThreshold() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+
+        Response response = dispatch(connMgr, 826, "connect",
+            "url", "jdbc:test:demo",
+            "driver-class", DRIVER_CLASS,
+            "validate-after-idle-seconds", 0);
+
+        assertTrue(response.ok);
+        assertEquals(0, connMgr.validateAfterIdleSeconds);
     }
 
     @ParameterizedTest
@@ -1235,6 +1279,113 @@ class DispatcherTest {
             oracleConnMgr, 190, "execute", "conn-id", 7, "sql", "SELECT 1 FROM dual");
         assertEquals(Boolean.TRUE, diagMap(oracleResponse).get("connection-invalidated"));
         assertTrue(oracleConnMgr.disconnected, "ORA-12592 must poison the logical connection");
+    }
+
+    @ParameterizedTest
+    @MethodSource("foregroundPreflightFailures")
+    void idleInvalidPrimaryStopsBeforeStatementCreation(String op, Throwable validationFailure)
+            throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.primaryValidationResult = false;
+        connMgr.primaryValidationFailure = validationFailure;
+        boolean[] statementCreated = {false};
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement", "prepareStatement" -> {
+                    statementCreated[0] = true;
+                    throw new SQLException("statement must not be created during failed preflight");
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Request request = request(824, op,
+            "conn-id", 7,
+            "sql", "UPDATE demo SET x = 1");
+        if ("execute-params".equals(op)) {
+            request.params.put("values", List.of());
+        }
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response response = dispatcher.dispatch(request);
+
+            assertFalse(response.ok);
+            assertEquals(1, connMgr.primaryValidationCalls);
+            assertEquals(3, connMgr.primaryValidationTimeoutSeconds);
+            assertFalse(statementCreated[0]);
+            assertTrue(connMgr.disconnected);
+            assertEquals(Boolean.TRUE,
+                diagMap(response).get("connection-invalidated"));
+            assertEquals(Boolean.TRUE,
+                diagMap(response).get("execution-not-started"));
+            assertEquals("query", diagMap(response).get("category"));
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("foregroundExecuteOps")
+    void postPreflightStatementFailureIsNeverMarkedNotStarted(String op) throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.primaryValidationResult = true;
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement", "prepareStatement" ->
+                    throw new java.sql.SQLRecoverableException(
+                        "transport lost after preflight", "08000");
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Request request = request(827, op,
+            "conn-id", 7,
+            "sql", "UPDATE demo SET x = 1");
+        if ("execute-params".equals(op)) {
+            request.params.put("values", List.of());
+        }
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response response = dispatcher.dispatch(request);
+
+            assertFalse(response.ok);
+            assertEquals(1, connMgr.primaryValidationCalls);
+            assertTrue(connMgr.disconnected);
+            Map<String, Object> diag = diagMap(response);
+            assertEquals(Boolean.TRUE, diag.get("connection-invalidated"));
+            assertFalse(diag.containsKey("execution-not-started"),
+                "phase must be cleared before any Statement creation");
+            assertEquals("query", diag.get("category"));
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void executeParamsValidatesValuesBeforeIdlePreflightOrPrepare() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> {
+                throw new AssertionError("invalid values must not access JDBC: " + method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response response = dispatcher.dispatch(request(828, "execute-params",
+                "conn-id", 7,
+                "sql", "UPDATE demo SET x = ?",
+                "values", "not-an-array"));
+
+            assertFalse(response.ok);
+            assertEquals(0, connMgr.primaryValidationCalls);
+            assertEquals(0, connMgr.primaryConnectionCalls);
+            assertEquals("protocol", diagMap(response).get("category"));
+            assertFalse(diagMap(response).containsKey("execution-not-started"));
+        } finally {
+            dispatcher.shutdown();
+        }
     }
 
     @Test
@@ -2509,6 +2660,19 @@ class DispatcherTest {
                 .map(value -> Arguments.of(op, value)));
     }
 
+    private static Stream<String> foregroundExecuteOps() {
+        return Stream.of("execute", "execute-params");
+    }
+
+    private static Stream<Arguments> foregroundPreflightFailures() {
+        return foregroundExecuteOps().flatMap(op -> Stream.of(
+            Arguments.of(op, null),
+            Arguments.of(op, new SQLException("generic validation failure", "HY000")),
+            Arguments.of(op, new RuntimeException(
+                "wrapped validation failure", new SQLException("transport probe failed", "HY000")))
+        ));
+    }
+
     private static Stream<Arguments> invalidFetchSizes() {
         return invalidFetchSizeValues().map(Arguments::of);
     }
@@ -2829,6 +2993,7 @@ class DispatcherTest {
         private Map<String, String> props;
         private Integer connectTimeoutSeconds;
         private Integer networkTimeoutSeconds;
+        private Integer validateAfterIdleSeconds;
         private boolean autoCommit = true;
         private Connection connection;
         private Connection metadataConnection;
@@ -2841,11 +3006,16 @@ class DispatcherTest {
         private SQLException currentSchemaFailure;
         private String currentSchema;
         private int primaryConnectionCalls;
+        private int primaryValidationCalls;
+        private int primaryValidationTimeoutSeconds;
+        private boolean primaryValidationResult = true;
+        private Throwable primaryValidationFailure;
         private volatile boolean disconnected;
 
         @Override
         public int connect(String url, String user, String password, Map<String, String> props,
                            Integer connectTimeoutSeconds, Integer networkTimeoutSeconds,
+                           Integer validateAfterIdleSeconds,
                            boolean autoCommit, String driverClass) throws SQLException {
             this.url = url;
             this.driverClass = driverClass;
@@ -2854,6 +3024,7 @@ class DispatcherTest {
             this.props = props;
             this.connectTimeoutSeconds = connectTimeoutSeconds;
             this.networkTimeoutSeconds = networkTimeoutSeconds;
+            this.validateAfterIdleSeconds = validateAfterIdleSeconds;
             this.autoCommit = autoCommit;
             if (connectFailure != null) {
                 throw connectFailure;
@@ -2875,6 +3046,32 @@ class DispatcherTest {
         public boolean hasConnection(int connId) {
             assertEquals(7, connId);
             return !disconnected;
+        }
+
+        @Override
+        public boolean validatePrimaryIfIdle(int connId, int timeoutSeconds)
+                throws SQLException {
+            assertEquals(7, connId);
+            primaryValidationCalls++;
+            primaryValidationTimeoutSeconds = timeoutSeconds;
+            if (disconnected) {
+                throw new SQLException("Unknown connection id: " + connId);
+            }
+            if (primaryValidationFailure instanceof SQLException sqlFailure) {
+                throw sqlFailure;
+            }
+            if (primaryValidationFailure instanceof RuntimeException runtimeFailure) {
+                throw runtimeFailure;
+            }
+            if (primaryValidationFailure instanceof Error error) {
+                throw error;
+            }
+            return primaryValidationResult;
+        }
+
+        @Override
+        public void markPrimaryUsed(int connId) {
+            assertEquals(7, connId);
         }
 
         @Override

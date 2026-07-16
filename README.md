@@ -74,6 +74,7 @@ Timeout-related params are explicit:
 - `connect-timeout-seconds`: JDBC login/connect timeout for `connect`
 - `network-timeout-seconds`: socket/network timeout applied to the JDBC `Connection`
 - `query-timeout-seconds`: statement timeout applied before `execute`
+- `validate-after-idle-seconds`: validate the primary connection before new SQL after this many idle seconds; omitted or zero disables the check
 
 `execute`, `execute-params`, and `fetch` accept an optional integer
 `fetch-size` from 1 through 10,000. The default is 500. Values outside that
@@ -106,6 +107,8 @@ redacted request context.  When a hidden/internal query path fails,
 `diag.context.generated-sql` carries the actual SQL text that the agent ran.
 
 `diag.connection-invalidated=true` is also a stable lifecycle signal. It is present when an error response references a local logical connection that the agent no longer owns, including a follow-up request after the original failure response was ignored. The agent derives this from its connection map, not exception text or client-side JDBC error rules. Metadata-session failure alone does not set the marker. Foreground SQL is never replayed automatically because its transaction outcome may be unknown.
+
+When idle preflight conclusively rejects a primary connection before the agent creates a `Statement` or `PreparedStatement`, the same response also includes `diag.execution-not-started=true`. This is evidence only about the current SQL request; it does not say that an earlier manual transaction can be recovered, and the agent still performs no automatic reconnect or SQL replay. The preflight uses JDBC `Connection.isValid`; the agent does not execute database-specific validation SQL or call `setAutoCommit`, `commit`, or `rollback` as part of that check.
 
 When the client sends `params.debug=true`, failures may also include an
 additional optional `debug` payload.  That payload is still redacted and is

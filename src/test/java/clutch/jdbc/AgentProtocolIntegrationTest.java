@@ -24,7 +24,8 @@ class AgentProtocolIntegrationTest {
                 {"id":1,"op":"connect","params":{
                   "url":"jdbc:h2:mem:protocol;DB_CLOSE_DELAY=-1",
                   "driver-class":"org.h2.Driver",
-                  "user":"sa","password":"","auto-commit":false}}
+                  "user":"sa","password":"","auto-commit":false,
+                  "validate-after-idle-seconds":300}}
                 """);
             assertTrue(connect.path("ok").asBoolean());
             int connId = connect.path("result").path("conn-id").asInt();

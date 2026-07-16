@@ -43,6 +43,7 @@ public class Dispatcher {
     static final int DEFAULT_EXECUTE_TIMEOUT = 29; // s; safety net when no client timeout given
     static final int MAX_CONCURRENT_JDBC_TASKS = 16;
     static final long WORKER_CANCEL_GRACE_MILLIS = 250L;
+    static final int PRIMARY_VALIDATION_TIMEOUT_SECONDS = 3;
     private static final String EXECUTOR_OVERLOADED_ERROR =
         "Agent overloaded: too many concurrent JDBC operations";
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -54,6 +55,7 @@ public class Dispatcher {
     private final Map<Integer, ReentrantLock> metadataLocks = new ConcurrentHashMap<>();
     private final Map<Integer, RunningStatement> runningStatements = new ConcurrentHashMap<>();
     private final ThreadLocal<String> generatedSqlContext = new ThreadLocal<>();
+    private final ThreadLocal<Boolean> executionNotStartedContext = new ThreadLocal<>();
     private final DispatcherDiagnostics diagnostics;
     private final MetadataOps metadataOps;
 
@@ -76,7 +78,8 @@ public class Dispatcher {
     public Dispatcher(ConnectionManager connMgr, CursorManager cursorMgr) {
         this.connMgr = connMgr;
         this.cursorMgr = cursorMgr;
-        this.diagnostics = new DispatcherDiagnostics(MetadataOps.SUPPORTED_OPS, generatedSqlContext);
+        this.diagnostics = new DispatcherDiagnostics(
+            MetadataOps.SUPPORTED_OPS, generatedSqlContext, executionNotStartedContext);
         this.metadataOps = new MetadataOps(connMgr, cursorMgr, generatedSqlContext);
     }
 
@@ -88,6 +91,7 @@ public class Dispatcher {
     /** Route {@code req} to the appropriate handler and return its response. */
     public Response dispatch(Request req) {
         generatedSqlContext.remove();
+        executionNotStartedContext.remove();
         try {
             if (requestBypassesConnectionLock(req)) {
                 return dispatchUnlocked(req);
@@ -114,6 +118,7 @@ public class Dispatcher {
             return errorResponse(req, e);
         } finally {
             generatedSqlContext.remove();
+            executionNotStartedContext.remove();
         }
     }
 
@@ -253,6 +258,8 @@ public class Dispatcher {
             (Map<String, String>) req.params.getOrDefault("props", Map.of());
         Integer connectTimeoutSeconds = getOptionalInt(req, "connect-timeout-seconds");
         Integer networkTimeoutSeconds = getOptionalInt(req, "network-timeout-seconds");
+        Integer validateAfterIdleSeconds =
+            getOptionalInt(req, "validate-after-idle-seconds");
         boolean autoCommit = getBoolean(req, "auto-commit", true);
 
         if (url == null) {
@@ -261,9 +268,15 @@ public class Dispatcher {
         if (driverClass == null || driverClass.isBlank()) {
             return errorResponse(req, "connect: 'driver-class' is required", "protocol");
         }
+        if (validateAfterIdleSeconds != null && validateAfterIdleSeconds < 0) {
+            return errorResponse(req,
+                "connect: 'validate-after-idle-seconds' must be non-negative",
+                "protocol");
+        }
 
         int connId = connMgr.connect(url, user, password, props,
-            connectTimeoutSeconds, networkTimeoutSeconds, autoCommit, driverClass);
+            connectTimeoutSeconds, networkTimeoutSeconds, validateAfterIdleSeconds,
+            autoCommit, driverClass);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
@@ -325,6 +338,10 @@ public class Dispatcher {
         int executeTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
 
+        Response preflightFailure = idlePrimaryPreflight(req, connId);
+        if (preflightFailure != null) {
+            return preflightFailure;
+        }
         Connection conn = primaryConnection(connId);
         Statement stmt = conn.createStatement();
         return executeStatement(
@@ -338,10 +355,15 @@ public class Dispatcher {
         Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
         int executeTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
+        List<?> values = preparedValues(req);
+        Response preflightFailure = idlePrimaryPreflight(req, connId);
+        if (preflightFailure != null) {
+            return preflightFailure;
+        }
         Connection conn = primaryConnection(connId);
         PreparedStatement stmt = conn.prepareStatement(sql);
         try {
-            bindValues(req, stmt);
+            bindValues(values, stmt);
         } catch (Exception error) {
             closeStatementQuietly(stmt);
             throw error;
@@ -431,6 +453,30 @@ public class Dispatcher {
             } else if (!cursorResponseReady) {
                 cursorMgr.close(cursorId);
             }
+            connMgr.markPrimaryUsed(connId);
+        }
+    }
+
+    private Response idlePrimaryPreflight(Request req, int connId) {
+        executionNotStartedContext.set(Boolean.TRUE);
+        try {
+            if (connMgr.validatePrimaryIfIdle(
+                    connId, PRIMARY_VALIDATION_TIMEOUT_SECONDS)) {
+                return null;
+            }
+            SQLException invalid = new SQLException(
+                "JDBC connection is not valid after idle preflight; SQL was not executed");
+            poisonConnection(connId);
+            return errorResponse(req, invalid.getMessage(), "query", invalid, connId);
+        } catch (SQLException | RuntimeException failure) {
+            poisonConnection(connId);
+            String message = failure.getMessage();
+            if (message == null || message.isBlank()) {
+                message = "JDBC connection validation failed before execution";
+            }
+            return errorResponse(req, message, "query", failure, connId);
+        } finally {
+            executionNotStartedContext.remove();
         }
     }
 
@@ -438,11 +484,15 @@ public class Dispatcher {
         return getString(req, "sql").stripTrailing().replaceAll(";+$", "");
     }
 
-    private void bindValues(Request req, PreparedStatement stmt) throws SQLException {
+    private List<?> preparedValues(Request req) {
         Object rawValues = req.params.get("values");
         if (!(rawValues instanceof List<?> values)) {
             throw new IllegalArgumentException("execute-params: 'values' must be an array");
         }
+        return values;
+    }
+
+    private void bindValues(List<?> values, PreparedStatement stmt) throws SQLException {
         for (int i = 0; i < values.size(); i++) {
             stmt.setObject(i + 1, jdbcValue(values.get(i)));
         }
@@ -488,6 +538,9 @@ public class Dispatcher {
         } finally {
             if (running != null) {
                 finishRunningStatement(connId, running);
+            }
+            if (!metadata) {
+                connMgr.markPrimaryUsed(connId);
             }
         }
     }

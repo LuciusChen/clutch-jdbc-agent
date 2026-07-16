@@ -6,10 +6,12 @@ import java.sql.DriverManager;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLException;
+import java.time.Clock;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,6 +29,7 @@ public class ConnectionManager {
 
     private static final System.Logger LOG = System.getLogger(ConnectionManager.class.getName());
 
+    private final Clock clock;
     private final AtomicInteger nextId = new AtomicInteger(1);
     private final Map<Integer, Session> connections = new ConcurrentHashMap<>();
     private final ExecutorService networkTimeoutExecutor = Executors.newCachedThreadPool(r -> {
@@ -35,6 +38,15 @@ public class ConnectionManager {
         return t;
     });
 
+    /** Create a connection manager using the system wall clock. */
+    public ConnectionManager() {
+        this(Clock.systemUTC());
+    }
+
+    ConnectionManager(Clock clock) {
+        this.clock = Objects.requireNonNull(clock);
+    }
+
     /**
      * Open a new JDBC connection and return its assigned connId.
      *
@@ -42,11 +54,15 @@ public class ConnectionManager {
      * @param user     database user (may be null for URL-embedded credentials)
      * @param password database password (may be null)
      * @param props    extra driver properties (e.g. oracle.net.tns_admin)
+     * @param validateAfterIdleSeconds validate the primary connection after this
+     *        many idle seconds; null or zero disables validation
      */
     public int connect(String url, String user, String password, Map<String, String> props,
                        Integer connectTimeoutSeconds, Integer networkTimeoutSeconds,
+                       Integer validateAfterIdleSeconds,
                        boolean autoCommit, String driverClass)
             throws SQLException {
+        long validateAfterIdleMillis = validationIdleMillis(validateAfterIdleSeconds);
         Properties p = new Properties();
         if (props != null) p.putAll(props);
         if (user != null)     p.setProperty("user",     user);
@@ -61,7 +77,8 @@ public class ConnectionManager {
                 int id = nextId.getAndIncrement();
                 connections.put(id, new Session(
                     primary, metadata, url, p, connectTimeoutSeconds,
-                    networkTimeoutSeconds, driverClass));
+                    networkTimeoutSeconds, driverClass,
+                    validateAfterIdleMillis, clock.millis()));
                 return id;
             } catch (SQLException | RuntimeException e) {
                 closeQuietly(metadata);
@@ -71,6 +88,17 @@ public class ConnectionManager {
             closeQuietly(primary);
             throw e;
         }
+    }
+
+    private long validationIdleMillis(Integer validateAfterIdleSeconds) {
+        if (validateAfterIdleSeconds == null || validateAfterIdleSeconds == 0) {
+            return 0L;
+        }
+        if (validateAfterIdleSeconds < 0) {
+            throw new IllegalArgumentException(
+                "validate-after-idle-seconds must be non-negative");
+        }
+        return validateAfterIdleSeconds * 1_000L;
     }
 
     private void configurePrimaryConnection(Connection conn, boolean autoCommit,
@@ -166,7 +194,40 @@ public class ConnectionManager {
         Session session = connections.get(connId);
         if (session == null)
             throw new SQLException("Unknown connection id: " + connId);
+        session.markPrimaryUsed(clock.millis());
         return session.primary();
+    }
+
+    /** Mark successful or attempted foreground use of the primary JDBC session. */
+    public void markPrimaryUsed(int connId) {
+        Session session = connections.get(connId);
+        if (session != null) {
+            session.markPrimaryUsed(clock.millis());
+        }
+    }
+
+    /**
+     * Validate the primary connection only after its configured idle interval.
+     * A missing session is reported before the disabled/idle checks so callers
+     * can authoritatively report that no user SQL was started.
+     */
+    public boolean validatePrimaryIfIdle(int connId, int timeoutSeconds)
+            throws SQLException {
+        Session session = connections.get(connId);
+        if (session == null) {
+            throw new SQLException("Unknown connection id: " + connId);
+        }
+        long thresholdMillis = session.validateAfterIdleMillis;
+        long idleMillis = Math.max(0L, clock.millis() - session.lastPrimaryUseMillis);
+        if (thresholdMillis == 0L || idleMillis < thresholdMillis) {
+            return true;
+        }
+        try {
+            return session.primary().isValid(timeoutSeconds);
+        } catch (SQLFeatureNotSupportedException | AbstractMethodError unsupported) {
+            logUnsupportedCapability("isValid(" + timeoutSeconds + "s)", unsupported);
+            return true;
+        }
     }
 
     /** Return whether {@code connId} still names a live logical session. */
@@ -358,11 +419,14 @@ public class ConnectionManager {
         private final Integer connectTimeoutSeconds;
         private final Integer networkTimeoutSeconds;
         private final String driverClass;
+        private final long validateAfterIdleMillis;
+        private volatile long lastPrimaryUseMillis;
         private volatile String currentSchema;
 
         private Session(Connection primary, Connection metadata, String url,
                         Properties props, Integer connectTimeoutSeconds,
-                        Integer networkTimeoutSeconds, String driverClass) {
+                        Integer networkTimeoutSeconds, String driverClass,
+                        long validateAfterIdleMillis, long connectedAtMillis) {
             this.primary = primary;
             this.metadata = metadata;
             this.url = url;
@@ -371,6 +435,8 @@ public class ConnectionManager {
             this.connectTimeoutSeconds = connectTimeoutSeconds;
             this.networkTimeoutSeconds = networkTimeoutSeconds;
             this.driverClass = driverClass;
+            this.validateAfterIdleMillis = validateAfterIdleMillis;
+            this.lastPrimaryUseMillis = connectedAtMillis;
         }
 
         private Connection primary() {
@@ -383,6 +449,10 @@ public class ConnectionManager {
 
         private void setMetadata(Connection metadata) {
             this.metadata = metadata;
+        }
+
+        private void markPrimaryUsed(long nowMillis) {
+            this.lastPrimaryUseMillis = nowMillis;
         }
     }
 }
