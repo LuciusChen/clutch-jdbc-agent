@@ -114,12 +114,10 @@ public class CursorManager {
 
     /** Close all cursors belonging to a connection (called on disconnect). */
     public void closeForConnection(int connId) {
-        cursors.entrySet().removeIf(e -> {
-            if (e.getValue().connId() == connId) {
-                close(e.getKey());
-                return true;
+        cursors.forEach((cursorId, cursor) -> {
+            if (cursor.connId() == connId) {
+                close(cursorId);
             }
-            return false;
         });
     }
 

@@ -88,6 +88,9 @@ period, the logical connection is closed and cannot be reused concurrently.
 Boolean params are JSON booleans, not strings or numeric sentinels. Staged DML
 uses `execute-params` with a positional JSON `values` array; the agent binds each
 entry through `PreparedStatement` instead of rendering it into SQL text.
+When `auto-commit=false` is requested, connection creation fails unless the
+driver accepts `setAutoCommit(false)`; the agent never silently continues in
+auto-commit mode.
 
 ### Response format
 
@@ -190,6 +193,11 @@ The agent no longer runs requests on one global synchronous lane. The stdin loop
 This is still intentionally much simpler than a fully async server: no
 connection pooling, no SQL rewriting, and no multi-statement scheduling inside
 one JDBC connection.
+
+For metadata recovery, a driver that does not implement `Connection.isValid`
+is treated as lacking that optional probe, not as having a dead session. A
+non-null, open metadata connection remains usable unless the triggering failure
+is itself classified as a connection failure.
 
 ## Driver Setup
 

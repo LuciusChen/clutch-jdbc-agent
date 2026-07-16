@@ -107,8 +107,8 @@ public class ConnectionManager {
         if (!autoCommit) {
             try {
                 conn.setAutoCommit(false);
-            } catch (SQLFeatureNotSupportedException | AbstractMethodError e) {
-                logUnsupportedCapability("setAutoCommit(false)", e);
+            } catch (AbstractMethodError e) {
+                throw new SQLException("JDBC driver does not support manual commit mode", e);
             }
         }
         applyNetworkTimeout(conn, networkTimeoutSeconds);
@@ -274,11 +274,6 @@ public class ConnectionManager {
         return true;
     }
 
-    /** Reopen only the metadata connection when its JDBC liveness check fails. */
-    public boolean reconnectMetadataIfInvalid(int connId) throws SQLException {
-        return reconnectMetadataIfInvalid(connId, null);
-    }
-
     /** Detach the metadata connection for {@code connId}, then close it off-thread. */
     public void invalidateMetadata(int connId) {
         Session session = connections.get(connId);
@@ -326,9 +321,22 @@ public class ConnectionManager {
         if (isConnectionFailure(failure)) {
             return false;
         }
+        if (connection == null) {
+            return false;
+        }
         try {
-            return connection != null && !connection.isClosed() && connection.isValid(1);
-        } catch (SQLException | AbstractMethodError e) {
+            if (connection.isClosed()) {
+                return false;
+            }
+        } catch (SQLException e) {
+            return false;
+        }
+        try {
+            return connection.isValid(1);
+        } catch (SQLFeatureNotSupportedException | AbstractMethodError e) {
+            logUnsupportedCapability("isValid(1s)", e);
+            return true;
+        } catch (SQLException e) {
             return false;
         }
     }

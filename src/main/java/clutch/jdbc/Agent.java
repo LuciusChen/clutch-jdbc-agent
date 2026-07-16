@@ -93,14 +93,6 @@ public class Agent {
                     out.println(mapper.writeValueAsString(
                         Response.error(req.id, REQUEST_OVERLOADED_ERROR)));
                 }
-            } catch (Exception e) {
-                LOG.log(System.Logger.Level.ERROR,
-                        "Error submitting request {0}: {1}",
-                        req.id,
-                        e.getMessage());
-                synchronized (out) {
-                    out.println(mapper.writeValueAsString(Response.error(req.id, e.getMessage())));
-                }
             }
         }
 
