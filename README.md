@@ -137,8 +137,8 @@ context and a redacted Java stack trace.
 | `get-schemas`     | List schemas via `DatabaseMetaData`              |
 | `get-tables`      | List schema/browser tables; generic JDBC includes `REMARKS` as optional `comment`; Oracle uses direct SQL over `user_*`, `user_synonyms`, and accessible `all_*` views |
 | `search-tables`   | Prefix-search tables/views for completion; generic JDBC includes optional `comment`; Oracle also includes low-privilege synonym / accessible-owner paths, with system owners filtered in SQL except for `PUBLIC SYNONYM` |
-| `get-columns`     | List columns for a table                         |
-| `search-columns`  | Prefix-search columns for completion             |
+| `get-columns`     | List columns for a table, including optional `default` expressions |
+| `search-columns`  | Prefix-search columns for completion, including optional `default` expressions |
 | `get-primary-keys`| List primary key columns                         |
 | `get-foreign-keys`| List imported foreign keys                       |
 | `get-indexes` / `get-index-columns` | Index metadata                  |

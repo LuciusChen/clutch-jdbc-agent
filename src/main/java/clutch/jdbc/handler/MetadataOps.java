@@ -434,12 +434,12 @@ final class MetadataOps {
                 if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
                     continue;
                 }
-                cols.add(Map.of(
-                    "name", rs.getString("COLUMN_NAME"),
-                    "type", rs.getString("TYPE_NAME"),
-                    "nullable", rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls,
-                    "position", rs.getInt("ORDINAL_POSITION")
-                ));
+                String name = rs.getString("COLUMN_NAME");
+                String type = rs.getString("TYPE_NAME");
+                boolean nullable = rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls;
+                String defaultValue = rs.getString("COLUMN_DEF");
+                int position = rs.getInt("ORDINAL_POSITION");
+                cols.add(columnMap(name, type, nullable, defaultValue, position));
             }
         }
         return cols;
@@ -460,7 +460,7 @@ final class MetadataOps {
                                                            String columnPattern)
             throws SQLException {
         String sql = """
-            SELECT column_name, data_type, nullable, column_id
+            SELECT column_name, data_type, nullable, data_default, column_id
             FROM user_tab_columns
             WHERE table_name = ?
               AND column_name LIKE ?
@@ -484,7 +484,7 @@ final class MetadataOps {
                                                               String table, String columnPattern)
             throws SQLException {
         String sql = """
-            SELECT column_name, data_type, nullable, column_id
+            SELECT column_name, data_type, nullable, data_default, column_id
             FROM all_tab_columns
             WHERE owner = ?
               AND table_name = ?
@@ -512,7 +512,7 @@ final class MetadataOps {
         String columnPattern = ((prefix == null || prefix.isBlank()) ? "" : prefix)
             .toUpperCase(Locale.ROOT) + "%";
         String sql = """
-            SELECT column_name, data_type, nullable, column_id
+            SELECT column_name, data_type, nullable, data_default, column_id
             FROM all_tab_columns
             WHERE table_name = ?
               AND column_name LIKE ?
@@ -525,8 +525,8 @@ final class MetadataOps {
             ps.setString(2, columnPattern);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    String name = rs.getString("column_name");
-                    colsByName.putIfAbsent(name, oracleColumnRow(rs));
+                    Map<String, Object> column = oracleColumnRow(rs);
+                    colsByName.putIfAbsent((String) column.get("name"), column);
                 }
             }
         }
@@ -559,12 +559,26 @@ final class MetadataOps {
     }
 
     private Map<String, Object> oracleColumnRow(ResultSet rs) throws SQLException {
-        return Map.of(
-            "name", rs.getString("column_name"),
-            "type", rs.getString("data_type"),
-            "nullable", !"N".equalsIgnoreCase(rs.getString("nullable")),
-            "position", rs.getInt("column_id")
-        );
+        String name = rs.getString("column_name");
+        String type = rs.getString("data_type");
+        boolean nullable = !"N".equalsIgnoreCase(rs.getString("nullable"));
+        String defaultValue = rs.getString("data_default");
+        int position = rs.getInt("column_id");
+        return columnMap(name, type, nullable, defaultValue, position);
+    }
+
+    private Map<String, Object> columnMap(String name, String type, boolean nullable,
+                                          String defaultValue, int position) {
+        Map<String, Object> column = new LinkedHashMap<>(Map.of(
+            "name", name,
+            "type", type,
+            "nullable", nullable,
+            "position", position
+        ));
+        if (defaultValue != null) {
+            column.put("default", defaultValue);
+        }
+        return column;
     }
 
     private Response getPrimaryKeys(Request req) throws SQLException {

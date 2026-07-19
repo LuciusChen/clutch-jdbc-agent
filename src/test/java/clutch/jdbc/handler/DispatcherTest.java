@@ -2101,6 +2101,10 @@ class DispatcherTest {
     @Test
     void getColumnsUsesOracleFastPath() throws Exception {
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        oracle.resultRows = List.of(
+            oracle.row("STATUS", "VARCHAR2", "N", "'pending'", 1),
+            oracle.row("NOTE", "VARCHAR2", "Y", null, 2)
+        );
         Response response = dispatchOracle(oracle, 3, "get-columns",
             "conn-id", 7,
             "schema", "ZJSY",
@@ -2108,7 +2112,7 @@ class DispatcherTest {
 
         assertTrue(response.ok);
         assertEquals(
-            "SELECT column_name, data_type, nullable, column_id\n" +
+            "SELECT column_name, data_type, nullable, data_default, column_id\n" +
             "FROM user_tab_columns\n" +
             "WHERE table_name = ?\n" +
             "  AND column_name LIKE ?\n" +
@@ -2117,7 +2121,9 @@ class DispatcherTest {
         assertEquals(List.of("T_SYS_PARA", "%"), oracle.params);
         assertEquals(5, oracle.queryTimeoutSeconds);
         List<Map<String, Object>> cols = resultList(response, "columns");
-        assertEquals("PARA_ID", cols.get(0).get("name"));
+        assertEquals("STATUS", cols.get(0).get("name"));
+        assertEquals("'pending'", cols.get(0).get("default"));
+        assertFalse(cols.get(1).containsKey("default"));
     }
 
     @Test
@@ -2260,7 +2266,8 @@ class DispatcherTest {
         jdbc.columnRows = List.of(
             jdbc.columnRow("id", "UInt64", 0, 1, "", "default"),
             jdbc.columnRow("demo_only", "UInt64", 0, 1, "", "demo"),
-            jdbc.columnRow("name", "String", DatabaseMetaData.columnNullable, 2, "", "default")
+            jdbc.columnRow("name", "String", DatabaseMetaData.columnNullable,
+                2, "'anonymous'", "", "default")
         );
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         connMgr.connection = jdbc.connection("ClickHouse");
@@ -2279,6 +2286,8 @@ class DispatcherTest {
         assertEquals(2, cols.size());
         assertEquals("id", cols.get(0).get("name"));
         assertEquals(false, cols.get(0).get("nullable"));
+        assertFalse(cols.get(0).containsKey("default"));
+        assertEquals("'anonymous'", cols.get(1).get("default"));
     }
 
     @Test
@@ -2398,7 +2407,7 @@ class DispatcherTest {
     void searchColumnsFallsBackToResolvedOracleSynonym() throws Exception {
         OracleMetadataRecorder oracle = new OracleMetadataRecorder();
         oracle.setRowsForSql("""
-            SELECT column_name, data_type, nullable, column_id
+            SELECT column_name, data_type, nullable, data_default, column_id
             FROM user_tab_columns
             WHERE table_name = ?
               AND column_name LIKE ?
@@ -2415,7 +2424,7 @@ class DispatcherTest {
               AND synonym_name = ?
             """, List.of(oracle.synonymRow("DATA_OWNER", "ORDERS")));
         oracle.setRowsForSql("""
-            SELECT column_name, data_type, nullable, column_id
+            SELECT column_name, data_type, nullable, data_default, column_id
             FROM all_tab_columns
             WHERE owner = ?
               AND table_name = ?
@@ -2436,7 +2445,7 @@ class DispatcherTest {
                        .anyMatch(sql -> sql.contains("user_synonyms")),
             "search-columns should resolve the synonym before loading columns");
         assertEquals(
-            "SELECT column_name, data_type, nullable, column_id\n" +
+            "SELECT column_name, data_type, nullable, data_default, column_id\n" +
             "FROM all_tab_columns\n" +
             "WHERE owner = ?\n" +
             "  AND table_name = ?\n" +
@@ -2448,6 +2457,56 @@ class DispatcherTest {
         assertEquals(2, cols.size());
         assertEquals("PARA_ID", cols.get(0).get("name"));
         assertEquals("PARA_NAME", cols.get(1).get("name"));
+    }
+
+    @Test
+    void searchColumnsIncludesDefaultsFromOracleAccessibleOwnerFallback() throws Exception {
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        oracle.setRowsForSql("""
+            SELECT column_name, data_type, nullable, data_default, column_id
+            FROM user_tab_columns
+            WHERE table_name = ?
+              AND column_name LIKE ?
+            ORDER BY column_id
+            """, List.of());
+        oracle.setRowsForSql("""
+            SELECT table_owner, table_name
+            FROM user_synonyms
+            WHERE synonym_name = ?
+            UNION ALL
+            SELECT table_owner, table_name
+            FROM all_synonyms
+            WHERE owner = 'PUBLIC'
+              AND synonym_name = ?
+            """, List.of());
+        oracle.setRowsForSql("""
+            SELECT column_name, data_type, nullable, data_default, column_id
+            FROM all_tab_columns
+            WHERE table_name = ?
+              AND column_name LIKE ?
+            ORDER BY owner, column_id
+            """, List.of(
+                oracle.row("STATUS", "VARCHAR2", "N", "'pending'", 1),
+                oracle.row("NOTE", "VARCHAR2", "Y", null, 2)
+            ));
+
+        Response response = dispatchOracle(oracle, 44, "search-columns",
+            "conn-id", 7,
+            "schema", "ZJSY",
+            "table", "orders",
+            "prefix", "");
+
+        assertTrue(response.ok);
+        assertEquals(
+            "SELECT column_name, data_type, nullable, data_default, column_id\n" +
+            "FROM all_tab_columns\n" +
+            "WHERE table_name = ?\n" +
+            "  AND column_name LIKE ?\n" +
+            "ORDER BY owner, column_id",
+            oracle.lastSqlNormalized());
+        List<Map<String, Object>> cols = resultList(response, "columns");
+        assertEquals("'pending'", cols.get(0).get("default"));
+        assertFalse(cols.get(1).containsKey("default"));
     }
 
     @Test
@@ -3217,10 +3276,16 @@ class DispatcherTest {
         }
 
         private Map<String, Object> row(String name, String type, String nullable, int position) {
+            return row(name, type, nullable, null, position);
+        }
+
+        private Map<String, Object> row(String name, String type, String nullable,
+                                        String defaultValue, int position) {
             Map<String, Object> row = new HashMap<>();
             row.put("column_name", name);
             row.put("data_type", type);
             row.put("nullable", nullable);
+            row.put("data_default", defaultValue);
             row.put("column_id", position);
             return row;
         }
@@ -3295,7 +3360,7 @@ class DispatcherTest {
                         lastPattern = (String) args[3];
                         yield metadataResultSet(
                             List.of("COLUMN_NAME", "TYPE_NAME", "NULLABLE", "ORDINAL_POSITION",
-                                    "TABLE_CAT", "TABLE_SCHEM"),
+                                    "COLUMN_DEF", "TABLE_CAT", "TABLE_SCHEM"),
                             columnRows
                         );
                     }
@@ -3386,11 +3451,17 @@ class DispatcherTest {
 
         private Map<String, Object> columnRow(String name, String type, int nullable, int position,
                                               String catalog, String schema) {
+            return columnRow(name, type, nullable, position, null, catalog, schema);
+        }
+
+        private Map<String, Object> columnRow(String name, String type, int nullable, int position,
+                                              String defaultValue, String catalog, String schema) {
             Map<String, Object> row = new HashMap<>();
             row.put("COLUMN_NAME", name);
             row.put("TYPE_NAME", type);
             row.put("NULLABLE", nullable);
             row.put("ORDINAL_POSITION", position);
+            row.put("COLUMN_DEF", defaultValue);
             row.put("TABLE_CAT", catalog);
             row.put("TABLE_SCHEM", schema);
             return row;
