@@ -1,5 +1,9 @@
 # 009 - Text-like BLOB Values
 
+> Superseded in part by [019](019-typed-binary-prepared-parameters.md): typed
+> binary prepared parameters now support client-side BLOB and RAW/BINARY
+> mutations without adding full BLOB streaming.
+
 ## Context
 
 JDBC exposes Oracle `BLOB`, generic `Blob`, and `byte[]` values as binary

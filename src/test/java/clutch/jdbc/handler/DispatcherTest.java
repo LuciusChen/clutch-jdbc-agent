@@ -9,7 +9,9 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.api.Test;
 
+import java.io.InputStream;
 import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
 import java.sql.DatabaseMetaData;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -17,7 +19,9 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Types;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +36,7 @@ import java.util.function.Consumer;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -1304,6 +1309,161 @@ class DispatcherTest {
         } finally {
             dispatcher.shutdown();
         }
+    }
+
+    @Test
+    void executeParamsUsesBinarySettersForReservedEnvelopes() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        byte[] blobBytes = "{\"message\":\"中文\"}".getBytes(StandardCharsets.UTF_8);
+        byte[] rawBytes = new byte[]{0, (byte) 0xff, 0x41, 0x0a};
+        byte[] emptyBytes = new byte[0];
+        List<String> setters = new ArrayList<>();
+        List<byte[]> boundBytes = new ArrayList<>();
+        List<Object> objectValues = new ArrayList<>();
+        PreparedStatement statement = (PreparedStatement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{PreparedStatement.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "setBlob" -> {
+                    setters.add("setBlob:" + args[0]);
+                    byte[] bytes = ((InputStream) args[1]).readAllBytes();
+                    assertEquals((long) bytes.length, args[2]);
+                    boundBytes.add(bytes);
+                    yield null;
+                }
+                case "setBytes" -> {
+                    setters.add("setBytes:" + args[0]);
+                    boundBytes.add((byte[]) args[1]);
+                    yield null;
+                }
+                case "setNull" -> {
+                    setters.add("setNull:" + args[0] + ":" + args[1]);
+                    yield null;
+                }
+                case "setObject" -> {
+                    setters.add("setObject:" + args[0]);
+                    objectValues.add(args[1]);
+                    yield null;
+                }
+                case "setQueryTimeout" -> null;
+                case "execute" -> false;
+                case "getUpdateCount" -> 1;
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "prepareStatement" -> statement;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response response = dispatcher.dispatch(request(
+                829, "execute-params",
+                "conn-id", 7,
+                "sql", """
+                    UPDATE documents
+                    SET payload = ?, raw_payload = ?, optional_blob = ?,
+                        optional_raw = ?, empty_blob = ?, empty_raw = ?,
+                        metadata = ?""",
+                "values", List.of(
+                    Map.of("__clutch_jdbc_param", "binary",
+                           "jdbc-type", "BLOB",
+                           "base64", Base64.getEncoder().encodeToString(blobBytes)),
+                    Map.of("__clutch_jdbc_param", "binary",
+                           "jdbc-type", "RAW",
+                           "base64", Base64.getEncoder().encodeToString(rawBytes)),
+                    binaryEnvelope("BLOB", null),
+                    binaryEnvelope("RAW", null),
+                    binaryEnvelope("BLOB",
+                        Base64.getEncoder().encodeToString(emptyBytes)),
+                    binaryEnvelope("RAW",
+                        Base64.getEncoder().encodeToString(emptyBytes)),
+                    Map.of("status", "ready"))));
+
+            assertTrue(response.ok, response.error);
+            assertEquals(
+                List.of("setBlob:1", "setBytes:2",
+                        "setNull:3:" + Types.BLOB,
+                        "setNull:4:" + Types.VARBINARY,
+                        "setBlob:5", "setBytes:6", "setObject:7"),
+                setters);
+            assertArrayEquals(blobBytes, boundBytes.get(0));
+            assertArrayEquals(rawBytes, boundBytes.get(1));
+            assertArrayEquals(emptyBytes, boundBytes.get(2));
+            assertArrayEquals(emptyBytes, boundBytes.get(3));
+            assertEquals(List.of("{\"status\":\"ready\"}"), objectValues);
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void executeParamsRejectsMalformedBinaryEnvelopesBeforeJdbcAccess() throws Exception {
+        List<Map.Entry<Map<String, Object>, String>> invalidCases = List.of(
+            Map.entry(binaryEnvelope("BLOB", "not-base64!"),
+                "Illegal base64"),
+            Map.entry(binaryEnvelope("VARCHAR2", "QQ=="),
+                "execute-params: unsupported binary jdbc-type: VARCHAR2"),
+            Map.entry(binaryEnvelope("BLOBSTER", "QQ=="),
+                "execute-params: unsupported binary jdbc-type: BLOBSTER"),
+            Map.entry(binaryEnvelope("DRAWING", "QQ=="),
+                "execute-params: unsupported binary jdbc-type: DRAWING"),
+            Map.entry(binaryEnvelope("NONBINARY", "QQ=="),
+                "execute-params: unsupported binary jdbc-type: NONBINARY"),
+            Map.entry(Map.of("__clutch_jdbc_param", "binary", "base64", "QQ=="),
+                "execute-params: binary parameter requires jdbc-type"),
+            Map.entry(Map.of("__clutch_jdbc_param", "other"),
+                "execute-params: unsupported __clutch_jdbc_param"),
+            Map.entry(Map.of("__clutch_jdbc_param", "binary",
+                             "jdbc-type", "BLOB"),
+                "execute-params: binary parameter requires base64"),
+            Map.entry(Map.of("__clutch_jdbc_param", "binary",
+                             "jdbc-type", "BLOB", "base64", 7),
+                "execute-params: binary parameter base64 must be a string or null"),
+            Map.entry(binaryEnvelope(" ", "QQ=="),
+                "execute-params: binary parameter requires jdbc-type"));
+        for (Map.Entry<Map<String, Object>, String> invalidCase : invalidCases) {
+            RecordingConnectionManager connMgr = new RecordingConnectionManager();
+            connMgr.connection = (Connection) Proxy.newProxyInstance(
+                DispatcherTest.class.getClassLoader(),
+                new Class<?>[]{Connection.class},
+                (_proxy, method, _args) -> {
+                    throw new AssertionError(
+                        "invalid binary envelope must not access JDBC: " + method.getName());
+                });
+            Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+            try {
+                Response response = dispatcher.dispatch(request(
+                    830, "execute-params",
+                    "conn-id", 7,
+                    "sql", "UPDATE documents SET payload = ?",
+                    "values", List.of(invalidCase.getKey())));
+
+                assertFalse(response.ok);
+                assertTrue(response.error.contains(invalidCase.getValue()),
+                    response.error);
+                assertEquals("protocol", diagMap(response).get("category"));
+                assertEquals(0, connMgr.primaryValidationCalls);
+                assertEquals(0, connMgr.primaryConnectionCalls);
+            } finally {
+                dispatcher.shutdown();
+            }
+        }
+    }
+
+    private static Map<String, Object> binaryEnvelope(String jdbcType, String base64) {
+        Map<String, Object> envelope = new HashMap<>();
+        envelope.put("__clutch_jdbc_param", "binary");
+        envelope.put("jdbc-type", jdbcType);
+        envelope.put("base64", base64);
+        return envelope;
     }
 
     @Test

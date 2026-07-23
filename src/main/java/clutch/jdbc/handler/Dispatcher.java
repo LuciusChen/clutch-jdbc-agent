@@ -7,6 +7,7 @@ import clutch.jdbc.model.Response;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.io.ByteArrayInputStream;
 import java.math.BigInteger;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -14,7 +15,11 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLTimeoutException;
 import java.sql.Statement;
+import java.sql.Types;
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -489,12 +494,82 @@ public class Dispatcher {
         if (!(rawValues instanceof List<?> values)) {
             throw new IllegalArgumentException("execute-params: 'values' must be an array");
         }
-        return values;
+        List<Object> prepared = new ArrayList<>(values.size());
+        for (Object value : values) {
+            prepared.add(preparedValue(value));
+        }
+        return prepared;
+    }
+
+    private Object preparedValue(Object value) {
+        if (!(value instanceof Map<?, ?> map)
+                || !map.containsKey("__clutch_jdbc_param")) {
+            return value;
+        }
+        if (!"binary".equals(map.get("__clutch_jdbc_param"))) {
+            throw new IllegalArgumentException(
+                "execute-params: unsupported __clutch_jdbc_param");
+        }
+        return binaryParameter(map);
+    }
+
+    private BinaryParameter binaryParameter(Map<?, ?> map) {
+        Object jdbcTypeValue = map.get("jdbc-type");
+        if (!(jdbcTypeValue instanceof String jdbcType) || jdbcType.isBlank()) {
+            throw new IllegalArgumentException(
+                "execute-params: binary parameter requires jdbc-type");
+        }
+        BinaryKind kind = binaryKind(jdbcType);
+        if (!map.containsKey("base64")) {
+            throw new IllegalArgumentException(
+                "execute-params: binary parameter requires base64");
+        }
+        Object base64Value = map.get("base64");
+        if (base64Value == null) {
+            return new BinaryParameter(kind, null);
+        }
+        if (!(base64Value instanceof String base64)) {
+            throw new IllegalArgumentException(
+                "execute-params: binary parameter base64 must be a string or null");
+        }
+        return new BinaryParameter(kind, Base64.getDecoder().decode(base64));
+    }
+
+    private BinaryKind binaryKind(String jdbcType) {
+        String normalized = jdbcType.strip().toUpperCase(Locale.ROOT);
+        return switch (normalized) {
+            case "BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB",
+                 "BINARY LARGE OBJECT" -> BinaryKind.BLOB;
+            case "RAW", "LONG RAW", "BINARY", "VARBINARY", "LONGVARBINARY",
+                 "BINARY VARYING", "IMAGE", "BINDATA", "BYTEA" ->
+                BinaryKind.BYTES;
+            default -> throw new IllegalArgumentException(
+                "execute-params: unsupported binary jdbc-type: " + jdbcType);
+        };
     }
 
     private void bindValues(List<?> values, PreparedStatement stmt) throws SQLException {
         for (int i = 0; i < values.size(); i++) {
-            stmt.setObject(i + 1, jdbcValue(values.get(i)));
+            int parameterIndex = i + 1;
+            Object value = values.get(i);
+            if (value instanceof BinaryParameter binary) {
+                bindBinaryValue(stmt, parameterIndex, binary);
+            } else {
+                stmt.setObject(parameterIndex, jdbcValue(value));
+            }
+        }
+    }
+
+    private void bindBinaryValue(PreparedStatement stmt, int parameterIndex,
+                                 BinaryParameter binary) throws SQLException {
+        byte[] bytes = binary.bytes();
+        if (bytes == null) {
+            stmt.setNull(parameterIndex,
+                binary.kind() == BinaryKind.BLOB ? Types.BLOB : Types.VARBINARY);
+        } else if (binary.kind() == BinaryKind.BLOB) {
+            stmt.setBlob(parameterIndex, new ByteArrayInputStream(bytes), bytes.length);
+        } else {
+            stmt.setBytes(parameterIndex, bytes);
         }
     }
 
@@ -508,6 +583,13 @@ public class Dispatcher {
             throw new SQLException("Cannot serialize structured JDBC parameter", error);
         }
     }
+
+    private enum BinaryKind {
+        BLOB,
+        BYTES
+    }
+
+    private record BinaryParameter(BinaryKind kind, byte[] bytes) {}
 
     private Response fetch(Request req) throws Exception {
         int cursorId = getInt(req, "cursor-id");

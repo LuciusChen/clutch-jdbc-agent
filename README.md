@@ -88,6 +88,20 @@ period, the logical connection is closed and cannot be reused concurrently.
 Boolean params are JSON booleans, not strings or numeric sentinels. Staged DML
 uses `execute-params` with a positional JSON `values` array; the agent binds each
 entry through `PreparedStatement` instead of rendering it into SQL text.
+Ordinary scalar, array, and object values retain that behavior. A binary value
+may instead use the reserved typed envelope:
+
+```json
+{"__clutch_jdbc_param":"binary","jdbc-type":"BLOB","base64":"eyJzdGF0dXMiOiJyZWFkeSJ9"}
+```
+
+The marker must be exactly `binary`. `jdbc-type` is the declared JDBC type from
+column metadata, and `base64` carries the exact bytes. A JSON `null` `base64`
+means a typed SQL `NULL`, while `""` means a non-null zero-byte value. BLOB
+values are bound with `PreparedStatement.setBlob`; RAW/BINARY-family values are
+bound with `setBytes`. Typed nulls use the corresponding JDBC null type.
+Malformed or unsupported envelopes fail before JDBC execution. This is a narrow
+binary binding contract, not a general JDBC type-tagging or BLOB-streaming API.
 When `auto-commit=false` is requested, connection creation fails unless the
 driver accepts `setAutoCommit(false)`; the agent never silently continues in
 auto-commit mode.

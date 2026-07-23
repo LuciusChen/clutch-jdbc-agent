@@ -1,5 +1,9 @@
 # 011 - Bind staged DML values in JDBC
 
+> Superseded in part by [019](019-typed-binary-prepared-parameters.md):
+> `execute-params` now also accepts a reserved typed binary envelope; ordinary
+> values retain the values-only binding path described here.
+
 ## Context
 
 Clutch already represented staged mutations as SQL templates plus positional
