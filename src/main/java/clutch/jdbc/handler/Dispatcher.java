@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.ByteArrayInputStream;
 import java.math.BigInteger;
+import java.sql.Blob;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -350,7 +351,7 @@ public class Dispatcher {
         Connection conn = primaryConnection(connId);
         Statement stmt = conn.createStatement();
         return executeStatement(
-            req, connId, stmt, () -> stmt.execute(sql), fetchSize, executeTimeout);
+            req, connId, stmt, () -> stmt.execute(sql), fetchSize, executeTimeout, null);
     }
 
     private Response executeParams(Request req) throws Exception {
@@ -367,23 +368,29 @@ public class Dispatcher {
         }
         Connection conn = primaryConnection(connId);
         PreparedStatement stmt = conn.prepareStatement(sql);
+        List<Blob> blobsToFree = new ArrayList<>();
         try {
-            bindValues(values, stmt);
+            bindValues(values, conn, stmt, blobsToFree);
         } catch (Exception error) {
             closeStatementQuietly(stmt);
+            freeBlobsQuietly(blobsToFree);
             throw error;
         }
         return executeStatement(
-            req, connId, stmt, stmt::execute, fetchSize, executeTimeout);
+            req, connId, stmt, stmt::execute, fetchSize, executeTimeout,
+            () -> freeBlobsQuietly(blobsToFree));
     }
 
     private Response executeStatement(Request req, int connId, Statement stmt,
                                       Callable<Boolean> executeAction, int fetchSize,
-                                      int executeTimeout) throws Exception {
+                                      int executeTimeout, Runnable executeCleanup)
+            throws Exception {
         RunningStatement running = null;
         Integer cursorId = null;
         boolean cursorResponseReady = false;
         boolean abandonStatement = false;
+        AtomicBoolean cleanupDone = new AtomicBoolean(false);
+        AtomicBoolean cleanupOnWorkerExit = new AtomicBoolean(false);
         try {
             stmt.setQueryTimeout(executeTimeout);
             running = beginRunningStatement(connId, req.id, stmt);
@@ -394,6 +401,9 @@ public class Dispatcher {
                     try {
                         return executeAction.call();
                     } finally {
+                        if (cleanupOnWorkerExit.get()) {
+                            runCleanupOnce(executeCleanup, cleanupDone);
+                        }
                         workerFinished.countDown();
                     }
                 });
@@ -404,6 +414,7 @@ public class Dispatcher {
             try {
                 isQuery = future.get(executeTimeout + 1L, TimeUnit.SECONDS);
             } catch (TimeoutException e) {
+                cleanupOnWorkerExit.set(true);
                 future.cancel(true);
                 cancelStatementQuietly(stmt);
                 if (!awaitWorkerTermination(workerFinished)) {
@@ -457,6 +468,9 @@ public class Dispatcher {
                 }
             } else if (!cursorResponseReady) {
                 cursorMgr.close(cursorId);
+            }
+            if (!abandonStatement) {
+                runCleanupOnce(executeCleanup, cleanupDone);
             }
             connMgr.markPrimaryUsed(connId);
         }
@@ -548,28 +562,52 @@ public class Dispatcher {
         };
     }
 
-    private void bindValues(List<?> values, PreparedStatement stmt) throws SQLException {
+    private void bindValues(List<?> values, Connection conn, PreparedStatement stmt,
+                            List<Blob> blobsToFree) throws SQLException {
         for (int i = 0; i < values.size(); i++) {
             int parameterIndex = i + 1;
             Object value = values.get(i);
             if (value instanceof BinaryParameter binary) {
-                bindBinaryValue(stmt, parameterIndex, binary);
+                bindBinaryValue(conn, stmt, parameterIndex, binary, blobsToFree);
             } else {
                 stmt.setObject(parameterIndex, jdbcValue(value));
             }
         }
     }
 
-    private void bindBinaryValue(PreparedStatement stmt, int parameterIndex,
-                                 BinaryParameter binary) throws SQLException {
+    private void bindBinaryValue(Connection conn, PreparedStatement stmt,
+                                 int parameterIndex, BinaryParameter binary,
+                                 List<Blob> blobsToFree) throws SQLException {
         byte[] bytes = binary.bytes();
         if (bytes == null) {
             stmt.setNull(parameterIndex,
                 binary.kind() == BinaryKind.BLOB ? Types.BLOB : Types.VARBINARY);
+        } else if (binary.kind() == BinaryKind.BLOB && bytes.length == 0) {
+            Blob blob = conn.createBlob();
+            blobsToFree.add(blob);
+            stmt.setBlob(parameterIndex, blob);
         } else if (binary.kind() == BinaryKind.BLOB) {
-            stmt.setBlob(parameterIndex, new ByteArrayInputStream(bytes), bytes.length);
+            stmt.setBinaryStream(
+                parameterIndex, new ByteArrayInputStream(bytes), bytes.length);
         } else {
             stmt.setBytes(parameterIndex, bytes);
+        }
+    }
+
+    private void freeBlobsQuietly(List<Blob> blobs) {
+        for (Blob blob : blobs) {
+            try {
+                blob.free();
+            } catch (Exception error) {
+                LOG.log(System.Logger.Level.WARNING,
+                    "Failed to free JDBC BLOB parameter during cleanup", error);
+            }
+        }
+    }
+
+    private void runCleanupOnce(Runnable cleanup, AtomicBoolean cleanupDone) {
+        if (cleanup != null && cleanupDone.compareAndSet(false, true)) {
+            cleanup.run();
         }
     }
 

@@ -98,10 +98,16 @@ may instead use the reserved typed envelope:
 The marker must be exactly `binary`. `jdbc-type` is the declared JDBC type from
 column metadata, and `base64` carries the exact bytes. A JSON `null` `base64`
 means a typed SQL `NULL`, while `""` means a non-null zero-byte value. BLOB
-values are bound with `PreparedStatement.setBlob`; RAW/BINARY-family values are
-bound with `setBytes`. Typed nulls use the corresponding JDBC null type.
-Malformed or unsupported envelopes fail before JDBC execution. This is a narrow
-binary binding contract, not a general JDBC type-tagging or BLOB-streaming API.
+values with at least one byte use the standard
+`PreparedStatement.setBinaryStream` data interface with an exact length; this
+lets drivers direct-bind small values instead of forcing a temporary-LOB round
+trip. A zero-byte BLOB uses an empty `Connection.createBlob` value because
+Oracle otherwise stores an empty binary stream as SQL `NULL`. The agent frees
+that `Blob` after execution, or after a timed-out worker actually exits.
+RAW/BINARY-family values use `setBytes`. Typed nulls use the corresponding JDBC
+null type. Malformed or unsupported envelopes fail before JDBC execution. This
+is a narrow binary binding contract, not a general JDBC type-tagging or
+BLOB-streaming API.
 When `auto-commit=false` is requested, connection creation fails unless the
 driver accepts `setAutoCommit(false)`; the agent never silently continues in
 auto-commit mode.
