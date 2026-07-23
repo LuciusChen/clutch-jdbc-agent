@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import java.io.InputStream;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
+import java.sql.Blob;
 import java.sql.DatabaseMetaData;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -22,6 +23,7 @@ import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +33,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
@@ -40,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -1312,23 +1316,47 @@ class DispatcherTest {
     }
 
     @Test
-    void executeParamsUsesBinarySettersForReservedEnvelopes() throws Exception {
+    void executeParamsUsesBinaryDataInterfaceForReservedEnvelopes() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         byte[] blobBytes = "{\"message\":\"中文\"}".getBytes(StandardCharsets.UTF_8);
         byte[] rawBytes = new byte[]{0, (byte) 0xff, 0x41, 0x0a};
         byte[] emptyBytes = new byte[0];
+        byte[] oneByteBlob = new byte[]{0x5a};
+        byte[] maxInlineBlob = new byte[65_536];
         List<String> setters = new ArrayList<>();
         List<byte[]> boundBytes = new ArrayList<>();
         List<Object> objectValues = new ArrayList<>();
+        List<String> emptyBlobLifecycle =
+            Collections.synchronizedList(new ArrayList<>());
+        Blob emptyBlob = (Blob) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Blob.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "length" -> 0L;
+                case "free" -> {
+                    emptyBlobLifecycle.add("freeBlob");
+                    yield null;
+                }
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
         PreparedStatement statement = (PreparedStatement) Proxy.newProxyInstance(
             DispatcherTest.class.getClassLoader(),
             new Class<?>[]{PreparedStatement.class},
             (_proxy, method, args) -> switch (method.getName()) {
+                case "setBinaryStream" -> {
+                    setters.add("setBinaryStream:" + args[0]);
+                    byte[] bytes = ((InputStream) args[1]).readAllBytes();
+                    assertTrue(bytes.length > 0,
+                        "zero-byte BLOB must bind as an empty Blob, not a binary stream");
+                    assertEquals(bytes.length, ((Number) args[2]).intValue());
+                    boundBytes.add(bytes);
+                    yield null;
+                }
                 case "setBlob" -> {
                     setters.add("setBlob:" + args[0]);
-                    byte[] bytes = ((InputStream) args[1]).readAllBytes();
-                    assertEquals((long) bytes.length, args[2]);
-                    boundBytes.add(bytes);
+                    emptyBlobLifecycle.add("setBlob");
+                    assertSame(emptyBlob, args[1]);
+                    assertEquals(0L, ((Blob) args[1]).length());
                     yield null;
                 }
                 case "setBytes" -> {
@@ -1346,9 +1374,15 @@ class DispatcherTest {
                     yield null;
                 }
                 case "setQueryTimeout" -> null;
-                case "execute" -> false;
+                case "execute" -> {
+                    emptyBlobLifecycle.add("execute");
+                    yield false;
+                }
                 case "getUpdateCount" -> 1;
-                case "close" -> null;
+                case "close" -> {
+                    emptyBlobLifecycle.add("closeStatement");
+                    yield null;
+                }
                 case "unwrap" -> null;
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
@@ -1358,6 +1392,10 @@ class DispatcherTest {
             new Class<?>[]{Connection.class},
             (_proxy, method, _args) -> switch (method.getName()) {
                 case "prepareStatement" -> statement;
+                case "createBlob" -> {
+                    emptyBlobLifecycle.add("createBlob");
+                    yield emptyBlob;
+                }
                 case "unwrap" -> null;
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
@@ -1371,7 +1409,7 @@ class DispatcherTest {
                     UPDATE documents
                     SET payload = ?, raw_payload = ?, optional_blob = ?,
                         optional_raw = ?, empty_blob = ?, empty_raw = ?,
-                        metadata = ?""",
+                        one_byte_blob = ?, max_inline_blob = ?, metadata = ?""",
                 "values", List.of(
                     Map.of("__clutch_jdbc_param", "binary",
                            "jdbc-type", "BLOB",
@@ -1385,21 +1423,166 @@ class DispatcherTest {
                         Base64.getEncoder().encodeToString(emptyBytes)),
                     binaryEnvelope("RAW",
                         Base64.getEncoder().encodeToString(emptyBytes)),
+                    binaryEnvelope("BLOB",
+                        Base64.getEncoder().encodeToString(oneByteBlob)),
+                    binaryEnvelope("BLOB",
+                        Base64.getEncoder().encodeToString(maxInlineBlob)),
                     Map.of("status", "ready"))));
 
             assertTrue(response.ok, response.error);
             assertEquals(
-                List.of("setBlob:1", "setBytes:2",
+                List.of("setBinaryStream:1", "setBytes:2",
                         "setNull:3:" + Types.BLOB,
                         "setNull:4:" + Types.VARBINARY,
-                        "setBlob:5", "setBytes:6", "setObject:7"),
+                        "setBlob:5", "setBytes:6",
+                        "setBinaryStream:7", "setBinaryStream:8", "setObject:9"),
                 setters);
             assertArrayEquals(blobBytes, boundBytes.get(0));
             assertArrayEquals(rawBytes, boundBytes.get(1));
             assertArrayEquals(emptyBytes, boundBytes.get(2));
-            assertArrayEquals(emptyBytes, boundBytes.get(3));
+            assertArrayEquals(oneByteBlob, boundBytes.get(3));
+            assertArrayEquals(maxInlineBlob, boundBytes.get(4));
             assertEquals(List.of("{\"status\":\"ready\"}"), objectValues);
+            assertEquals(
+                List.of("createBlob", "setBlob", "execute", "closeStatement", "freeBlob"),
+                emptyBlobLifecycle);
         } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void executeParamsFreesEmptyBlobWhenExecutionFails() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        AtomicInteger freeCalls = new AtomicInteger();
+        AtomicInteger closeCalls = new AtomicInteger();
+        Blob emptyBlob = (Blob) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Blob.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "free" -> {
+                    freeCalls.incrementAndGet();
+                    yield null;
+                }
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        PreparedStatement statement = (PreparedStatement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{PreparedStatement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "setBlob", "setQueryTimeout" -> null;
+                case "execute" -> throw new SQLException("empty BLOB write failed");
+                case "close" -> {
+                    closeCalls.incrementAndGet();
+                    yield null;
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "prepareStatement" -> statement;
+                case "createBlob" -> emptyBlob;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response response = dispatcher.dispatch(request(
+                831, "execute-params",
+                "conn-id", 7,
+                "sql", "UPDATE documents SET payload = ?",
+                "values", List.of(binaryEnvelope("BLOB", ""))));
+
+            assertFalse(response.ok);
+            assertTrue(response.error.contains("empty BLOB write failed"), response.error);
+            assertEquals(1, closeCalls.get());
+            assertEquals(1, freeCalls.get());
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void executeParamsDefersEmptyBlobFreeUntilTimedOutWorkerExits() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        CountDownLatch executeStarted = new CountDownLatch(1);
+        CountDownLatch releaseDriver = new CountDownLatch(1);
+        CountDownLatch blobFreed = new CountDownLatch(1);
+        AtomicBoolean executeRunning = new AtomicBoolean(false);
+        AtomicBoolean freedWhileExecuting = new AtomicBoolean(false);
+        Blob emptyBlob = (Blob) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Blob.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "free" -> {
+                    freedWhileExecuting.set(executeRunning.get());
+                    blobFreed.countDown();
+                    yield null;
+                }
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        PreparedStatement statement = (PreparedStatement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{PreparedStatement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "setBlob", "setQueryTimeout", "cancel", "close" -> null;
+                case "execute" -> {
+                    executeRunning.set(true);
+                    executeStarted.countDown();
+                    while (releaseDriver.getCount() > 0) {
+                        try {
+                            releaseDriver.await();
+                        } catch (InterruptedException ignored) {
+                            // Simulate a JDBC driver that ignores interruption.
+                        }
+                    }
+                    executeRunning.set(false);
+                    yield false;
+                }
+                case "getUpdateCount" -> 1;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        connMgr.connection = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "prepareStatement" -> statement;
+                case "createBlob" -> emptyBlob;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Response> future = executor.submit(() -> dispatcher.dispatch(request(
+                832, "execute-params",
+                "conn-id", 7,
+                "sql", "UPDATE documents SET payload = ?",
+                "values", List.of(binaryEnvelope("BLOB", "")),
+                "query-timeout-seconds", 1)));
+            assertTrue(executeStarted.await(1, TimeUnit.SECONDS));
+
+            Response response = future.get(4, TimeUnit.SECONDS);
+
+            assertFalse(response.ok);
+            assertEquals("timeout", diagMap(response).get("category"));
+            assertTrue(connMgr.disconnected);
+            assertEquals(1L, blobFreed.getCount(),
+                "a still-running JDBC worker must retain its bound Blob");
+            releaseDriver.countDown();
+            assertTrue(blobFreed.await(1, TimeUnit.SECONDS));
+            assertFalse(freedWhileExecuting.get());
+        } finally {
+            releaseDriver.countDown();
+            executor.shutdownNow();
             dispatcher.shutdown();
         }
     }

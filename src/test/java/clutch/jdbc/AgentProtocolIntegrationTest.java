@@ -10,8 +10,10 @@ import org.junit.jupiter.api.Test;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AgentProtocolIntegrationTest {
@@ -67,9 +69,9 @@ class AgentProtocolIntegrationTest {
         ConnectionManager connections = new ConnectionManager();
         Dispatcher dispatcher = new Dispatcher(connections, new CursorManager());
         String payload = "{\"message\":\"中文\"}";
+        byte[] payloadBytes = payload.getBytes(StandardCharsets.UTF_8);
         byte[] rawPayload = new byte[]{0, (byte) 0xff, 0x41, 0x0a};
-        String base64 = Base64.getEncoder().encodeToString(
-            payload.getBytes(StandardCharsets.UTF_8));
+        String base64 = Base64.getEncoder().encodeToString(payloadBytes);
         String rawBase64 = Base64.getEncoder().encodeToString(rawPayload);
         try {
             JsonNode connect = roundTrip(mapper, dispatcher, """
@@ -96,8 +98,28 @@ class AgentProtocolIntegrationTest {
             assertTrue(insert.path("ok").asBoolean(), insert.toString());
             assertEquals(1, insert.path("result").path("affected-rows").asInt());
 
+            JsonNode emptyInsert = roundTrip(mapper, dispatcher, """
+                {"id":14,"op":"execute-params","params":{"conn-id":%d,
+                  "sql":"INSERT INTO documents (id, payload, raw_payload) VALUES (?, ?, ?)",
+                  "values":[2,
+                    {"__clutch_jdbc_param":"binary","jdbc-type":"BLOB","base64":""},
+                    {"__clutch_jdbc_param":"binary","jdbc-type":"RAW","base64":""}]}}
+                """.formatted(connId));
+            assertTrue(emptyInsert.path("ok").asBoolean(), emptyInsert.toString());
+            assertEquals(1, emptyInsert.path("result").path("affected-rows").asInt());
+
+            JsonNode nullInsert = roundTrip(mapper, dispatcher, """
+                {"id":15,"op":"execute-params","params":{"conn-id":%d,
+                  "sql":"INSERT INTO documents (id, payload, raw_payload) VALUES (?, ?, ?)",
+                  "values":[3,
+                    {"__clutch_jdbc_param":"binary","jdbc-type":"BLOB","base64":null},
+                    {"__clutch_jdbc_param":"binary","jdbc-type":"RAW","base64":null}]}}
+                """.formatted(connId));
+            assertTrue(nullInsert.path("ok").asBoolean(), nullInsert.toString());
+            assertEquals(1, nullInsert.path("result").path("affected-rows").asInt());
+
             JsonNode query = roundTrip(mapper, dispatcher, """
-                {"id":14,"op":"execute","params":{"conn-id":%d,
+                {"id":16,"op":"execute","params":{"conn-id":%d,
                   "sql":"SELECT payload FROM documents WHERE id = 1"}}
                 """.formatted(connId));
             JsonNode value = query.path("result").path("rows").path(0).path(0);
@@ -105,13 +127,25 @@ class AgentProtocolIntegrationTest {
             assertEquals(payload, value.path("text").asText());
             assertEquals("UTF-8", value.path("encoding").asText());
             try (var stmt = connections.getPrimary(connId).prepareStatement(
-                    "SELECT payload, raw_payload FROM documents WHERE id = 1");
+                    "SELECT id, payload, raw_payload FROM documents ORDER BY id");
                  var result = stmt.executeQuery()) {
                 assertTrue(result.next());
-                assertEquals(payload,
-                    new String(result.getBytes(1), StandardCharsets.UTF_8));
-                org.junit.jupiter.api.Assertions.assertArrayEquals(
-                    rawPayload, result.getBytes(2));
+                assertEquals(1, result.getInt(1));
+                assertArrayEquals(payloadBytes, result.getBytes(2));
+                assertArrayEquals(rawPayload, result.getBytes(3));
+                assertTrue(result.next());
+                assertEquals(2, result.getInt(1));
+                assertArrayEquals(new byte[0], result.getBytes(2));
+                assertFalse(result.wasNull());
+                assertArrayEquals(new byte[0], result.getBytes(3));
+                assertFalse(result.wasNull());
+                assertTrue(result.next());
+                assertEquals(3, result.getInt(1));
+                assertNull(result.getBytes(2));
+                assertTrue(result.wasNull());
+                assertNull(result.getBytes(3));
+                assertTrue(result.wasNull());
+                assertFalse(result.next());
             }
         } finally {
             connections.disconnectAll();

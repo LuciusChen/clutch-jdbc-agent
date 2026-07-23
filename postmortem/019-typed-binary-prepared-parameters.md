@@ -1,5 +1,10 @@
 # 019 - Typed Binary Prepared Parameters
 
+> Superseded in part by [020](020-blob-data-interface-binding.md): non-empty BLOB
+> values now use `PreparedStatement.setBinaryStream` rather than `setBlob` to
+> avoid forced temporary-LOB creation during parameter binding; zero-byte BLOBs
+> use an explicitly managed empty `Blob`.
+
 ## Context
 
 `execute-params` originally carried only positional JSON values and bound every value with `PreparedStatement.setObject`. That kept the protocol portable for ordinary strings, numbers, booleans, structured JSON text, and SQL NULL, but it erased the one distinction Oracle needs for binary storage. When Clutch edited textual content stored in a `BLOB`, the driver received a Java string through `setObject`, attempted a database-specific hexadecimal conversion, and failed with `ORA-01465: invalid hex number`.
