@@ -151,6 +151,24 @@ class TypeConverterTest {
     }
 
     @ParameterizedTest
+    @MethodSource("fractionalSecondBoundaries")
+    void convertTrimsFractionalSecondsAcrossNanoBoundaries(String timestamp, String expected)
+            throws SQLException {
+        assertEquals(expected,
+            TypeConverter.convert(resultSetReturning(Timestamp.valueOf(timestamp)), 1));
+    }
+
+    static Stream<Arguments> fractionalSecondBoundaries() {
+        return Stream.of(
+            Arguments.of("2024-06-28 19:30:00", "2024-06-28 19:30:00"),
+            Arguments.of("2024-06-28 19:30:00.000000001", "2024-06-28 19:30:00.000000001"),
+            Arguments.of("2024-06-28 19:30:00.0000001", "2024-06-28 19:30:00.0000001"),
+            Arguments.of("2024-06-28 19:30:00.5", "2024-06-28 19:30:00.5"),
+            Arguments.of("2024-06-28 19:30:00.99", "2024-06-28 19:30:00.99"),
+            Arguments.of("2024-06-28 19:30:00.999999999", "2024-06-28 19:30:00.999999999"));
+    }
+
+    @ParameterizedTest
     @MethodSource("basicTypeConversions")
     void convertHandlesBasicJdbcTypes(Object input, Object expected) throws SQLException {
         assertEquals(expected, TypeConverter.convert(resultSetReturning(input), 1));

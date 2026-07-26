@@ -7,8 +7,21 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
+import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -17,6 +30,130 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AgentProtocolIntegrationTest {
+
+    @Test
+    void serveWritesOneParseableAtomicLinePerRequest() throws Exception {
+        // Drive the production loop -- serve, writeLine, the stdout lock,
+        // and the real request pool -- with more requests than pool slots.
+        // Every request must come back as exactly one parseable line with a
+        // unique id (dispatcher error or overload rejection both qualify);
+        // an interleaved or split line would fail JSON parsing.
+        int requests = 100;
+        StringBuilder input = new StringBuilder();
+        for (int i = 1; i <= requests; i++) {
+            input.append("{\"id\":").append(i)
+                 .append(",\"op\":\"no-such-op\",\"params\":{}}\n");
+        }
+        ObjectMapper mapper = new ObjectMapper();
+        Dispatcher dispatcher = new Dispatcher(new ConnectionManager(), new CursorManager());
+        ExecutorService pool = Agent.newRequestPool();
+        ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        try {
+            Agent.serve(new BufferedReader(new StringReader(input.toString())),
+                        new BufferedOutputStream(sink), mapper, dispatcher, pool);
+        } finally {
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+            dispatcher.shutdown();
+        }
+        String[] lines = sink.toString(StandardCharsets.UTF_8).split("\n");
+        assertEquals(requests + 1, lines.length);
+        Set<Integer> ids = new HashSet<>();
+        for (String line : lines) {
+            JsonNode response = mapper.readTree(line);
+            assertTrue(ids.add(response.get("id").asInt()),
+                       "duplicate response id in: " + line);
+        }
+        assertTrue(ids.contains(0), "missing ready line");
+        for (int i = 1; i <= requests; i++) {
+            assertTrue(ids.contains(i), "missing response for request " + i);
+        }
+    }
+
+    @Test
+    void serveFlushesExactlyOncePerLineAndSurfacesWriteFailures() throws Exception {
+        // One flush per protocol line: an autoFlush PrintStream underneath
+        // would double it, and System.out would swallow the IOException.
+        class FlushCounting extends ByteArrayOutputStream {
+            int flushes;
+            @Override
+            public void flush() throws IOException {
+                flushes++;
+                super.flush();
+            }
+        }
+        ObjectMapper mapper = new ObjectMapper();
+        Dispatcher dispatcher = new Dispatcher(new ConnectionManager(), new CursorManager());
+        ExecutorService pool = Agent.newRequestPool();
+        FlushCounting sink = new FlushCounting();
+        try {
+            Agent.serve(new BufferedReader(new StringReader("")), sink,
+                        mapper, dispatcher, pool);
+            assertEquals(1, sink.flushes, "ready line must flush exactly once");
+            byte[] bytes = sink.toByteArray();
+            assertEquals('\n', bytes[bytes.length - 1]);
+
+            OutputStream failing = new OutputStream() {
+                @Override
+                public void write(int b) throws IOException {
+                    throw new IOException("stdout gone");
+                }
+            };
+            assertThrows(IOException.class,
+                         () -> Agent.serve(new BufferedReader(new StringReader("")),
+                                           failing, mapper, dispatcher, pool));
+        } finally {
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void serveRejectsRequestsBeyondPoolCapacityWithOverloadErrors() throws Exception {
+        // Deterministic overload: block every worker on a latch, then submit
+        // more requests than pool slots.  The surplus must each get an
+        // overload error line while the workers are still held.
+        int held = Agent.MAX_CONCURRENT_REQUESTS;
+        int surplus = 10;
+        CountDownLatch release = new CountDownLatch(1);
+        ObjectMapper mapper = new ObjectMapper();
+        Dispatcher dispatcher = new Dispatcher(new ConnectionManager(), new CursorManager()) {
+            @Override
+            public Response dispatch(Request request) {
+                try {
+                    release.await(30, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return Response.error(request.id, "released");
+            }
+        };
+        StringBuilder input = new StringBuilder();
+        for (int i = 1; i <= held + surplus; i++) {
+            input.append("{\"id\":").append(i)
+                 .append(",\"op\":\"held\",\"params\":{}}\n");
+        }
+        ExecutorService pool = Agent.newRequestPool();
+        ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        try {
+            Agent.serve(new BufferedReader(new StringReader(input.toString())),
+                        new BufferedOutputStream(sink), mapper, dispatcher, pool);
+        } finally {
+            release.countDown();
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+            dispatcher.shutdown();
+        }
+        int overloaded = 0;
+        for (String line : sink.toString(StandardCharsets.UTF_8).split("\n")) {
+            JsonNode error = mapper.readTree(line).get("error");
+            if (error != null && error.asText().startsWith("Agent overloaded")) {
+                overloaded++;
+            }
+        }
+        assertEquals(surplus, overloaded);
+    }
 
     @Test
     void jsonProtocolExecutesPreparedJdbcRoundTrip() throws Exception {
