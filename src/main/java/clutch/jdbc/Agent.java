@@ -53,18 +53,37 @@ public class Agent {
         Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
         ExecutorService requestPool = newRequestPool();
 
-        // stdout must be line-buffered and UTF-8 for the protocol.
-        PrintStream out = new PrintStream(
-            new BufferedOutputStream(System.out), true, StandardCharsets.UTF_8);
-
-        // Signal readiness to Emacs.
-        out.println(mapper.writeValueAsString(
-            Response.ok(0, java.util.Map.of("agent", "clutch-jdbc-agent", "ready", true))));
-
-        // Main loop: one request per line.
+        // stdout is buffered and flushed exactly once per protocol line by
+        // writeLine.  Write to the file descriptor directly: System.out is
+        // an autoFlush PrintStream that would flush twice per line and
+        // swallow IOExceptions into checkError().
+        OutputStream out = new BufferedOutputStream(
+            new FileOutputStream(FileDescriptor.out));
         BufferedReader in = new BufferedReader(
             new InputStreamReader(System.in, StandardCharsets.UTF_8));
 
+        serve(in, out, mapper, dispatcher, requestPool);
+
+        // stdin closed — clean up and exit.
+        LOG.log(System.Logger.Level.INFO, "stdin closed, shutting down.");
+        requestPool.shutdownNow();
+        connMgr.disconnectAll();
+        dispatcher.shutdown();
+    }
+
+    /**
+     * Serve the line protocol on IN/OUT until IN is exhausted: emit the
+     * ready signal, then dispatch one JSON request per line.
+     * Package-private so tests can drive the real framing and locking.
+     */
+    static void serve(BufferedReader in, OutputStream out, ObjectMapper mapper,
+                      Dispatcher dispatcher, ExecutorService requestPool)
+            throws IOException {
+        // Signal readiness to Emacs.
+        writeLine(mapper, out,
+            Response.ok(0, java.util.Map.of("agent", "clutch-jdbc-agent", "ready", true)));
+
+        // Main loop: one request per line.
         String line;
         while ((line = in.readLine()) != null) {
             line = line.strip();
@@ -77,9 +96,7 @@ public class Agent {
                 LOG.log(System.Logger.Level.ERROR,
                         "Error parsing request line: {0}",
                         e.getMessage());
-                synchronized (out) {
-                    out.println(mapper.writeValueAsString(Response.error(-1, e.getMessage())));
-                }
+                writeLine(mapper, out, Response.error(-1, e.getMessage()));
                 continue;
             }
 
@@ -89,21 +106,12 @@ public class Agent {
                 LOG.log(System.Logger.Level.WARNING,
                         "Rejecting request {0}: request pool saturated",
                         req.id);
-                synchronized (out) {
-                    out.println(mapper.writeValueAsString(
-                        Response.error(req.id, REQUEST_OVERLOADED_ERROR)));
-                }
+                writeLine(mapper, out, Response.error(req.id, REQUEST_OVERLOADED_ERROR));
             }
         }
-
-        // stdin closed — clean up and exit.
-        LOG.log(System.Logger.Level.INFO, "stdin closed, shutting down.");
-        requestPool.shutdownNow();
-        connMgr.disconnectAll();
-        dispatcher.shutdown();
     }
 
-    private static ExecutorService newRequestPool() {
+    static ExecutorService newRequestPool() {
         ThreadPoolExecutor pool = new ThreadPoolExecutor(
             MAX_CONCURRENT_REQUESTS,
             MAX_CONCURRENT_REQUESTS,
@@ -120,25 +128,37 @@ public class Agent {
     }
 
     private static void handleRequest(Dispatcher dispatcher, ObjectMapper mapper,
-                                      PrintStream out, Request req) {
+                                      OutputStream out, Request req) {
         try {
             Response resp = dispatcher.dispatch(req);
-            synchronized (out) {
-                out.println(mapper.writeValueAsString(resp));
-            }
+            writeLine(mapper, out, resp);
         } catch (Exception e) {
             LOG.log(System.Logger.Level.ERROR,
                     "Error handling request {0}: {1}",
                     req.id, e.getMessage());
             try {
-                synchronized (out) {
-                    out.println(mapper.writeValueAsString(Response.error(req.id, e.getMessage())));
-                }
+                writeLine(mapper, out, Response.error(req.id, e.getMessage()));
             } catch (IOException ioException) {
                 LOG.log(System.Logger.Level.ERROR,
                         "Error writing error response for request {0}: {1}",
                         req.id, ioException.getMessage());
             }
+        }
+    }
+
+    /**
+     * Serialize RESP straight to UTF-8 bytes and write it as one protocol line.
+     * Skipping the intermediate UTF-16 String halves the copies on the
+     * response hot path; the synchronized block keeps each line atomic and
+     * the single explicit flush pushes payload and newline together.
+     */
+    private static void writeLine(ObjectMapper mapper, OutputStream out, Response resp)
+            throws IOException {
+        byte[] payload = mapper.writeValueAsBytes(resp);
+        synchronized (out) {
+            out.write(payload, 0, payload.length);
+            out.write('\n');
+            out.flush();
         }
     }
 
