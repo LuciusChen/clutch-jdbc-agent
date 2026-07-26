@@ -153,6 +153,73 @@ class AgentProtocolIntegrationTest {
         }
     }
 
+    @Test
+    void forceDisconnectBypassesAStuckConnectionLock() throws Exception {
+        Class.forName("org.h2.Driver");
+        ObjectMapper mapper = new ObjectMapper();
+        ConnectionManager connections = new ConnectionManager();
+        Dispatcher dispatcher = new Dispatcher(connections, new CursorManager());
+        Thread stuck = null;
+        try {
+            JsonNode connect = roundTrip(mapper, dispatcher, """
+                {"id":1,"op":"connect","params":{
+                  "url":"jdbc:h2:mem:forcedisc;DB_CLOSE_DELAY=-1",
+                  "driver-class":"org.h2.Driver",
+                  "user":"sa","password":"","auto-commit":true,
+                  "validate-after-idle-seconds":300}}
+                """);
+            assertTrue(connect.path("ok").asBoolean());
+            int connId = connect.path("result").path("conn-id").asInt();
+
+            assertTrue(roundTrip(mapper, dispatcher, """
+                {"id":2,"op":"execute","params":{"conn-id":%d,
+                  "sql":"CREATE ALIAS IF NOT EXISTS SLEEP FOR 'java.lang.Thread.sleep(long)'"}}
+                """.formatted(connId)).path("ok").asBoolean());
+
+            // Occupy the foreground lock the way a stuck JDBC call would.
+            java.util.concurrent.CountDownLatch entered =
+                new java.util.concurrent.CountDownLatch(1);
+            stuck = new Thread(() -> {
+                entered.countDown();
+                try {
+                    roundTrip(mapper, dispatcher, """
+                        {"id":3,"op":"execute","params":{"conn-id":%d,
+                          "sql":"SELECT SLEEP(8000)"}}
+                        """.formatted(connId));
+                } catch (Exception ignored) {
+                    // The forced close is expected to fail this call.
+                }
+            }, "stuck-jdbc-call");
+            stuck.setDaemon(true);
+            stuck.start();
+            assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS));
+            Thread.sleep(300); // let the execute reach the driver
+
+            // The ordinary disconnect would block behind the lock; the
+            // forced one must return promptly and drop the session.
+            long start = System.nanoTime();
+            JsonNode forced = roundTrip(mapper, dispatcher, """
+                {"id":4,"op":"force-disconnect","params":{"conn-id":%d}}
+                """.formatted(connId));
+            long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+            assertTrue(forced.path("ok").asBoolean());
+            assertTrue(elapsedMillis < 2000,
+                "force-disconnect blocked for " + elapsedMillis + "ms");
+            assertFalse(connections.hasConnection(connId));
+
+            // Idempotent for connections that are already gone.
+            assertTrue(roundTrip(mapper, dispatcher, """
+                {"id":5,"op":"force-disconnect","params":{"conn-id":%d}}
+                """.formatted(connId)).path("ok").asBoolean());
+        } finally {
+            if (stuck != null) {
+                stuck.join(10_000);
+            }
+            connections.disconnectAll();
+            dispatcher.shutdown();
+        }
+    }
+
     private JsonNode roundTrip(ObjectMapper mapper, Dispatcher dispatcher, String json)
             throws Exception {
         Request request = mapper.readValue(json, Request.class);
