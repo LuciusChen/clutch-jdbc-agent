@@ -171,7 +171,19 @@ public class TypeConverter {
         if (nanos == 0) {
             return base;
         }
-        String fraction = String.format("%09d", nanos).replaceFirst("0+$", "");
-        return base + "." + fraction;
+        // Hand-rolled zero-pad and trailing-zero trim: String.format plus
+        // String.replaceFirst would parse a format spec and compile a Pattern
+        // for every fractional value on the row hot path.
+        char[] digits = new char[9];
+        int rest = nanos;
+        for (int i = 8; i >= 0; i--) {
+            digits[i] = (char) ('0' + rest % 10);
+            rest /= 10;
+        }
+        int end = 9;
+        while (end > 1 && digits[end - 1] == '0') {
+            end--;
+        }
+        return base + "." + new String(digits, 0, end);
     }
 }
