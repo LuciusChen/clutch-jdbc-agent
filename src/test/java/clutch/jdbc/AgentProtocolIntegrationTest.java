@@ -184,7 +184,7 @@ class AgentProtocolIntegrationTest {
                 try {
                     roundTrip(mapper, dispatcher, """
                         {"id":3,"op":"execute","params":{"conn-id":%d,
-                          "sql":"SELECT SLEEP(8000)"}}
+                          "sql":"SELECT SLEEP(3000)"}}
                         """.formatted(connId));
                 } catch (Exception ignored) {
                     // The forced close is expected to fail this call.
@@ -212,9 +212,8 @@ class AgentProtocolIntegrationTest {
                 {"id":5,"op":"force-disconnect","params":{"conn-id":%d}}
                 """.formatted(connId)).path("ok").asBoolean());
         } finally {
-            if (stuck != null) {
-                stuck.join(10_000);
-            }
+            // The wedged call sleeps out on its own daemon thread; waiting
+            // for it would only bill the test for the prop's duration.
             connections.disconnectAll();
             dispatcher.shutdown();
         }
