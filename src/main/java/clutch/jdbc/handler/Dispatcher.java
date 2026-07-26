@@ -196,6 +196,7 @@ public class Dispatcher {
             case "ping" -> ping(req);
             case "connect" -> connect(req);
             case "disconnect" -> disconnect(req);
+            case "force-disconnect" -> forceDisconnect(req);
             case "commit" -> commit(req);
             case "rollback" -> rollback(req);
             case "set-auto-commit" -> setAutoCommit(req);
@@ -291,6 +292,23 @@ public class Dispatcher {
         cursorMgr.closeForConnection(connId);
         connMgr.disconnect(connId);
         runningStatements.remove(connId);
+        return Response.ok(req.id, Map.of("conn-id", connId));
+    }
+
+    /**
+     * Remove a logical connection without waiting for its locks.
+     *
+     * The ordinary disconnect queues behind the connection's foreground and
+     * metadata locks, so a JDBC call stuck inside either of them blocks the
+     * release forever and pins a request thread.  This op runs unlocked:
+     * the session leaves the map immediately, cursors are abandoned rather
+     * than closed, and the JDBC resources close off-thread where a
+     * non-cooperative driver cannot delay invalidation.  A no-op for
+     * already removed connections.
+     */
+    private Response forceDisconnect(Request req) throws SQLException {
+        int connId = getInt(req, "conn-id");
+        poisonConnection(connId);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
@@ -681,7 +699,7 @@ public class Dispatcher {
 
     private boolean requestBypassesConnectionLock(Request req) {
         return switch (req.op) {
-            case "ping", "connect", "cancel" -> true;
+            case "ping", "connect", "cancel", "force-disconnect" -> true;
             default -> false;
         };
     }
