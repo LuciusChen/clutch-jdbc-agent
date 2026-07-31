@@ -6,30 +6,88 @@ import clutch.jdbc.model.Response;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Base64;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AgentProtocolIntegrationTest {
+
+    private static final String NOISY_DRIVER_OUTPUT = "noisy-driver-console-output";
+
+    @Test
+    void mainQuarantinesDriverStdoutFromJsonProtocol(@TempDir Path driversDir)
+            throws Exception {
+        String driverClassName = NoisyDriver.class.getName();
+        String driverClassResource = driverClassName.replace('.', '/') + ".class";
+        InputStream driverClassBytes = getClass().getClassLoader()
+            .getResourceAsStream(driverClassResource);
+        assertNotNull(driverClassBytes);
+        try (driverClassBytes;
+             JarOutputStream jar = new JarOutputStream(
+                 Files.newOutputStream(driversDir.resolve("noisy-driver.jar")))) {
+            jar.putNextEntry(new JarEntry(driverClassResource));
+            driverClassBytes.transferTo(jar);
+            jar.closeEntry();
+            jar.putNextEntry(new JarEntry("META-INF/services/java.sql.Driver"));
+            jar.write((driverClassName + "\n").getBytes(StandardCharsets.UTF_8));
+            jar.closeEntry();
+        }
+
+        String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        Process process = new ProcessBuilder(
+            java, "-cp", System.getProperty("java.class.path"),
+            Agent.class.getName(), driversDir.toString()).start();
+        try {
+            try (OutputStream input = process.getOutputStream()) {
+                input.write("{\"id\":1,\"op\":\"ping\",\"params\":{}}\n"
+                    .getBytes(StandardCharsets.UTF_8));
+            }
+            assertTrue(process.waitFor(10, TimeUnit.SECONDS), "agent process did not exit");
+            String stdout = new String(
+                process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            String stderr = new String(
+                process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+            List<String> protocolLines = stdout.lines()
+                .filter(line -> !line.isBlank())
+                .toList();
+
+            assertEquals(2, protocolLines.size(), stdout);
+            ObjectMapper mapper = new ObjectMapper();
+            assertEquals(0, mapper.readTree(protocolLines.get(0)).path("id").asInt());
+            assertEquals(1, mapper.readTree(protocolLines.get(1)).path("id").asInt());
+            assertFalse(stdout.contains(NOISY_DRIVER_OUTPUT), stdout);
+            assertTrue(stderr.contains(NOISY_DRIVER_OUTPUT), stderr);
+        } finally {
+            process.destroyForcibly();
+        }
+    }
 
     @Test
     void serveWritesOneParseableAtomicLinePerRequest() throws Exception {
@@ -376,5 +434,12 @@ class AgentProtocolIntegrationTest {
         Request request = mapper.readValue(json, Request.class);
         Response response = dispatcher.dispatch(request);
         return mapper.readTree(mapper.writeValueAsBytes(response));
+    }
+
+    /** Service-loaded test driver that simulates unconditional console output. */
+    public static final class NoisyDriver extends org.h2.Driver {
+        static {
+            System.out.println(NOISY_DRIVER_OUTPUT);
+        }
     }
 }

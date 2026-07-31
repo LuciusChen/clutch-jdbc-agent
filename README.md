@@ -60,8 +60,10 @@ for the full setup guide.
 
 ## Protocol
 
-One JSON object per line on stdin/stdout. stdout is exclusively protocol output;
-all logging goes to stderr.
+One JSON object per line on stdin/stdout. The agent reserves the operating-system
+stdout handle for protocol output, then redirects Java's global `System.out` to
+UTF-8 stderr before loading third-party drivers. Agent logs and driver console
+messages therefore remain visible on stderr without corrupting protocol framing.
 
 ### Request format
 

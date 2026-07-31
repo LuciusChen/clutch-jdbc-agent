@@ -23,7 +23,8 @@ import java.util.concurrent.TimeUnit;
  *
  * drivers-dir defaults to "./drivers" relative to the jar location.
  *
- * stderr is used exclusively for logging — never for protocol messages.
+ * stderr carries agent logs and quarantined third-party console output,
+ * never protocol messages.
  */
 public class Agent {
 
@@ -34,6 +35,13 @@ public class Agent {
 
     /** Start the agent: load drivers, emit ready signal, then loop on stdin. */
     public static void main(String[] args) throws Exception {
+        // Keep an independent handle to the real stdout for protocol writes,
+        // then quarantine Java-level stdout before any third-party driver code
+        // can load.  Some drivers print login/status text unconditionally.
+        OutputStream out = new BufferedOutputStream(
+            new FileOutputStream(FileDescriptor.out));
+        System.setOut(new PrintStream(System.err, true, StandardCharsets.UTF_8));
+
         // Determine drivers directory.
         File driversDir = args.length > 0
             ? new File(args[0])
@@ -53,12 +61,8 @@ public class Agent {
         Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
         ExecutorService requestPool = newRequestPool();
 
-        // stdout is buffered and flushed exactly once per protocol line by
-        // writeLine.  Write to the file descriptor directly: System.out is
-        // an autoFlush PrintStream that would flush twice per line and
-        // swallow IOExceptions into checkError().
-        OutputStream out = new BufferedOutputStream(
-            new FileOutputStream(FileDescriptor.out));
+        // The dedicated stdout handle is flushed exactly once per protocol
+        // line by writeLine and surfaces IOExceptions directly.
         BufferedReader in = new BufferedReader(
             new InputStreamReader(System.in, StandardCharsets.UTF_8));
 
