@@ -203,8 +203,10 @@ Before committing significant changes, review the whole diff:
 - **No redundancy**: remove duplicated logic or dead code introduced by the change.
 - **Protocol stability**: any change to request/response field names or semantics
   is a breaking change for the Emacs side. Coordinate with `clutch-db-jdbc.el`.
-- **No stdout pollution**: `grep 'System.out' src/` must return zero results
-  outside `Agent.java`'s protocol writes.
+- **No stdout pollution**: production `System.out` use belongs only in
+  `Agent.java`, where it is redirected away from the protocol before third-party
+  code loads. A deliberate test-only noisy driver may write there solely to
+  prove that quarantine boundary.
 - **Compile clean**: `mvn package` must produce zero warnings.
 
 ## Quality Checks
@@ -212,7 +214,8 @@ Before committing significant changes, review the whole diff:
 Before releasing:
 - `mvn package` produces no warnings.
 - All `public` methods and classes have Javadoc.
-- `System.out` is used **only** in `Agent.java` for protocol output.
+- Production `System.out` references appear **only** in `Agent.java`'s startup
+  quarantine; protocol writes use its dedicated `FileDescriptor.out` stream.
 - All `System.err` / logger calls use structured messages (no string concatenation
   in hot paths).
 - Smoke test: `echo '{"id":1,"op":"ping","params":{}}' | java -jar target/clutch-jdbc-agent-*.jar`
