@@ -148,6 +148,9 @@ context and a redacted Java stack trace.
 | `commit`          | Commit the current transaction                   |
 | `rollback`        | Roll back the current transaction                |
 | `set-auto-commit` | Toggle JDBC autocommit on the primary session    |
+| `create-savepoint` | Create a savepoint, returning an opaque `savepoint-id` |
+| `rollback-savepoint` | Roll back to and release an opaque savepoint   |
+| `release-savepoint` | Release an opaque savepoint after success       |
 | `set-current-schema` | Update current schema on primary + metadata sessions |
 | `cancel`          | Cancel the currently running statement for a connection |
 | `execute`         | Execute SQL; returns first batch + `cursor-id`   |
@@ -209,6 +212,18 @@ clutch-jdbc-agent (JVM process)
 ```
 
 The agent no longer runs requests on one global synchronous lane. The stdin loop parses requests and hands them to a small request pool. The dispatcher uses independent per-connection foreground and metadata locks, so ordinary queries and metadata may run in parallel without allowing two operations to race on either JDBC session. Schema changes and disconnect acquire both locks in foreground-then-metadata order. If an idle timeout or Oracle `ORA-12592` makes the metadata session unsafe, the agent replaces only that session, restores the remembered schema, and retries the metadata request once; a failed retry or schema restore invalidates that replacement for the next request instead of reusing uncertain state. The primary transaction is untouched. `cancel` is the deliberate exception to serialization: it can arrive while `execute` or `fetch` is running, locate the live `Statement`, and call `Statement.cancel()` without tearing down the whole session.
+
+Savepoint operations are direct translations of the standard JDBC
+`Connection` API. `create-savepoint` rejects auto-commit sessions and checks
+`DatabaseMetaData.supportsSavepoints()` before creating any savepoint.
+Savepoint ids are opaque agent-local handles. `ConnectionManager` owns both
+the JDBC objects and their lifecycle: successful commit, rollback, or
+autocommit transition invalidates them under the same session lock, while a
+failed outer boundary does not proactively clear them while the session remains
+live. A rollback-to-savepoint recovery consumes its handle even on failure
+because its partial outcome is unknown. Disconnect or fatal session
+invalidation removes every remaining handle. The agent does not interpret SQL
+or decide when a client workflow should create a savepoint.
 
 This is still intentionally much simpler than a fully async server: no
 connection pooling, no SQL rewriting, and no multi-statement scheduling inside

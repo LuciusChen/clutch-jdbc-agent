@@ -163,6 +163,7 @@ public class Dispatcher {
     private boolean requestUsesDirectConnectionId(String op) {
         return switch (op) {
             case "disconnect", "commit", "rollback", "set-auto-commit",
+                 "create-savepoint", "rollback-savepoint", "release-savepoint",
                  "set-current-schema", "execute", "execute-params" -> true;
             default -> false;
         };
@@ -200,6 +201,9 @@ public class Dispatcher {
             case "commit" -> commit(req);
             case "rollback" -> rollback(req);
             case "set-auto-commit" -> setAutoCommit(req);
+            case "create-savepoint" -> createSavepoint(req);
+            case "rollback-savepoint" -> rollbackSavepoint(req);
+            case "release-savepoint" -> releaseSavepoint(req);
             case "cancel" -> cancel(req);
             case "execute" -> execute(req);
             case "execute-params" -> executeParams(req);
@@ -314,21 +318,47 @@ public class Dispatcher {
 
     private Response commit(Request req) throws SQLException {
         int connId = getInt(req, "conn-id");
-        primaryConnection(connId).commit();
+        connMgr.commit(connId);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
     private Response rollback(Request req) throws SQLException {
         int connId = getInt(req, "conn-id");
-        primaryConnection(connId).rollback();
+        connMgr.rollback(connId);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
     private Response setAutoCommit(Request req) throws SQLException {
         int connId = getInt(req, "conn-id");
         boolean autoCommit = getBoolean(req, "auto-commit", true);
-        primaryConnection(connId).setAutoCommit(autoCommit);
+        connMgr.setAutoCommit(connId, autoCommit);
         return Response.ok(req.id, Map.of("conn-id", connId, "auto-commit", autoCommit));
+    }
+
+    private Response createSavepoint(Request req) throws SQLException {
+        int connId = getInt(req, "conn-id");
+        int savepointId = connMgr.createSavepoint(connId);
+        return Response.ok(req.id, Map.of(
+            "conn-id", connId,
+            "savepoint-id", savepointId));
+    }
+
+    private Response rollbackSavepoint(Request req) throws SQLException {
+        int connId = getInt(req, "conn-id");
+        int savepointId = getInt(req, "savepoint-id");
+        connMgr.rollbackSavepoint(connId, savepointId);
+        return Response.ok(req.id, Map.of(
+            "conn-id", connId,
+            "savepoint-id", savepointId));
+    }
+
+    private Response releaseSavepoint(Request req) throws SQLException {
+        int connId = getInt(req, "conn-id");
+        int savepointId = getInt(req, "savepoint-id");
+        connMgr.releaseSavepoint(connId, savepointId);
+        return Response.ok(req.id, Map.of(
+            "conn-id", connId,
+            "savepoint-id", savepointId));
     }
 
     private Response cancel(Request req) {

@@ -3,12 +3,14 @@ package clutch.jdbc;
 import java.sql.Connection;
 import java.sql.Driver;
 import java.sql.DriverManager;
+import java.sql.Savepoint;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLException;
 import java.time.Clock;
 import java.util.Collections;
 import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -31,6 +33,7 @@ public class ConnectionManager {
 
     private final Clock clock;
     private final AtomicInteger nextId = new AtomicInteger(1);
+    private final AtomicInteger nextSavepointId = new AtomicInteger(1);
     private final Map<Integer, Session> connections = new ConcurrentHashMap<>();
     private final ExecutorService networkTimeoutExecutor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "clutch-jdbc-network-timeout");
@@ -191,11 +194,109 @@ public class ConnectionManager {
 
     /** Return the live primary Connection for {@code connId}, or throw if unknown. */
     public Connection getPrimary(int connId) throws SQLException {
-        Session session = connections.get(connId);
-        if (session == null)
-            throw new SQLException("Unknown connection id: " + connId);
+        Session session = requireSession(connId);
         session.markPrimaryUsed(clock.millis());
         return session.primary();
+    }
+
+    /** Commit the primary transaction and invalidate its savepoint handles. */
+    public void commit(int connId) throws SQLException {
+        Session session = requireSession(connId);
+        synchronized (session) {
+            try {
+                session.primary().commit();
+                session.savepoints.clear();
+            } finally {
+                session.markPrimaryUsed(clock.millis());
+            }
+        }
+    }
+
+    /** Roll back the primary transaction and invalidate its savepoint handles. */
+    public void rollback(int connId) throws SQLException {
+        Session session = requireSession(connId);
+        synchronized (session) {
+            try {
+                session.primary().rollback();
+                session.savepoints.clear();
+            } finally {
+                session.markPrimaryUsed(clock.millis());
+            }
+        }
+    }
+
+    /** Set primary auto-commit and invalidate savepoint handles after success. */
+    public void setAutoCommit(int connId, boolean autoCommit) throws SQLException {
+        Session session = requireSession(connId);
+        synchronized (session) {
+            try {
+                Connection primary = session.primary();
+                if (primary.getAutoCommit() != autoCommit) {
+                    primary.setAutoCommit(autoCommit);
+                    session.savepoints.clear();
+                }
+            } finally {
+                session.markPrimaryUsed(clock.millis());
+            }
+        }
+    }
+
+    /**
+     * Create a savepoint on a manual-commit primary connection.
+     *
+     * @return an opaque process-local identifier for later rollback or release
+     */
+    public int createSavepoint(int connId) throws SQLException {
+        Session session = requireSession(connId);
+        synchronized (session) {
+            Connection primary = session.primary();
+            if (primary.getAutoCommit()) {
+                throw new SQLException("Cannot create a savepoint in auto-commit mode");
+            }
+            if (!primary.getMetaData().supportsSavepoints()) {
+                throw new SQLFeatureNotSupportedException(
+                    "JDBC driver does not support savepoints");
+            }
+            Savepoint savepoint = primary.setSavepoint();
+            int savepointId = nextSavepointId.getAndIncrement();
+            session.savepoints.put(savepointId, savepoint);
+            session.markPrimaryUsed(clock.millis());
+            return savepointId;
+        }
+    }
+
+    /** Roll back to and release the savepoint identified by {@code savepointId}. */
+    public void rollbackSavepoint(int connId, int savepointId) throws SQLException {
+        Session session = requireSession(connId);
+        synchronized (session) {
+            Savepoint savepoint = session.savepoint(savepointId);
+            try {
+                session.primary().rollback(savepoint);
+                session.primary().releaseSavepoint(savepoint);
+            } finally {
+                session.savepoints.remove(savepointId);
+                session.markPrimaryUsed(clock.millis());
+            }
+        }
+    }
+
+    /** Release the savepoint identified by {@code savepointId}. */
+    public void releaseSavepoint(int connId, int savepointId) throws SQLException {
+        Session session = requireSession(connId);
+        synchronized (session) {
+            Savepoint savepoint = session.savepoint(savepointId);
+            session.primary().releaseSavepoint(savepoint);
+            session.savepoints.remove(savepointId);
+            session.markPrimaryUsed(clock.millis());
+        }
+    }
+
+    private Session requireSession(int connId) throws SQLException {
+        Session session = connections.get(connId);
+        if (session == null) {
+            throw new SQLException("Unknown connection id: " + connId);
+        }
+        return session;
     }
 
     /** Mark successful or attempted foreground use of the primary JDBC session. */
@@ -430,6 +531,7 @@ public class ConnectionManager {
         private final long validateAfterIdleMillis;
         private volatile long lastPrimaryUseMillis;
         private volatile String currentSchema;
+        private final Map<Integer, Savepoint> savepoints = new HashMap<>();
 
         private Session(Connection primary, Connection metadata, String url,
                         Properties props, Integer connectTimeoutSeconds,
@@ -461,6 +563,14 @@ public class ConnectionManager {
 
         private void markPrimaryUsed(long nowMillis) {
             this.lastPrimaryUseMillis = nowMillis;
+        }
+
+        private Savepoint savepoint(int savepointId) throws SQLException {
+            Savepoint savepoint = savepoints.get(savepointId);
+            if (savepoint == null) {
+                throw new SQLException("Unknown savepoint id: " + savepointId);
+            }
+            return savepoint;
         }
     }
 }
