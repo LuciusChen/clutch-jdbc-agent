@@ -1,5 +1,9 @@
 # 003 — Manual commit mode enters the JDBC agent protocol
 
+_Extended by [021](021-savepoint-primitives.md), which adds direct JDBC
+savepoint primitives without moving transaction workflow policy into the
+agent._
+
 ## Background
 
 The original JDBC agent deliberately stopped at auto-commit execution:

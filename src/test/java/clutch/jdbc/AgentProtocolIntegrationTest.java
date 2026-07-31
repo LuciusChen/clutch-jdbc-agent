@@ -73,7 +73,7 @@ class AgentProtocolIntegrationTest {
     @Test
     void serveFlushesExactlyOncePerLineAndSurfacesWriteFailures() throws Exception {
         // One flush per protocol line: an autoFlush PrintStream underneath
-        // would double it, and System.out would swallow the IOException.
+        // would double it, and the standard-output PrintStream would swallow the IOException.
         class FlushCounting extends ByteArrayOutputStream {
             int flushes;
             @Override
@@ -185,11 +185,26 @@ class AgentProtocolIntegrationTest {
                 """.formatted(connId));
             assertEquals(1, insert.path("result").path("affected-rows").asInt());
 
+            JsonNode savepoint = roundTrip(mapper, dispatcher, """
+                {"id":4,"op":"create-savepoint","params":{"conn-id":%d}}
+                """.formatted(connId));
+            int savepointId = savepoint.path("result").path("savepoint-id").asInt();
+            assertTrue(savepointId > 0);
+            assertTrue(roundTrip(mapper, dispatcher, """
+                {"id":5,"op":"execute","params":{"conn-id":%d,
+                  "sql":"INSERT INTO orders VALUES (18, 'batch', NULL)"}}
+                """.formatted(connId)).path("ok").asBoolean());
+            assertTrue(roundTrip(mapper, dispatcher, """
+                {"id":6,"op":"rollback-savepoint","params":{
+                  "conn-id":%d,"savepoint-id":%d}}
+                """.formatted(connId, savepointId)).path("ok").asBoolean());
+
             JsonNode query = roundTrip(mapper, dispatcher, """
-                {"id":4,"op":"execute","params":{"conn-id":%d,
-                  "sql":"SELECT id, note, optional FROM orders"}}
+                {"id":7,"op":"execute","params":{"conn-id":%d,
+                  "sql":"SELECT id, note, optional FROM orders ORDER BY id"}}
                 """.formatted(connId));
             JsonNode row = query.path("result").path("rows").path(0);
+            assertEquals(1, query.path("result").path("rows").size());
             assertEquals(17, row.path(0).asInt());
             assertEquals("中文", row.path(1).asText());
             assertTrue(row.path(2).isNull());

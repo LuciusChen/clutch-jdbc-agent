@@ -4,9 +4,11 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.Driver;
 import java.sql.DriverManager;
 import java.sql.DriverPropertyInfo;
+import java.sql.Savepoint;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLException;
@@ -103,6 +105,149 @@ class ConnectionManagerTest {
                     "metadata connection must not open after manual-commit setup fails");
                 assertEquals(1, driver.closedCount,
                     "failed primary connection must be closed");
+            } finally {
+                mgr.disconnectAll();
+                DriverManager.deregisterDriver(driver);
+            }
+        }
+    }
+
+    @Test
+    void savepointsUsePrimaryJdbcObjectsAndOpaqueLocalIds() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager();
+            int connId = mgr.connect("jdbc:test:savepoints", "analyst", "secret",
+                Map.of(), null, null, null, false, RecordingDriver.class.getName());
+
+            int firstId = mgr.createSavepoint(connId);
+            mgr.rollbackSavepoint(connId, firstId);
+            int secondId = mgr.createSavepoint(connId);
+            mgr.releaseSavepoint(connId, secondId);
+
+            assertTrue(secondId > firstId);
+            assertEquals(2, driver.primarySavepointCalls);
+            assertEquals(1, driver.primaryRollbackToSavepointCalls);
+            assertEquals(2, driver.primaryReleaseSavepointCalls);
+            assertThrows(SQLException.class, () -> mgr.releaseSavepoint(connId, firstId));
+            mgr.disconnect(connId);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void primaryTransactionLifecycleInvalidatesSavepointHandles() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager();
+            int connId = mgr.connect("jdbc:test:savepoint-lifecycle", "analyst", "secret",
+                Map.of(), null, null, null, false, RecordingDriver.class.getName());
+
+            int unchangedModeSavepoint = mgr.createSavepoint(connId);
+            mgr.setAutoCommit(connId, false);
+            mgr.releaseSavepoint(connId, unchangedModeSavepoint);
+
+            int commitSavepoint = mgr.createSavepoint(connId);
+            mgr.commit(connId);
+            assertThrows(
+                SQLException.class, () -> mgr.releaseSavepoint(connId, commitSavepoint));
+
+            int rollbackSavepoint = mgr.createSavepoint(connId);
+            mgr.rollback(connId);
+            assertThrows(
+                SQLException.class, () -> mgr.releaseSavepoint(connId, rollbackSavepoint));
+
+            int autoCommitSavepoint = mgr.createSavepoint(connId);
+            mgr.setAutoCommit(connId, true);
+            assertThrows(
+                SQLException.class, () -> mgr.releaseSavepoint(connId, autoCommitSavepoint));
+
+            assertEquals(1, driver.primaryCommitCalls);
+            assertEquals(1, driver.primaryRollbackCalls);
+            assertEquals(2, driver.primarySetAutoCommitCalls);
+            mgr.disconnect(connId);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void failedTransactionBoundaryKeepsSavepointHandleForRecovery() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager();
+            int connId = mgr.connect("jdbc:test:savepoint-commit-failure",
+                "analyst", "secret", Map.of(), null, null, null, false,
+                RecordingDriver.class.getName());
+            int savepointId = mgr.createSavepoint(connId);
+            driver.primaryCommitFailure = new SQLException("commit failed");
+
+            assertThrows(SQLException.class, () -> mgr.commit(connId));
+
+            driver.primaryCommitFailure = null;
+            mgr.rollbackSavepoint(connId, savepointId);
+            assertEquals(1, driver.primaryRollbackToSavepointCalls);
+            mgr.disconnect(connId);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void savepointFailureHandlesRemainOnlyWhenRecoveryIsPossible() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager();
+            int connId = mgr.connect("jdbc:test:savepoint-release", "analyst", "secret",
+                Map.of(), null, null, null, false, RecordingDriver.class.getName());
+            int savepointId = mgr.createSavepoint(connId);
+            driver.primaryReleaseSavepointFailure = new SQLException("release failed");
+
+            assertThrows(
+                SQLException.class, () -> mgr.releaseSavepoint(connId, savepointId));
+
+            driver.primaryReleaseSavepointFailure = null;
+            mgr.rollbackSavepoint(connId, savepointId);
+            assertEquals(1, driver.primaryRollbackToSavepointCalls);
+            assertThrows(
+                SQLException.class, () -> mgr.releaseSavepoint(connId, savepointId));
+
+            int failedRollbackId = mgr.createSavepoint(connId);
+            driver.primaryRollbackToSavepointFailure =
+                new SQLException("rollback to savepoint failed");
+            assertThrows(
+                SQLException.class, () -> mgr.rollbackSavepoint(connId, failedRollbackId));
+            driver.primaryRollbackToSavepointFailure = null;
+            assertThrows(
+                SQLException.class, () -> mgr.releaseSavepoint(connId, failedRollbackId));
+            mgr.disconnect(connId);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void savepointCreationRejectsUnsupportedOrAutocommitSessionsBeforeDml() throws Exception {
+        for (boolean autoCommit : List.of(false, true)) {
+            RecordingDriver driver = new RecordingDriver();
+            driver.savepointsSupported = autoCommit;
+            DriverManager.registerDriver(driver);
+            ConnectionManager mgr = new ConnectionManager();
+            try {
+                int connId = mgr.connect("jdbc:test:savepoint-preflight", "analyst", "secret",
+                    Map.of(), null, null, null, autoCommit, RecordingDriver.class.getName());
+
+                SQLException failure = assertThrows(
+                    SQLException.class, () -> mgr.createSavepoint(connId));
+
+                assertTrue(failure.getMessage().contains(
+                    autoCommit ? "auto-commit" : "savepoint"));
+                assertEquals(0, driver.primarySavepointCalls);
             } finally {
                 mgr.disconnectAll();
                 DriverManager.deregisterDriver(driver);
@@ -441,13 +586,20 @@ class ConnectionManagerTest {
         private int primarySetAutoCommitCalls;
         private int primaryCommitCalls;
         private int primaryRollbackCalls;
+        private int primarySavepointCalls;
+        private int primaryRollbackToSavepointCalls;
+        private int primaryReleaseSavepointCalls;
         private int primaryValidationCalls;
         private int primaryValidationTimeoutSeconds;
         private boolean primaryValidationResult = true;
         private Throwable primaryValidationFailure;
         private Throwable primarySetAutoCommitFailure;
+        private SQLException primaryCommitFailure;
+        private SQLException primaryRollbackToSavepointFailure;
+        private Throwable primaryReleaseSavepointFailure;
         private Throwable metadataValidationFailure;
         private boolean metadataReadOnly;
+        private boolean savepointsSupported = true;
         private int connectCount;
         private volatile int closedCount;
         private boolean throwOnSetAutoCommit;
@@ -503,11 +655,36 @@ class ConnectionManagerTest {
                         yield null;
                     }
                     case "commit" -> {
-                        if (!metadata) primaryCommitCalls++;
+                        if (!metadata) {
+                            primaryCommitCalls++;
+                            if (primaryCommitFailure != null) {
+                                throw primaryCommitFailure;
+                            }
+                        }
                         yield null;
                     }
                     case "rollback" -> {
-                        if (!metadata) primaryRollbackCalls++;
+                        if (!metadata && args == null) {
+                            primaryRollbackCalls++;
+                        } else if (!metadata) {
+                            primaryRollbackToSavepointCalls++;
+                            if (primaryRollbackToSavepointFailure != null) {
+                                throw primaryRollbackToSavepointFailure;
+                            }
+                        }
+                        yield null;
+                    }
+                    case "getAutoCommit" -> !primaryAutoCommitDisabled;
+                    case "getMetaData" -> databaseMetaData();
+                    case "setSavepoint" -> {
+                        primarySavepointCalls++;
+                        yield new TestSavepoint(primarySavepointCalls);
+                    }
+                    case "releaseSavepoint" -> {
+                        if (!metadata) primaryReleaseSavepointCalls++;
+                        if (!metadata && primaryReleaseSavepointFailure != null) {
+                            throw primaryReleaseSavepointFailure;
+                        }
                         yield null;
                     }
                     case "isClosed" -> false;
@@ -545,6 +722,18 @@ class ConnectionManagerTest {
                 });
         }
 
+        private DatabaseMetaData databaseMetaData() {
+            return (DatabaseMetaData) Proxy.newProxyInstance(
+                getClass().getClassLoader(),
+                new Class<?>[]{DatabaseMetaData.class},
+                (_proxy, method, _args) -> switch (method.getName()) {
+                    case "supportsSavepoints" -> savepointsSupported;
+                    case "unwrap" -> null;
+                    case "isWrapperFor" -> false;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+        }
+
         @Override
         public boolean acceptsURL(String url) {
             return url != null && url.startsWith("jdbc:test:");
@@ -573,6 +762,18 @@ class ConnectionManagerTest {
         @Override
         public Logger getParentLogger() {
             return Logger.getGlobal();
+        }
+    }
+
+    private record TestSavepoint(int id) implements Savepoint {
+        @Override
+        public int getSavepointId() {
+            return id;
+        }
+
+        @Override
+        public String getSavepointName() throws SQLException {
+            throw new SQLException("Unnamed savepoint");
         }
     }
 

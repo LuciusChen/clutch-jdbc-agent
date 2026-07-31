@@ -72,6 +72,9 @@ final class DispatcherDiagnostics {
             case "execute", "execute-params" -> "query";
             case "fetch" -> "fetch";
             case "cancel" -> "cancel";
+            case "commit", "rollback", "set-auto-commit",
+                 "create-savepoint", "rollback-savepoint",
+                 "release-savepoint" -> "transaction";
             default -> "internal";
         };
     }

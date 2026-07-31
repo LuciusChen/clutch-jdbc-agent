@@ -407,6 +407,25 @@ class DispatcherTest {
         assertFalse(called[0]);
     }
 
+    @Test
+    void savepointOpsRouteOpaqueIdsThroughConnectionManager() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.returnedSavepointId = 73;
+
+        Response created = dispatch(connMgr, 83, "create-savepoint", "conn-id", 7);
+        Response rolledBack = dispatch(
+            connMgr, 84, "rollback-savepoint", "conn-id", 7, "savepoint-id", 73);
+        Response released = dispatch(
+            connMgr, 85, "release-savepoint", "conn-id", 7, "savepoint-id", 74);
+
+        assertTrue(created.ok);
+        assertEquals(73, resultMap(created).get("savepoint-id"));
+        assertTrue(rolledBack.ok);
+        assertTrue(released.ok);
+        assertEquals(List.of(73), connMgr.rolledBackSavepointIds);
+        assertEquals(List.of(74), connMgr.releasedSavepointIds);
+    }
+
     @ParameterizedTest
     @MethodSource("nonExactIntegerParams")
     void foregroundOpsRejectFractionalAndOverflowingConnectionIds(Object connId) throws Exception {
@@ -3331,6 +3350,9 @@ class DispatcherTest {
         private boolean primaryValidationResult = true;
         private Throwable primaryValidationFailure;
         private volatile boolean disconnected;
+        private int returnedSavepointId;
+        private final List<Integer> rolledBackSavepointIds = new ArrayList<>();
+        private final List<Integer> releasedSavepointIds = new ArrayList<>();
 
         @Override
         public int connect(String url, String user, String password, Map<String, String> props,
@@ -3392,6 +3414,39 @@ class DispatcherTest {
         @Override
         public void markPrimaryUsed(int connId) {
             assertEquals(7, connId);
+        }
+
+        @Override
+        public void commit(int connId) throws SQLException {
+            getPrimary(connId).commit();
+        }
+
+        @Override
+        public void rollback(int connId) throws SQLException {
+            getPrimary(connId).rollback();
+        }
+
+        @Override
+        public void setAutoCommit(int connId, boolean autoCommit) throws SQLException {
+            getPrimary(connId).setAutoCommit(autoCommit);
+        }
+
+        @Override
+        public int createSavepoint(int connId) {
+            assertEquals(7, connId);
+            return returnedSavepointId;
+        }
+
+        @Override
+        public void rollbackSavepoint(int connId, int savepointId) {
+            assertEquals(7, connId);
+            rolledBackSavepointIds.add(savepointId);
+        }
+
+        @Override
+        public void releaseSavepoint(int connId, int savepointId) {
+            assertEquals(7, connId);
+            releasedSavepointIds.add(savepointId);
         }
 
         @Override

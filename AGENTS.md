@@ -256,6 +256,7 @@ Recoverable cancel/interrupt support is no longer deferred; see
 - SQL parsing or query analysis
 - Schema caching inside the agent
 - CLOB/BLOB full content streaming (placeholders are sufficient for v1)
-- Transaction management beyond autocommit
+- General transaction orchestration beyond the direct commit, rollback,
+  autocommit, and savepoint primitives documented in postmortem 021
 - Multiple result sets from a single execute (stored procedures)
 - A separate configuration file for the agent
