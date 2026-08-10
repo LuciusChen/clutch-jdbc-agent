@@ -138,6 +138,28 @@ class ConnectionManagerTest {
     }
 
     @Test
+    void releasingSavepointInvalidatesLaterHandles() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager();
+            int connId = mgr.connect("jdbc:test:nested-savepoint-release",
+                "analyst", "secret", Map.of(), null, null, null, false,
+                RecordingDriver.class.getName());
+            int outerId = mgr.createSavepoint(connId);
+            int innerId = mgr.createSavepoint(connId);
+
+            mgr.releaseSavepoint(connId, outerId);
+
+            assertThrows(SQLException.class, () -> mgr.releaseSavepoint(connId, innerId));
+            assertEquals(1, driver.primaryReleaseSavepointCalls);
+            mgr.disconnect(connId);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
     void primaryTransactionLifecycleInvalidatesSavepointHandles() throws Exception {
         RecordingDriver driver = new RecordingDriver();
         DriverManager.registerDriver(driver);

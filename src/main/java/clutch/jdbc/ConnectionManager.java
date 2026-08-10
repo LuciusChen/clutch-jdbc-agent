@@ -284,13 +284,13 @@ public class ConnectionManager {
         }
     }
 
-    /** Release the savepoint identified by {@code savepointId}. */
+    /** Release {@code savepointId} and every savepoint created after it. */
     public void releaseSavepoint(int connId, int savepointId) throws SQLException {
         Session session = requireSession(connId);
         synchronized (session) {
             Savepoint savepoint = session.savepoint(savepointId);
             releaseSavepointIfSupported(session.primary(), savepoint);
-            session.savepoints.remove(savepointId);
+            session.savepoints.keySet().removeIf(id -> id >= savepointId);
             session.markPrimaryUsed(clock.millis());
         }
     }

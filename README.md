@@ -225,9 +225,11 @@ failed outer boundary does not proactively clear them while the session remains
 live. A rollback-to-savepoint recovery consumes its handle even on failure
 because its partial outcome is unknown. Once rollback to a savepoint succeeds,
 every handle created after it is invalid too; the database has discarded those
-later savepoints even when explicit release is unsupported. Disconnect or fatal
-session invalidation removes every remaining handle. The agent does not
-interpret SQL or decide when a client workflow should create a savepoint.
+later savepoints even when explicit release is unsupported. A successful or
+logically normalized explicit release likewise invalidates its target and every
+later handle, matching the JDBC contract. Disconnect or fatal session
+invalidation removes every remaining handle. The agent does not interpret SQL
+or decide when a client workflow should create a savepoint.
 
 Some drivers, including Oracle JDBC, support savepoints but not the optional
 `Connection.releaseSavepoint` operation. After a successful rollback-to-savepoint
