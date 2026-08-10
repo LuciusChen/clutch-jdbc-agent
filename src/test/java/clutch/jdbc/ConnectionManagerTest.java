@@ -232,6 +232,36 @@ class ConnectionManagerTest {
     }
 
     @Test
+    void unsupportedExplicitSavepointReleaseStillCompletesLogicalBoundary()
+            throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager();
+            int connId = mgr.connect("jdbc:test:savepoint-release-unsupported",
+                "analyst", "secret", Map.of(), null, null, null, false,
+                RecordingDriver.class.getName());
+            driver.primaryReleaseSavepointFailure =
+                new SQLFeatureNotSupportedException("releaseSavepoint");
+
+            int successfulBatchId = mgr.createSavepoint(connId);
+            mgr.releaseSavepoint(connId, successfulBatchId);
+            assertThrows(
+                SQLException.class, () -> mgr.releaseSavepoint(connId, successfulBatchId));
+
+            int recoveredBatchId = mgr.createSavepoint(connId);
+            mgr.rollbackSavepoint(connId, recoveredBatchId);
+            assertEquals(1, driver.primaryRollbackToSavepointCalls);
+            assertThrows(
+                SQLException.class, () -> mgr.releaseSavepoint(connId, recoveredBatchId));
+            assertEquals(2, driver.primaryReleaseSavepointCalls);
+            mgr.disconnect(connId);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
     void savepointCreationRejectsUnsupportedOrAutocommitSessionsBeforeDml() throws Exception {
         for (boolean autoCommit : List.of(false, true)) {
             RecordingDriver driver = new RecordingDriver();

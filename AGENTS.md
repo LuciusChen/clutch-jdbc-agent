@@ -127,6 +127,11 @@ Only split a class when it has a genuinely distinct responsibility. Do not creat
 
 - **Errors must surface, not hide**: Do not add fallback/default returns that silently swallow failures. Let errors propagate immediately.
 - **Catch at the boundary, nowhere else**: Only `Dispatcher`'s top-level catch block should convert exceptions to `Response.error`. Handler methods and business logic must not try/catch — let exceptions bubble naturally.
+- **Normalize only proven optional lifecycle gaps**: A resource owner may catch
+  exactly `SQLFeatureNotSupportedException` when JDBC documents an operation as
+  optional and the requested logical boundary is already established. Document
+  the invariant in a postmortem, keep broader `SQLException` failures visible,
+  and prove both paths with tests.
 - **Tests must fail when the code is wrong**: If deleting or breaking the function under test does not turn the test red, the test is worthless. Assert specific, distinguishable output values.
 - **No hard-coded expectations**: Use diverse inputs — multiple data sets, random values, boundary cases — so that a hard-coded return cannot satisfy all assertions.
 - **Red before green**: When fixing a bug, first write a failing test that reproduces it. Confirm it fails. Then fix the code. A test written after the fix has never been proven to catch the bug.

@@ -272,7 +272,7 @@ public class ConnectionManager {
             Savepoint savepoint = session.savepoint(savepointId);
             try {
                 session.primary().rollback(savepoint);
-                session.primary().releaseSavepoint(savepoint);
+                releaseSavepointIfSupported(session.primary(), savepoint);
             } finally {
                 session.savepoints.remove(savepointId);
                 session.markPrimaryUsed(clock.millis());
@@ -285,9 +285,25 @@ public class ConnectionManager {
         Session session = requireSession(connId);
         synchronized (session) {
             Savepoint savepoint = session.savepoint(savepointId);
-            session.primary().releaseSavepoint(savepoint);
+            releaseSavepointIfSupported(session.primary(), savepoint);
             session.savepoints.remove(savepointId);
             session.markPrimaryUsed(clock.millis());
+        }
+    }
+
+    /**
+     * Release {@code savepoint} when the driver implements optional release.
+     * A transaction boundary remains valid when JDBC reports that only explicit
+     * release is unsupported; commit or rollback will discard the database-side
+     * savepoint.
+     */
+    private void releaseSavepointIfSupported(Connection connection, Savepoint savepoint)
+            throws SQLException {
+        try {
+            connection.releaseSavepoint(savepoint);
+        } catch (SQLFeatureNotSupportedException unsupported) {
+            LOG.log(System.Logger.Level.DEBUG,
+                "JDBC driver does not support explicit savepoint release");
         }
     }
 
