@@ -23,6 +23,13 @@ are allocated monotonically by the agent, so a greater local id in the same
 session denotes a savepoint created after the rollback target. Keeping one of
 those handles would expose database state that no longer exists.
 
+The same ordering rule applies when explicit release returns normally, whether
+the driver performed it or the narrowly normalized unsupported-method path
+established the logical release. JDBC defines release as removing the target
+and all subsequent savepoints, so the manager discards all corresponding local
+handles. A broader release failure still preserves them because its outcome is
+not known.
+
 ## Rationale
 
 Skipping savepoints entirely would make staged manual-commit submissions
@@ -42,6 +49,11 @@ handle to be rejected locally without another driver release call. Existing
 tests continue to require ordinary release failures to propagate and failed
 rollback handles to become unusable.
 
+A separate supported-driver fail-first test releases an outer savepoint and
+requires its later inner handle to be rejected without a second driver call.
+This pins JDBC's target-and-subsequent release contract independently of
+Oracle's unsupported explicit-release behavior.
+
 An Oracle Podman reproduction confirmed the driver boundary: rolling back the
 outer savepoint made a later rollback fail with `ORA-01086`, while releasing
 that same stale handle appeared to succeed only because Oracle's unsupported
@@ -52,9 +64,11 @@ for the later handle instead.
 The consuming Clutch repository ran its complete Podman matrix with the locally
 built candidate copied into its isolated runtime. The source and runtime jar
 SHA-256 values matched. All 17 Oracle backend tests passed, including the
-nested-savepoint regression; the complete matrix passed 121 tests with 39
-expected capability skips and no unexpected result, then removed every started
-container.
+nested-savepoint regression. A reconstructed pre-fix candidate made the SQL
+Server nested-release regression fail because a later stale handle incorrectly
+returned success; the fixed candidate passed all five SQL Server backend tests.
+The complete matrix passed 122 tests with 39 expected capability skips and no
+unexpected result, then removed every started container.
 
 This fix is prepared as version 0.2.20. The Clutch pin must remain unchanged
 until the exact release artifact is published and its checksum is verified.
