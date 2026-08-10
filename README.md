@@ -227,6 +227,13 @@ because its partial outcome is unknown. Disconnect or fatal session
 invalidation removes every remaining handle. The agent does not interpret SQL
 or decide when a client workflow should create a savepoint.
 
+Some drivers, including Oracle JDBC, support savepoints but not the optional
+`Connection.releaseSavepoint` operation. After a successful rollback-to-savepoint
+or successful batch body, that specific unsupported cleanup is treated as a
+logical release: the agent forgets its opaque handle and the database discards
+the physical savepoint at the enclosing commit or rollback. Other release
+errors still propagate because their transaction outcome is not known.
+
 This is still intentionally much simpler than a fully async server: no
 connection pooling, no SQL rewriting, and no multi-statement scheduling inside
 one JDBC connection.
