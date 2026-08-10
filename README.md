@@ -223,9 +223,11 @@ the JDBC objects and their lifecycle: successful commit, rollback, or
 autocommit transition invalidates them under the same session lock, while a
 failed outer boundary does not proactively clear them while the session remains
 live. A rollback-to-savepoint recovery consumes its handle even on failure
-because its partial outcome is unknown. Disconnect or fatal session
-invalidation removes every remaining handle. The agent does not interpret SQL
-or decide when a client workflow should create a savepoint.
+because its partial outcome is unknown. Once rollback to a savepoint succeeds,
+every handle created after it is invalid too; the database has discarded those
+later savepoints even when explicit release is unsupported. Disconnect or fatal
+session invalidation removes every remaining handle. The agent does not
+interpret SQL or decide when a client workflow should create a savepoint.
 
 Some drivers, including Oracle JDBC, support savepoints but not the optional
 `Connection.releaseSavepoint` operation. After a successful rollback-to-savepoint

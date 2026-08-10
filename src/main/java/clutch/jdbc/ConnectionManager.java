@@ -265,13 +265,17 @@ public class ConnectionManager {
         }
     }
 
-    /** Roll back to and release the savepoint identified by {@code savepointId}. */
+    /**
+     * Roll back to and release the savepoint identified by {@code savepointId}.
+     * Savepoints created after the target are invalid once rollback succeeds.
+     */
     public void rollbackSavepoint(int connId, int savepointId) throws SQLException {
         Session session = requireSession(connId);
         synchronized (session) {
             Savepoint savepoint = session.savepoint(savepointId);
             try {
                 session.primary().rollback(savepoint);
+                session.savepoints.keySet().removeIf(id -> id > savepointId);
                 releaseSavepointIfSupported(session.primary(), savepoint);
             } finally {
                 session.savepoints.remove(savepointId);
