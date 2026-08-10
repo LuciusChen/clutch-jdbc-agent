@@ -255,6 +255,13 @@ class ConnectionManagerTest {
             assertThrows(
                 SQLException.class, () -> mgr.releaseSavepoint(connId, recoveredBatchId));
             assertEquals(2, driver.primaryReleaseSavepointCalls);
+
+            int outerBatchId = mgr.createSavepoint(connId);
+            int innerBatchId = mgr.createSavepoint(connId);
+            mgr.rollbackSavepoint(connId, outerBatchId);
+            assertThrows(
+                SQLException.class, () -> mgr.releaseSavepoint(connId, innerBatchId));
+            assertEquals(3, driver.primaryReleaseSavepointCalls);
             mgr.disconnect(connId);
         } finally {
             DriverManager.deregisterDriver(driver);
