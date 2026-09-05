@@ -178,12 +178,16 @@ Rules for `TypeConverter.convert()`:
 - `Timestamp` → local wall-clock String via `toLocalDateTime()` formatted as
   `yyyy-MM-dd HH:mm:ss[.fraction]`. Fractional seconds are included only when
   non-zero, with trailing zeros stripped. Oracle `DATE` has a time component —
-  always use `getTimestamp()`, never `getDate()`, for Oracle columns.
+  preserve it when the driver's `getObject()` returns a `Timestamp`. The
+  converter does not currently force a timestamp getter for Oracle DATE.
 - `Date` → `toLocalDate().toString()` (e.g. `2024-06-28`)
 - `Time` → local wall-clock String via `toLocalTime()` formatted as
   `HH:mm:ss[.fraction]`, same trailing-zero rules as Timestamp.
-- `Clob` → `{"__type":"clob","length":N,"preview":"..."}` (first 256 chars)
-- `Blob`, `byte[]` → `{"__type":"blob","length":N}`
+- `Clob` → `{"__type":"clob","length":N,"preview":"..."}` (at most 256 UTF-16
+  units, without splitting a surrogate pair; original length is unchanged)
+- `Blob`, `byte[]` → `{"__type":"blob","length":N}`, optionally with complete
+  `text` and `encoding` for small UTF-8/GB18030 JSON/XML payloads. Detection may
+  trim a temporary string; returned content must retain original whitespace.
 - Anything else → `rs.getString(col)` fallback
 
 Stability over perfection.

@@ -64,14 +64,14 @@ public class TypeConverter {
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT)
                 .decode(ByteBuffer.wrap(bytes))
-                .toString()
-                .strip();
+                .toString();
         } catch (CharacterCodingException e) {
             return null;
         }
     }
 
     private static boolean structuredBlobText(String text) {
+        text = text.strip();
         if (text.isEmpty()) return false;
         return looksLikeJson(text) || looksLikeXml(text);
     }
@@ -132,6 +132,11 @@ public class TypeConverter {
             Clob clob = (Clob) val;
             long len = clob.length();
             String preview = clob.getSubString(1, (int) Math.min(len, 256));
+            // A preview boundary must not split a UTF-16 surrogate pair.
+            if (len > 256 && !preview.isEmpty()
+                    && Character.isHighSurrogate(preview.charAt(preview.length() - 1))) {
+                preview = preview.substring(0, preview.length() - 1);
+            }
             return java.util.Map.of("__type", "clob", "length", len, "preview", preview);
         }
         if (val instanceof Blob) {

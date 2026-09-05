@@ -188,8 +188,8 @@ JDBC column values are converted to a stable set of JSON-safe types:
 | `Timestamp`                 | Local wall-clock string (`2024-01-15 13:45:30`) |
 | `Date`                      | Date string (`2024-01-15`)                    |
 | `Time`                      | Time string (`13:45:30`)                      |
-| `Clob`                      | `{"__type":"clob","length":N,"preview":"..."}` |
-| `Blob` / `byte[]` (≤64 KB)  | `{"__type":"blob","length":N}` or `{"__type":"blob","length":N,"text":"..."}` if valid UTF-8 JSON |
+| `Clob`                      | `{"__type":"clob","length":N,"preview":"..."}`; at most 256 UTF-16 units, without splitting surrogate pairs; original length retained |
+| `Blob` / `byte[]` (≤64 KB)  | `{"__type":"blob","length":N}`, with complete `text` and `encoding` for UTF-8/GB18030 JSON/XML; original whitespace is preserved |
 | String / textual fallback   | String, limited to 1,048,576 characters per cell |
 | Anything else               | `rs.getString(col)` fallback                  |
 
