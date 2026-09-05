@@ -11,6 +11,7 @@ import java.nio.charset.Charset;
 import java.sql.Blob;
 import java.sql.Clob;
 import java.sql.Date;
+import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Time;
@@ -26,6 +27,49 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TypeConverterTest {
+
+    @Test
+    void clobPreviewKeepsWholeSurrogatePairs() throws SQLException {
+        String[][] cases = {
+            {"", ""},
+            {"😀", "😀"},
+            {"中😀é文", "中😀é文"},
+            {"😀".repeat(128), "😀".repeat(128)},
+            {"😀".repeat(129), "😀".repeat(128)},
+            {"中".repeat(254) + "😀", "中".repeat(254) + "😀"},
+            {"中".repeat(255) + "😀", "中".repeat(255)},
+            {"a".repeat(256) + "😀", "a".repeat(256)}
+        };
+        try (var conn = DriverManager.getConnection("jdbc:h2:mem:clob_preview");
+             var stmt = conn.prepareStatement("SELECT CAST(? AS CLOB)")) {
+            for (String[] testCase : cases) {
+                stmt.setString(1, testCase[0]);
+                try (var rs = stmt.executeQuery()) {
+                    assertTrue(rs.next());
+                    Object converted = TypeConverter.convert(rs, 1);
+                    assertEquals(Map.of("__type", "clob",
+                                        "length", (long) testCase[0].length(),
+                                        "preview", testCase[1]), converted);
+                }
+            }
+        }
+    }
+
+    @Test
+    void blobTextPreservesOriginalWhitespaceAndEncoding() {
+        for (String payload : new String[] {" \n{\"ok\":true}\t\n",
+                                           "\t<root>中文</root>\r\n"}) {
+            for (String encoding : new String[] {"UTF-8", "GB18030"}) {
+                byte[] bytes = payload.getBytes(Charset.forName(encoding));
+                Map<String, Object> converted = TypeConverter.blobBytesToMap(bytes, bytes.length);
+                assertEquals(payload, converted.get("text"));
+                assertEquals((long) bytes.length, converted.get("length"));
+                assertTrue(java.util.Arrays.equals(bytes,
+                    converted.get("text").toString().getBytes(
+                        Charset.forName(converted.get("encoding").toString()))));
+            }
+        }
+    }
 
     @Test
     void convertPropagatesClobReadFailures() {
