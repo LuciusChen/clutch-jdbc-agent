@@ -129,6 +129,51 @@ class AgentProtocolIntegrationTest {
     }
 
     @Test
+    void malformedSqlGetsOneStructuredErrorPerLine() throws Exception {
+        String input = """
+            {"id":1,"op":"execute","params":{"conn-id":7,"sql":7}}
+            {"id":2,"op":"execute-params","params":{"conn-id":7,"sql":true}}
+            {"id":3,"op":"execute","params":{"conn-id":7,"sql":["secret-sql"],"debug":true}}
+            {"id":4,"op":"execute-params","params":{"conn-id":7,"sql":{"password":"secret-sql"},"debug":true}}
+            {"id":5,"op":"ping","params":{}}
+            """;
+        ObjectMapper mapper = new ObjectMapper();
+        Dispatcher dispatcher = new Dispatcher(new ConnectionManager(), new CursorManager());
+        ExecutorService pool = Agent.newRequestPool();
+        ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        try {
+            Agent.serve(new BufferedReader(new StringReader(input)),
+                        new BufferedOutputStream(sink), mapper, dispatcher, pool);
+        } finally {
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+            dispatcher.shutdown();
+        }
+        String stdout = sink.toString(StandardCharsets.UTF_8);
+        Set<Integer> ids = new HashSet<>();
+        for (String line : stdout.lines().toList()) {
+            JsonNode response = mapper.readTree(line);
+            int id = response.path("id").asInt();
+            assertTrue(ids.add(id), "duplicate response id: " + id);
+            if (id >= 1 && id <= 4) {
+                assertFalse(response.path("ok").asBoolean());
+                assertEquals("Missing or non-string param: sql", response.path("error").asText());
+                assertEquals("protocol", response.path("diag").path("category").asText());
+                assertEquals("java.lang.IllegalArgumentException",
+                    response.path("diag").path("exception-class").asText());
+                assertEquals(id >= 3, response.has("debug"));
+            } else {
+                assertTrue(response.path("ok").asBoolean(), line);
+                if (id == 5) {
+                    assertTrue(response.path("result").path("pong").asBoolean());
+                }
+            }
+        }
+        assertEquals(Set.of(0, 1, 2, 3, 4, 5), ids);
+        assertFalse(stdout.contains("secret-sql"), stdout);
+    }
+
+    @Test
     void serveFlushesExactlyOncePerLineAndSurfacesWriteFailures() throws Exception {
         // One flush per protocol line: an autoFlush PrintStream underneath
         // would double it, and the standard-output PrintStream would swallow the IOException.
