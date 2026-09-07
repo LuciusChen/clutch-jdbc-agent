@@ -11,6 +11,8 @@ import org.junit.jupiter.api.Test;
 
 import java.io.InputStream;
 import java.lang.reflect.Proxy;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.sql.Blob;
 import java.sql.DatabaseMetaData;
@@ -1056,6 +1058,8 @@ class DispatcherTest {
 
             assertFalse(response.ok);
             assertTrue(response.error.contains("fetch-size"), response.error);
+            assertEquals(8, ((Map<?, ?>) diagMap(response).get("context")).get("sql-length"),
+                "valid SQL must retain its length in diagnostic context");
             assertEquals(0, connMgr.primaryConnectionCalls,
                 "invalid fetch-size must be rejected before JDBC access");
         } finally {
@@ -2993,6 +2997,44 @@ class DispatcherTest {
         );
     }
 
+    @ParameterizedTest
+    @MethodSource("foregroundExecuteOps")
+    void malformedSqlRetainsValidationErrorAndSafeDiagnostics(String op) throws Exception {
+        RecordingConnectionManager connections = new RecordingConnectionManager();
+        Dispatcher dispatcher = new Dispatcher(connections, new CursorManager());
+        try {
+            for (boolean debug : List.of(false, true)) {
+                for (Object sql : new Object[]{null, 7, true, List.of("secret-sql"),
+                                               Map.of("password", "secret-sql")}) {
+                    Response response = dispatcher.dispatch(request(833, op,
+                        "conn-id", 7, "sql", sql, "fetch-size", 3,
+                        "query-timeout-seconds", 5, "debug", debug));
+                    assertFalse(response.ok);
+                    assertEquals("Missing or non-string param: sql", response.error);
+                    Map<String, Object> diag = diagMap(response);
+                    assertEquals("protocol", diag.get("category"));
+                    assertEquals("java.lang.IllegalArgumentException", diag.get("exception-class"));
+                    Map<?, ?> context = (Map<?, ?>) diag.get("context");
+                    assertEquals(Map.of("fetch-size", 3, "query-timeout-seconds", 5), context);
+                    if (debug) {
+                        assertEquals(context, ((Map<?, ?>) response.debug).get("request-context"));
+                        assertTrue(((String) ((Map<?, ?>) response.debug).get("stack-trace"))
+                            .contains("IllegalArgumentException: Missing or non-string param: sql"));
+                    } else {
+                        assertNull(response.debug);
+                    }
+                    assertFalse(Objects.toString(response.diag).contains("secret-sql"));
+                    assertFalse(Objects.toString(response.debug).contains("secret-sql"));
+                }
+            }
+            assertEquals(0, connections.primaryConnectionCalls,
+                "malformed SQL must never reach JDBC");
+            assertTrue(dispatcher.dispatch(request(834, "ping")).ok);
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
     private static Stream<Arguments> invalidExecuteFetchSizeCases() {
         return Stream.of("execute", "execute-params")
             .flatMap(op -> invalidFetchSizeValues()
@@ -3021,7 +3063,100 @@ class DispatcherTest {
     }
 
     private static Stream<Object> nonExactIntegerParams() {
-        return Stream.<Object>of(1.5d, 2_147_483_648L, -2_147_483_649L);
+        return Stream.<Object>of(1.5d, 1.0d, 1.0f, Double.NaN,
+            Double.POSITIVE_INFINITY, 2_147_483_648L, -2_147_483_649L,
+            BigInteger.valueOf(2_147_483_648L), BigInteger.valueOf(-2_147_483_649L),
+            BigDecimal.ONE, "7", true, List.of(7));
+    }
+
+    @ParameterizedTest
+    @MethodSource("exactIntegerParams")
+    void exactIntegersReachBothHandlerLanesAndOptionalTimeouts(Number value) throws Exception {
+        int expected = value.intValue();
+        List<Integer> calls = new ArrayList<>();
+        ConnectionManager connections = new ConnectionManager() {
+            @Override
+            public void commit(int connId) {
+                calls.add(connId);
+            }
+
+            @Override
+            public Connection getMetadata(int connId) {
+                calls.add(connId);
+                return metadataConnectionWithSchemas(List.of("TYPE_CHECK"));
+            }
+        };
+        Dispatcher dispatcher = new Dispatcher(connections, new CursorManager());
+        try {
+            for (String op : List.of("commit", "get-schemas")) {
+                Response response = dispatcher.dispatch(request(827, op, "conn-id", value));
+                assertTrue(response.ok, response.error);
+                if (op.equals("get-schemas")) {
+                    assertEquals(List.of("TYPE_CHECK"), resultMap(response).get("schemas"));
+                }
+            }
+            assertEquals(List.of(expected, expected), calls);
+        } finally {
+            dispatcher.shutdown();
+        }
+        RecordingConnectionManager recorder = new RecordingConnectionManager();
+        Response response = dispatch(recorder, 828, "connect",
+            "url", "jdbc:test:types", "driver-class", DRIVER_CLASS,
+            "connect-timeout-seconds", value);
+        assertTrue(response.ok, response.error);
+        assertEquals(expected, recorder.connectTimeoutSeconds);
+    }
+
+    private static Stream<Number> exactIntegerParams() {
+        return Stream.of((byte) -128, (short) 32767, 0, 7, Integer.MIN_VALUE,
+            Integer.MAX_VALUE, 7L, (long) Integer.MIN_VALUE, (long) Integer.MAX_VALUE,
+            BigInteger.valueOf(7), BigInteger.valueOf(Integer.MIN_VALUE),
+            BigInteger.valueOf(Integer.MAX_VALUE));
+    }
+
+    @Test
+    void requiredAndOptionalParamsPreserveMissingNullAndStringRules() throws Exception {
+        for (boolean explicitNull : List.of(false, true)) {
+            for (String op : List.of("commit", "get-schemas")) {
+                Request req = request(829, op);
+                if (explicitNull) {
+                    req.params.put("conn-id", null);
+                }
+                Dispatcher dispatcher = new Dispatcher(new ConnectionManager(), new CursorManager());
+                try {
+                    Response response = dispatcher.dispatch(req);
+                    assertFalse(response.ok);
+                    assertEquals("Missing or non-integer param: conn-id", response.error);
+                } finally {
+                    dispatcher.shutdown();
+                }
+            }
+            RecordingConnectionManager recorder = new RecordingConnectionManager();
+            Response response = explicitNull
+                ? dispatch(recorder, 830, "connect", "url", "jdbc:test:types",
+                    "driver-class", DRIVER_CLASS, "connect-timeout-seconds", null)
+                : dispatch(recorder, 830, "connect", "url", "jdbc:test:types",
+                    "driver-class", DRIVER_CLASS);
+            assertTrue(response.ok, response.error);
+            assertNull(recorder.connectTimeoutSeconds);
+        }
+        for (Object value : new Object[]{null, 7, true, List.of("APP")}) {
+            for (String op : List.of("set-current-schema", "get-tables")) {
+                // Optional schema accepts null; its successful path is covered by metadata tests.
+                if (op.equals("get-tables") && value == null) {
+                    continue;
+                }
+                Response response = dispatch(new RecordingConnectionManager(), 831, op,
+                    "conn-id", 7, "schema", value);
+                assertFalse(response.ok);
+                String prefix = op.equals("get-tables") ? "Non-string" : "Missing or non-string";
+                assertEquals(prefix + " param: schema", response.error);
+            }
+        }
+        Response missingSql = dispatch(new RecordingConnectionManager(), 832,
+            "execute", "conn-id", 7);
+        assertFalse(missingSql.ok);
+        assertEquals("Missing or non-string param: sql", missingSql.error);
     }
 
     private static Response dispatch(RecordingConnectionManager connMgr, int id, String op,

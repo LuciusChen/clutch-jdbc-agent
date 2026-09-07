@@ -131,6 +131,8 @@ connection id, exception class, SQLState, vendor code, cause chain, and
 redacted request context.  When a hidden/internal query path fails,
 `diag.context.generated-sql` carries the actual SQL text that the agent ran.
 
+Malformed SQL parameters are rejected before JDBC access with a protocol diagnostic. Non-string SQL is omitted from diagnostic context rather than converted to text; valid SQL contributes its length, not its contents. The same rule applies to the opt-in debug context.
+
 `diag.connection-invalidated=true` is also a stable lifecycle signal. It is present when an error response references a local logical connection that the agent no longer owns, including a follow-up request after the original failure response was ignored. The agent derives this from its connection map, not exception text or client-side JDBC error rules. Metadata-session failure alone does not set the marker. Foreground SQL is never replayed automatically because its transaction outcome may be unknown.
 
 When idle preflight conclusively rejects a primary connection before the agent creates a `Statement` or `PreparedStatement`, the same response also includes `diag.execution-not-started=true`. This is evidence only about the current SQL request; it does not say that an earlier manual transaction can be recovered, and the agent still performs no automatic reconnect or SQL replay. The preflight uses JDBC `Connection.isValid`; the agent does not execute database-specific validation SQL or call `setAutoCommit`, `commit`, or `rollback` as part of that check.

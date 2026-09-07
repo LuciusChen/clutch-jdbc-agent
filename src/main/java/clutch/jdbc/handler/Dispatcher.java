@@ -8,7 +8,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.ByteArrayInputStream;
-import java.math.BigInteger;
 import java.sql.Blob;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -170,14 +169,12 @@ public class Dispatcher {
     }
 
     private Integer requestConnectionId(Request req) {
-        Object connId = req.params.get("conn-id");
-        Integer exactConnId = exactIntValue(connId);
+        Integer exactConnId = req.intOrNull("conn-id");
         if (exactConnId != null) {
             return exactConnId;
         }
         if ("fetch".equals(req.op)) {
-            Object cursorId = req.params.get("cursor-id");
-            Integer exactCursorId = exactIntValue(cursorId);
+            Integer exactCursorId = req.intOrNull("cursor-id");
             if (exactCursorId != null) {
                 try {
                     return cursorMgr.connectionId(exactCursorId);
@@ -267,10 +264,10 @@ public class Dispatcher {
         String password = (String) req.params.get("password");
         Map<String, String> props =
             (Map<String, String>) req.params.getOrDefault("props", Map.of());
-        Integer connectTimeoutSeconds = getOptionalInt(req, "connect-timeout-seconds");
-        Integer networkTimeoutSeconds = getOptionalInt(req, "network-timeout-seconds");
+        Integer connectTimeoutSeconds = req.getOptionalInt("connect-timeout-seconds");
+        Integer networkTimeoutSeconds = req.getOptionalInt("network-timeout-seconds");
         Integer validateAfterIdleSeconds =
-            getOptionalInt(req, "validate-after-idle-seconds");
+            req.getOptionalInt("validate-after-idle-seconds");
         boolean autoCommit = getBoolean(req, "auto-commit", true);
 
         if (url == null) {
@@ -292,7 +289,7 @@ public class Dispatcher {
     }
 
     private Response disconnect(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         cursorMgr.closeForConnection(connId);
         connMgr.disconnect(connId);
         runningStatements.remove(connId);
@@ -311,32 +308,32 @@ public class Dispatcher {
      * already removed connections.
      */
     private Response forceDisconnect(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         poisonConnection(connId);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
     private Response commit(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         connMgr.commit(connId);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
     private Response rollback(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         connMgr.rollback(connId);
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 
     private Response setAutoCommit(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         boolean autoCommit = getBoolean(req, "auto-commit", true);
         connMgr.setAutoCommit(connId, autoCommit);
         return Response.ok(req.id, Map.of("conn-id", connId, "auto-commit", autoCommit));
     }
 
     private Response createSavepoint(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         int savepointId = connMgr.createSavepoint(connId);
         return Response.ok(req.id, Map.of(
             "conn-id", connId,
@@ -344,8 +341,8 @@ public class Dispatcher {
     }
 
     private Response rollbackSavepoint(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
-        int savepointId = getInt(req, "savepoint-id");
+        int connId = req.getInt("conn-id");
+        int savepointId = req.getInt("savepoint-id");
         connMgr.rollbackSavepoint(connId, savepointId);
         return Response.ok(req.id, Map.of(
             "conn-id", connId,
@@ -353,8 +350,8 @@ public class Dispatcher {
     }
 
     private Response releaseSavepoint(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
-        int savepointId = getInt(req, "savepoint-id");
+        int connId = req.getInt("conn-id");
+        int savepointId = req.getInt("savepoint-id");
         connMgr.releaseSavepoint(connId, savepointId);
         return Response.ok(req.id, Map.of(
             "conn-id", connId,
@@ -362,7 +359,7 @@ public class Dispatcher {
     }
 
     private Response cancel(Request req) {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         RunningStatement running = runningStatements.get(connId);
         if (running == null) {
             return Response.ok(req.id, Map.of("conn-id", connId, "cancelled", false));
@@ -385,10 +382,10 @@ public class Dispatcher {
     // -------------------------------------------------------------------------
 
     private Response execute(Request req) throws Exception {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String sql = normalizedSql(req);
         int fetchSize = getFetchSize(req);
-        Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
+        Integer queryTimeoutSeconds = req.getOptionalInt("query-timeout-seconds");
         int executeTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
 
@@ -403,10 +400,10 @@ public class Dispatcher {
     }
 
     private Response executeParams(Request req) throws Exception {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String sql = normalizedSql(req);
         int fetchSize = getFetchSize(req);
-        Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
+        Integer queryTimeoutSeconds = req.getOptionalInt("query-timeout-seconds");
         int executeTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
         List<?> values = preparedValues(req);
@@ -548,7 +545,7 @@ public class Dispatcher {
     }
 
     private String normalizedSql(Request req) {
-        return getString(req, "sql").stripTrailing().replaceAll(";+$", "");
+        return req.getString("sql").stripTrailing().replaceAll(";+$", "");
     }
 
     private List<?> preparedValues(Request req) {
@@ -678,9 +675,9 @@ public class Dispatcher {
     private record BinaryParameter(BinaryKind kind, byte[] bytes) {}
 
     private Response fetch(Request req) throws Exception {
-        int cursorId = getInt(req, "cursor-id");
+        int cursorId = req.getInt("cursor-id");
         int fetchSize = getFetchSize(req);
-        Integer queryTimeoutSeconds = getOptionalInt(req, "query-timeout-seconds");
+        Integer queryTimeoutSeconds = req.getOptionalInt("query-timeout-seconds");
         int fetchTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
         int connId = cursorMgr.connectionId(cursorId);
@@ -714,7 +711,7 @@ public class Dispatcher {
     }
 
     private Response closeCursor(Request req) {
-        int cursorId = getInt(req, "cursor-id");
+        int cursorId = req.getInt("cursor-id");
         cursorMgr.close(cursorId);
         return Response.ok(req.id, Map.of("cursor-id", cursorId));
     }
@@ -736,17 +733,17 @@ public class Dispatcher {
 
     private Integer lockConnectionId(Request req) throws SQLException {
         if (MetadataOps.supports(req.op)) {
-            return getInt(req, "conn-id");
+            return req.getInt("conn-id");
         }
         if (requestUsesDirectConnectionId(req.op)) {
-            return getInt(req, "conn-id");
+            return req.getInt("conn-id");
         }
         return switch (req.op) {
             case "fetch" -> {
                 getFetchSize(req);
-                yield cursorMgr.connectionId(getInt(req, "cursor-id"));
+                yield cursorMgr.connectionId(req.getInt("cursor-id"));
             }
-            case "close-cursor" -> cursorMgr.connectionId(getInt(req, "cursor-id"));
+            case "close-cursor" -> cursorMgr.connectionId(req.getInt("cursor-id"));
             default -> null;
         };
     }
@@ -760,7 +757,7 @@ public class Dispatcher {
             return true;
         }
         if ("fetch".equals(req.op) || "close-cursor".equals(req.op)) {
-            return cursorMgr.usesMetadataConnection(getInt(req, "cursor-id"));
+            return cursorMgr.usesMetadataConnection(req.getInt("cursor-id"));
         }
         return false;
     }
@@ -942,51 +939,6 @@ public class Dispatcher {
             return "timeout";
         }
         return "fetch";
-    }
-
-    private int getInt(Request req, String key) {
-        Object value = req.params.get(key);
-        Integer exact = exactIntValue(value);
-        if (exact != null) {
-            return exact;
-        }
-        throw new IllegalArgumentException("Missing or non-integer param: " + key);
-    }
-
-    private String getString(Request req, String key) {
-        Object value = req.params.get(key);
-        if (value instanceof String string) {
-            return string;
-        }
-        throw new IllegalArgumentException("Missing or non-string param: " + key);
-    }
-
-    private Integer getOptionalInt(Request req, String key) {
-        Object value = req.params.get(key);
-        if (value == null) {
-            return null;
-        }
-        Integer exact = exactIntValue(value);
-        if (exact != null) {
-            return exact;
-        }
-        throw new IllegalArgumentException("Non-integer param: " + key);
-    }
-
-    private Integer exactIntValue(Object value) {
-        if (value instanceof Byte || value instanceof Short || value instanceof Integer) {
-            return ((Number) value).intValue();
-        }
-        if (value instanceof Long longValue) {
-            return longValue >= Integer.MIN_VALUE && longValue <= Integer.MAX_VALUE
-                ? longValue.intValue() : null;
-        }
-        if (value instanceof BigInteger bigInteger
-            && bigInteger.compareTo(BigInteger.valueOf(Integer.MIN_VALUE)) >= 0
-            && bigInteger.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) <= 0) {
-            return bigInteger.intValue();
-        }
-        return null;
     }
 
     private int getFetchSize(Request req) {

@@ -185,7 +185,7 @@ final class DispatcherDiagnostics {
                 "network-timeout-seconds", optionalIntParam(req, "network-timeout-seconds"));
         }
         if ("execute".equals(req.op) || "execute-params".equals(req.op)) {
-            String sql = (String) req.params.get("sql");
+            String sql = optionalStringParam(req, "sql");
             return entryMap(
                 "sql-length", sql != null ? sql.length() : null,
                 "fetch-size", optionalIntParam(req, "fetch-size"),

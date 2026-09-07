@@ -62,7 +62,7 @@ clutch.jdbc.handler
   MetadataOps.java       ← DatabaseMetaData and dialect-specific introspection
 
 clutch.jdbc.model
-  Request.java           ← {"id", "op", "params"}
+  Request.java           ← {"id", "op", "params"} and exact typed field access
   Response.java          ← {"id", "ok", "result" / "error"}
 ```
 
@@ -197,7 +197,7 @@ Stability over perfection.
 - Keep methods under ~30 lines. Extract a private helper when a method exceeds this.
 - Name helpers after what they compute, not where they're called from.
 - Handler methods in `Dispatcher` follow a consistent pattern:
-  1. Extract params (call `getInt` / `getString` helpers — throw on missing)
+  1. Extract params (`req.getInt` / `req.getString` — throw on missing)
   2. Delegate to manager(s)
   3. Build and return `Response.ok(...)`
 - Pure computation (type conversion, metadata parsing) must be separate from

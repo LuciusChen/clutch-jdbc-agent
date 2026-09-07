@@ -93,7 +93,7 @@ final class MetadataOps {
     }
 
     private Response getSchemas(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         DatabaseMetaData meta = metadataConnection(connId).getMetaData();
         List<String> schemas = new ArrayList<>();
         try (ResultSet rs = meta.getSchemas()) {
@@ -105,8 +105,8 @@ final class MetadataOps {
     }
 
     private Response setCurrentSchema(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
-        String schema = getString(req, "schema");
+        int connId = req.getInt("conn-id");
+        String schema = req.getString("schema");
         Connection primary = primaryConnection(connId);
         Connection metadata = metadataConnection(connId);
         applyCurrentSchema(primary, schema);
@@ -118,7 +118,7 @@ final class MetadataOps {
     }
 
     private Response getTables(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         Connection conn = metadataConnection(connId);
@@ -233,10 +233,10 @@ final class MetadataOps {
     }
 
     private Response getColumns(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        String table = getString(req, "table");
+        String table = req.getString("table");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> cols = isOracle(conn)
             ? getOracleColumns(conn, schema, table, null)
@@ -245,7 +245,7 @@ final class MetadataOps {
     }
 
     private Response searchTables(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         String prefix = Objects.toString(req.params.get("prefix"), "");
@@ -389,10 +389,10 @@ final class MetadataOps {
     }
 
     private Response searchColumns(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        String table = getString(req, "table");
+        String table = req.getString("table");
         String prefix = Objects.toString(req.params.get("prefix"), "");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> cols = isOracle(conn)
@@ -582,10 +582,10 @@ final class MetadataOps {
     }
 
     private Response getPrimaryKeys(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        String table = getString(req, "table");
+        String table = req.getString("table");
         Connection conn = metadataConnection(connId);
         List<String> pks = isOracle(conn)
             ? getOraclePrimaryKeys(conn, schema, table)
@@ -651,10 +651,10 @@ final class MetadataOps {
     }
 
     private Response getForeignKeys(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        String table = getString(req, "table");
+        String table = req.getString("table");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> fks = isOracle(conn)
             ? getOracleForeignKeys(conn, schema, table)
@@ -683,10 +683,10 @@ final class MetadataOps {
     }
 
     private Response getReferencingObjects(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        String table = getString(req, "table");
+        String table = req.getString("table");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> objects = isOracle(conn)
             ? getOracleReferencingObjects(conn, schema, table)
@@ -835,7 +835,7 @@ final class MetadataOps {
     }
 
     private Response getIndexes(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         String table = getOptionalString(req, "table");
@@ -972,10 +972,10 @@ final class MetadataOps {
     }
 
     private Response getIndexColumns(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        String index = getString(req, "index");
+        String index = req.getString("index");
         String table = getOptionalString(req, "table");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> columns = isOracle(conn)
@@ -1064,7 +1064,7 @@ final class MetadataOps {
     }
 
     private Response getSequences(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String schema = (String) req.params.get("schema");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> sequences = isOracle(conn)
@@ -1153,7 +1153,7 @@ final class MetadataOps {
     }
 
     private Response getProcedures(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         Connection conn = metadataConnection(connId);
@@ -1164,7 +1164,7 @@ final class MetadataOps {
     }
 
     private Response getFunctions(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         Connection conn = metadataConnection(connId);
@@ -1243,10 +1243,10 @@ final class MetadataOps {
     }
 
     private Response getProcedureParams(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        String name = getString(req, "name");
+        String name = req.getString("name");
         String identity = getOptionalString(req, "identity");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> params = isOracle(conn)
@@ -1256,10 +1256,10 @@ final class MetadataOps {
     }
 
     private Response getFunctionParams(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        String name = getString(req, "name");
+        String name = req.getString("name");
         String identity = getOptionalString(req, "identity");
         Connection conn = metadataConnection(connId);
         List<Map<String, Object>> params = isOracle(conn)
@@ -1341,10 +1341,10 @@ final class MetadataOps {
     }
 
     private Response getObjectSource(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String schema = (String) req.params.get("schema");
-        String name = getString(req, "name");
-        String type = getString(req, "type");
+        String name = req.getString("name");
+        String type = req.getString("type");
         String identity = getOptionalString(req, "identity");
         Connection conn = metadataConnection(connId);
         String source = isOracle(conn)
@@ -1354,10 +1354,10 @@ final class MetadataOps {
     }
 
     private Response getObjectDdl(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String schema = (String) req.params.get("schema");
-        String name = getString(req, "name");
-        String type = getString(req, "type");
+        String name = req.getString("name");
+        String type = req.getString("type");
         String identity = getOptionalString(req, "identity");
         Connection conn = metadataConnection(connId);
         String ddl = isOracle(conn)
@@ -1507,7 +1507,7 @@ final class MetadataOps {
     }
 
     private Response getTriggers(Request req) throws SQLException {
-        int connId = getInt(req, "conn-id");
+        int connId = req.getInt("conn-id");
         String schema = (String) req.params.get("schema");
         String table = getOptionalString(req, "table");
         Connection conn = metadataConnection(connId);
@@ -1726,31 +1726,6 @@ final class MetadataOps {
             }
         }
         return map;
-    }
-
-    private int getInt(Request req, String key) {
-        Object v = req.params.get(key);
-        if (v instanceof Byte || v instanceof Short || v instanceof Integer) {
-            return ((Number) v).intValue();
-        }
-        if (v instanceof Long longValue
-            && longValue >= Integer.MIN_VALUE && longValue <= Integer.MAX_VALUE) {
-            return longValue.intValue();
-        }
-        if (v instanceof java.math.BigInteger bigInteger
-            && bigInteger.compareTo(java.math.BigInteger.valueOf(Integer.MIN_VALUE)) >= 0
-            && bigInteger.compareTo(java.math.BigInteger.valueOf(Integer.MAX_VALUE)) <= 0) {
-            return bigInteger.intValue();
-        }
-        throw new IllegalArgumentException("Missing or non-integer param: " + key);
-    }
-
-    private String getString(Request req, String key) {
-        Object v = req.params.get(key);
-        if (v instanceof String s) {
-            return s;
-        }
-        throw new IllegalArgumentException("Missing or non-string param: " + key);
     }
 
     private String getOptionalString(Request req, String key) {
