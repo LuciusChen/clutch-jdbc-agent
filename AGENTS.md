@@ -1,274 +1,62 @@
-# clutch-jdbc-agent Development Guide
+# JDBC agent working guide
 
-Java best practices for a thin JDBC ↔ JSON bridge. The goal is a minimal,
-debuggable sidecar — not a general-purpose database framework.
+Maintain a thin, debuggable Java 17+ JDBC-to-JSON bridge. Prefer direct implementation and clear resource ownership over a general-purpose database framework.
 
-## First Principles
+## Implementation quality
 
-- **Question every abstraction**: Before adding a class, interface, or layer, ask
-  "is this solving a real problem right now?" If the answer is hypothetical, don't add it.
-- **Simplify relentlessly**: Three similar methods are better than a premature
-  abstraction. A single readable class is better than a hierarchy of one.
-- **This is a bridge, not a backend**: All business logic (pagination UI, schema
-  caching, relation graphs, query history) lives in Emacs. The agent only converts
-  JDBC calls to JSON and back. If a feature belongs in Emacs, put it in Emacs.
-- **Delete, don't deprecate**: If something is unused, remove it entirely.
-  No backward-compatibility shims, no `@Deprecated` stubs left in place.
-- **Prefer boring code**: A straightforward `if/else` chain is easier to debug
-  over a network than a clever polymorphic dispatch hierarchy.
+- Correctness and passing tests are the baseline. A cleanup must also simplify state, control flow, ownership or reading the code; moving code or reducing line count alone is not enough.
+- Helpers should own meaningful operations or shared rules. Remove pure forwarding, one-use accessor ladders and redundant validation when an existing owner already supplies the contract. Do not extract helpers to meet a line-count target or merely hide nesting.
+- Keep genuinely different semantics separate. Primary and metadata sessions, transaction completion, savepoint recovery and diagnostic inspection are not interchangeable just because their code looks similar.
+- Prefer straightforward Java 17, existing conventions, local data shapes and try-with-resources. Use package-private visibility where appropriate; keep Javadoc for public contracts. Split classes only at distinct responsibilities; do not add Service/Factory/Helper layers without a current need.
+- Remove unused internal code and speculative compatibility scaffolding. Preserve the documented baseline and supported driver capabilities; do not delete necessary compatibility solely to reduce branches.
+- Treat tests as implementation too: prove public behavior, lifecycle invariants and meaningful boundaries. Avoid tests that only lock in private helper structure; deterministic expected values are normal and random inputs are not a default requirement.
 
-## Architecture Boundaries
+## Scope and completion
 
-The agent is responsible for exactly:
-- JVM startup and driver loading
-- JDBC connection lifecycle (open / close)
-- SQL execution and result streaming via cursors
-- `DatabaseMetaData` queries for schema introspection
-- Type conversion: JDBC → JSON-safe Java types
+- An implementation request includes the change, relevant tests, diff review and necessary documentation. Continue through that work within the task and active permissions. A review or diagnosis request does not authorize implementation.
+- Inspect the affected path and its callers; broaden when dependencies or evidence require it. Ask only for choices that materially affect scope, public behavior, compatibility or external effects.
+- Preserve unrelated changes. Isolated local checks can be iterated within an authorized task; existing databases and user runtime directories are not disposable. Commit, push, publish and runtime replacement require task authorization.
+- After a failed fix, revise the hypothesis before editing again. Resume when evidence supports a change; do not stack fallback paths or stop automatically after an arbitrary attempt count.
+- Stop when the requested outcome and applicable verification are complete, or explain a concrete blocker. Report uncovered drivers or fault-injection limits accurately; passing a proxy-driver test does not establish behavior for every real JDBC driver.
 
-The agent must NOT contain:
-- Pagination logic (page numbers, offsets — that is Emacs's job)
-- SQL rewriting or analysis
-- Schema caching (Emacs caches; agent always queries `DatabaseMetaData` fresh)
-- Connection profiles or credential storage
-- UI concepts of any kind
+## Ownership and protocol
 
-## Version Baseline
+- Java owns driver loading, connections, execution, cursors, metadata and value conversion. Pagination UI, SQL rewriting, schema caches, profiles and mutation orchestration belong to Clutch.
+- `ConnectionManager` owns logical sessions and savepoints; `CursorManager` owns streaming resources; `Dispatcher` owns request routing, locks and execution lifecycle. Preserve primary/metadata session isolation. Metadata recovery must not discard or commit the primary transaction.
+- Serialize operations on each JDBC session. Operations acquiring both locks use foreground-then-metadata order; `cancel` and `force-disconnect` bypass those locks for their existing lifecycle roles.
+- stdout is only for one JSON response per request line, plus the startup ready message. Keep the dedicated protocol output and Java stdout quarantine in `Agent`; use structured stderr logging. Unparseable requests use id -1.
+- Use `Request`'s typed accessors for their existing contracts. Invalid request fields must fail before JDBC work or cursor advancement; diagnostic inspection must not throw while describing the original error.
+- Drivers remain external jars in `drivers/`. Preserve URLClassLoader/ServiceLoader loading and `DriverShim` registration; an empty driver directory is not itself a fatal startup error.
+- Preserve value-conversion contracts, including decimal precision, local temporal values, Unicode-safe CLOB previews, original lengths, and complete text/encoding for supported small BLOBs. Read the relevant converter and tests before changing a representation.
+- Do not add connection pooling, reactive orchestration, a new protocol/configuration framework, SQL parsing, multiple-result-set support or full LOB streaming without an explicitly scoped requirement and design rationale.
 
-- The published Java baseline is **Java 17+** for both build and runtime.
-- Do not silently introduce Java 21-only syntax or APIs just because the local
-  machine has a newer JDK.
-- If a change would raise the baseline above Java 17, document the reason in a
-  postmortem first, then update:
-  - `pom.xml`
-  - `README.md`
-  - `clutch`'s JDBC documentation and bundled agent version/checksum
-- Treat baseline changes as release-level changes, not incidental refactors.
+## Error and recovery boundaries
 
-## Package Structure
+- `Dispatcher` converts dispatch/JDBC failures into structured error responses. Handlers normally propagate failures. `Agent` owns framing, parse errors, output failures and the outer unexpected-failure boundary; it is not a substitute for Dispatcher diagnostics.
+- Catch expected exceptions at the owner that can validate, recover or clean up. Internal errors must not become success, empty results or guessed defaults. Preserve the primary exception and causal/suppressed diagnostics if cleanup also fails.
+- Local resources use try-with-resources; cursor/session owners handle longer lifetimes and shutdown. Cleanup and timeout changes must preserve logical invalidation and must not introduce blocking work into a path that promises to return independently of driver cleanup.
+- Normalize an unsupported optional JDBC operation only when the logical contract still holds. Catch the specific unsupported capability, keep broader SQL failures visible and verify both supported and unsupported paths. Preserve established legacy-driver handling only where that contract requires it.
+- Recovery needs evidence, explicit ownership and a bounded policy. Do not replay user SQL with unknown execution/transaction outcome, introduce heuristic cancellation deadlines or share execution/cancellation capacity without proving the recovery and saturation semantics.
 
-```
-clutch.jdbc
-  Agent.java             ← main(), process loop, driver loading
-  ConnectionManager.java ← connId → primary/metadata JDBC session
-  CursorManager.java     ← cursorId → (Statement, ResultSet), fetch pagination
-  DriverLoader.java      ← scan drivers/, URLClassLoader + ServiceLoader
-  DriverShim.java        ← wrap external Driver for DriverManager acceptance
-  TypeConverter.java     ← JDBC column value → JSON-safe object
+## Read when relevant
 
-clutch.jdbc.handler
-  Dispatcher.java        ← route op strings to handler methods
-  DispatcherDiagnostics.java ← error classification, redaction, debug payloads
-  MetadataOps.java       ← DatabaseMetaData and dialect-specific introspection
+- Build commands, current module map and driver setup: [README](README.md).
+- Protocol fields and value representations: [protocol](README.md#protocol), [type conversion](README.md#type-conversion) and the linked canonical Clutch protocol contract.
+- Concurrency, recovery and session transitions: [architecture](README.md#architecture), the owning implementation and relevant tests.
+- Non-obvious design or known limitations: search [postmortem/](postmortem/) for the affected topic. Do not read every historical record before a local edit.
 
-clutch.jdbc.model
-  Request.java           ← {"id", "op", "params"} and exact typed field access
-  Response.java          ← {"id", "ok", "result" / "error"}
-```
+## Verification
 
-Only split a class when it has a genuinely distinct responsibility. Do not create
-`XxxService`, `XxxFactory`, or `XxxHelper` wrappers for the sake of pattern-following.
+- Documentation/instruction-only changes: review consistency, links and the diff. No Java build, live database run or new product test is required.
+- Code/tests: start with affected tests; before committing code, run `mvn package` with passing tests and no compiler warnings. Reuse a passing run for unchanged code and environment; repeat or broaden only for new changes, failures or unresolved concerns.
+- Bug fixes need a failing regression before the fix. Reuse existing tests for mechanical or behavior-preserving cleanup. Protocol, routing and recovery tests should exercise Dispatcher or Agent as appropriate, not bypass the behavior being changed.
+- Changes to drivers, execution, metadata, transactions, cancellation or conversion require the affected real database workflow via Clutch's test runner. Use Podman/disposable fixtures and the exact jar under test; identify which cases are unit tests, fault injection, live passes or skips. The client runner is `test/run-ci.sh native-live` in the Clutch checkout, with `CLUTCH_TEST_JDBC_AGENT_JAR` and `CLUTCH_TEST_JDBC_AGENT_DIR` selecting the isolated JDBC runtime.
+- Before release, also smoke-test startup and ping against the exact artifact and review stdout isolation. Readiness is a separate id-0 response; the ping request must receive its own successful response.
+- Review the complete intended diff and preserve unrelated work. Tests must not hide failures by changing fixtures or weakening assertions without a contract-based reason.
 
-## Naming
+## Documentation and release
 
-- **Classes**: `PascalCase`. Name them after what they *are*, not what they *do*
-  (`CursorManager`, not `CursorManagementService`).
-- **Methods**: `camelCase`. Name them after what they *return or produce*
-  (`getSchemas`, `fetch`, `connect`), not implementation details.
-- **Private fields**: `camelCase`, no Hungarian prefix.
-- **Constants**: `UPPER_SNAKE_CASE`.
-- **Package-private**: prefer over `public` when a class is not part of the
-  external API. There is no external API — everything is internal.
-
-## Protocol Rules
-
-- **stdout strictly for protocol**: never `System.out.println` a log message.
-  All logging goes to `System.err` (or `System.Logger`).
-- **One JSON object per line**: no pretty-printing, no multi-line messages.
-- **Every request gets exactly one response**: no partial responses, no streaming
-  mid-message. The cursor model handles large results via `fetch`.
-- **Error responses are not exceptions**: return `Response.error(id, msg)` for
-  expected failure modes (bad SQL, unknown conn-id, etc.). Let uncaught exceptions
-  bubble to the Agent-level catch block which also returns an error response.
-- **id=-1 for unparseable requests**: if JSON parsing fails, respond with id=-1
-  so Emacs can distinguish protocol errors from request errors.
-
-## Control Flow
-
-- Prefer flat, linear control flow. Avoid deep nesting — extract a helper method
-  rather than adding another indent level.
-- Use straightforward modern Java that remains valid on Java 17.
-  `switch ->`, records, and `instanceof` pattern matching are fine; avoid newer
-  Java 21-only pattern-matching `switch` constructs unless the baseline is
-  intentionally raised and documented.
-- Use `record` for simple data carriers (`FetchResult`). Do not add behavior to
-  records beyond accessor methods.
-- Handler methods declare `throws Exception` — see "Error Handling and Testing
-  Discipline" for the catch-at-boundary rule.
-
-## Error Handling
-
-- **Protocol errors** (bad JSON, unknown op, missing param): return `Response.error`,
-  never crash the process.
-- **JDBC errors** (`SQLException`): return `Response.error` with a concise
-  message and, when available, structured diagnostics (`diag`) such as
-  SQLState, vendor code, exception class, cause chain, redacted request
-  context, and generated/internal SQL for hidden query paths. Do not expose
-  stack traces to Emacs.
-- **Resource cleanup**: always use try-with-resources for `ResultSet`, `Statement`,
-  `Connection` when the scope is local. For long-lived resources (cursor lifecycle),
-  ensure `close()` is called in `finally` or on shutdown.
-- **Shutdown**: on stdin EOF, call `connMgr.disconnectAll()` before exiting.
-  Do not leave JDBC connections open.
-- Error messages should state what is wrong: `"Unknown connection id: 5"`,
-  not `"Connection operation failed"`.
-
-## Error Handling and Testing Discipline
-
-- **Errors must surface, not hide**: Do not add fallback/default returns that silently swallow failures. Let errors propagate immediately.
-- **Catch at the boundary, nowhere else**: Only `Dispatcher`'s top-level catch block should convert exceptions to `Response.error`. Handler methods and business logic must not try/catch — let exceptions bubble naturally.
-- **Normalize only proven optional lifecycle gaps**: A resource owner may catch
-  exactly `SQLFeatureNotSupportedException` when JDBC documents an operation as
-  optional and the requested logical boundary is already established. Document
-  the invariant in a postmortem, keep broader `SQLException` failures visible,
-  and prove both paths with tests.
-- **Tests must fail when the code is wrong**: If deleting or breaking the function under test does not turn the test red, the test is worthless. Assert specific, distinguishable output values.
-- **No hard-coded expectations**: Use diverse inputs — multiple data sets, random values, boundary cases — so that a hard-coded return cannot satisfy all assertions.
-- **Red before green**: When fixing a bug, first write a failing test that reproduces it. Confirm it fails. Then fix the code. A test written after the fix has never been proven to catch the bug.
-
-## State Management
-
-Long-lived state has three explicit owners:
-
-- `ConnectionManager`: `ConcurrentHashMap<Integer, Session>`. Each `connect`
-  call gets an auto-incremented integer id. No pooling. Each logical clutch
-  connection owns a primary JDBC connection for foreground SQL and a metadata
-  connection for introspection. Metadata recovery may replace only the latter.
-- `CursorManager`: `ConcurrentHashMap<Integer, Cursor>`. Each `execute` that
-  returns a `ResultSet` gets a cursor id. The `ResultSet` stays open until
-  `fetch` returns `done=true` or `close-cursor` is called explicitly.
-- `Dispatcher`: per-connection locks, currently running statements, and bounded
-  request/execution pools. `cancel` deliberately bypasses the connection lock
-  so it can reach the active statement.
-
-No connection profiles, metadata caches, or database business state belong in
-the agent.
-
-## Driver Loading
-
-- Drivers live in `drivers/` next to the jar — never embedded in the fat jar.
-- Use `URLClassLoader` + `ServiceLoader<java.sql.Driver>` to discover drivers.
-- Always wrap loaded drivers in `DriverShim` before calling
-  `DriverManager.registerDriver()`. Without the shim, `DriverManager` rejects
-  drivers whose classloader is not an ancestor of the system classloader.
-- Log loaded driver class names to stderr for debuggability.
-- Do not fail hard if `drivers/` is empty — many users only need one database.
-
-## Type Conversion
-
-Rules for `TypeConverter.convert()`:
-
-- `null` / `wasNull()` → JSON `null`
-- `Boolean` → JSON boolean
-- `Integer`, `Long`, `Short`, `Byte` → JSON number
-- `Double`, `Float` → JSON number, **but** NaN and Infinity → JSON string
-  (NaN/Inf are not valid JSON)
-- `BigDecimal` → **String** (use `toPlainString()`). Preserves precision;
-  avoids JavaScript float rounding on the Emacs side.
-- `Timestamp` → local wall-clock String via `toLocalDateTime()` formatted as
-  `yyyy-MM-dd HH:mm:ss[.fraction]`. Fractional seconds are included only when
-  non-zero, with trailing zeros stripped. Oracle `DATE` has a time component —
-  preserve it when the driver's `getObject()` returns a `Timestamp`. The
-  converter does not currently force a timestamp getter for Oracle DATE.
-- `Date` → `toLocalDate().toString()` (e.g. `2024-06-28`)
-- `Time` → local wall-clock String via `toLocalTime()` formatted as
-  `HH:mm:ss[.fraction]`, same trailing-zero rules as Timestamp.
-- `Clob` → `{"__type":"clob","length":N,"preview":"..."}` (at most 256 UTF-16
-  units, without splitting a surrogate pair; original length is unchanged)
-- `Blob`, `byte[]` → `{"__type":"blob","length":N}`, optionally with complete
-  `text` and `encoding` for small UTF-8/GB18030 JSON/XML payloads. Detection may
-  trim a temporary string; returned content must retain original whitespace.
-- Anything else → `rs.getString(col)` fallback
-
-Stability over perfection.
-
-## Method Design
-
-- Keep methods under ~30 lines. Extract a private helper when a method exceeds this.
-- Name helpers after what they compute, not where they're called from.
-- Handler methods in `Dispatcher` follow a consistent pattern:
-  1. Extract params (`req.getInt` / `req.getString` — throw on missing)
-  2. Delegate to manager(s)
-  3. Build and return `Response.ok(...)`
-- Pure computation (type conversion, metadata parsing) must be separate from
-  I/O (reading `ResultSet`, writing response).
-
-## Pre-Submit Review
-
-Before committing significant changes, review the whole diff:
-
-- **No heuristic shortcuts**: if a fix feels "good enough for now", document why
-  it is deferred. Don't leave silent partial implementations.
-- **No redundancy**: remove duplicated logic or dead code introduced by the change.
-- **Protocol stability**: any change to request/response field names or semantics
-  is a breaking change for the Emacs side. Coordinate with `clutch-db-jdbc.el`.
-- **No stdout pollution**: production `System.out` use belongs only in
-  `Agent.java`, where it is redirected away from the protocol before third-party
-  code loads. A deliberate test-only noisy driver may write there solely to
-  prove that quarantine boundary.
-- **Compile clean**: `mvn package` must produce zero warnings.
-
-## Quality Checks
-
-Before releasing:
-- `mvn package` produces no warnings.
-- All `public` methods and classes have Javadoc.
-- Production `System.out` references appear **only** in `Agent.java`'s startup
-  quarantine; protocol writes use its dedicated `FileDescriptor.out` stream.
-- All `System.err` / logger calls use structured messages (no string concatenation
-  in hot paths).
-- Smoke test: `echo '{"id":1,"op":"ping","params":{}}' | java -jar target/clutch-jdbc-agent-*.jar`
-  must print `{"id":1,"ok":true,"result":{"pong":true}}`.
-
-## Release Discipline
-
-- Treat the published release jar as the source of truth consumed by `clutch`. If the jar bytes change, the consuming checksum in `clutch` must change in lockstep.
-- Prefer bumping `<version>` for any released jar content change. Replacing a GitHub release asset in place should be reserved for exceptional repair cases.
-- If an in-place asset replacement is unavoidable, update `clutch-jdbc-agent-sha256` in `clutch` immediately and verify `clutch-jdbc-ensure-agent` against the published asset, not just a local Maven build.
-- Do not assume the local `target/*.jar` checksum matches the release asset checksum. Always verify against the uploaded artifact before documenting or committing a checksum.
-
-## Postmortems
-
-The `postmortem/` directory contains design decision records. **Read them before
-making significant changes.**
-
-Each file is named `NNN-topic.md` and records: background, decision, rationale,
-alternatives considered, and known limitations.
-
-**Write a postmortem when:**
-- Changing the protocol (field names, new ops, error semantics)
-- Choosing between non-obvious implementation approaches
-- Adding a new driver-loading strategy or classloader trick
-- Reverting or abandoning an approach — especially document *why* it was wrong
-- Discovering a limitation that is deliberately deferred (e.g. CLOB streaming)
-
-**What to write:** focus on *why*, not *what*. The code already shows what was
-done. A record that only restates the code adds no value.
-
-## What NOT to Build (v1)
-
-Explicitly deferred — do not add these without a postmortem justifying the need:
-
-Recoverable cancel/interrupt support is no longer deferred; see
-`postmortem/007-cancel-op-and-request-concurrency.md`.
-
-- Connection pooling (HikariCP, c3p0, etc.)
-- Async/reactive execution (CompletableFuture, Project Reactor)
-- Full JSON-RPC framing (jsonrpc id types, batch requests, notifications)
-- SQL parsing or query analysis
-- Schema caching inside the agent
-- CLOB/BLOB full content streaming (placeholders are sufficient for v1)
-- General transaction orchestration beyond the direct commit, rollback,
-  autocommit, and savepoint primitives documented in postmortem 021
-- Multiple result sets from a single execute (stored procedures)
-- A separate configuration file for the agent
+- Keep README and the canonical protocol document consistent with changed behavior. Coordinate wire field/semantic changes with `clutch-db-jdbc.el`; distinguish compatible additions from actual contract breaks.
+- Java 17 is the published baseline. An intentional baseline change must update pom.xml, README, Clutch's requirements and release metadata, with a rationale.
+- Published jar bytes are what Clutch consumes. Prefer a version bump for a changed release artifact; update Clutch's version/checksum pair against the published bytes. Do not substitute the checksum of an arbitrary local build.
+- Keep a concise postmortem for non-obvious protocol, lifecycle, driver or compatibility decisions, abandoned designs and deliberately deferred limitations. Routine cleanup, wording or instruction maintenance does not require a new record; preserve historical records as history.

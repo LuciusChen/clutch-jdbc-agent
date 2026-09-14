@@ -88,13 +88,13 @@ final class MetadataOps {
     void restoreCurrentSchema(int connId) throws SQLException {
         String schema = connMgr.currentSchema(connId);
         if (schema != null) {
-            applyCurrentSchema(metadataConnection(connId), schema);
+            applyCurrentSchema(connMgr.getMetadata(connId), schema);
         }
     }
 
     private Response getSchemas(Request req) throws SQLException {
         int connId = req.getInt("conn-id");
-        DatabaseMetaData meta = metadataConnection(connId).getMetaData();
+        DatabaseMetaData meta = connMgr.getMetadata(connId).getMetaData();
         List<String> schemas = new ArrayList<>();
         try (ResultSet rs = meta.getSchemas()) {
             while (rs.next()) {
@@ -107,8 +107,8 @@ final class MetadataOps {
     private Response setCurrentSchema(Request req) throws SQLException {
         int connId = req.getInt("conn-id");
         String schema = req.getString("schema");
-        Connection primary = primaryConnection(connId);
-        Connection metadata = metadataConnection(connId);
+        Connection primary = connMgr.getPrimary(connId);
+        Connection metadata = connMgr.getMetadata(connId);
         applyCurrentSchema(primary, schema);
         if (metadata != primary) {
             applyCurrentSchema(metadata, schema);
@@ -121,7 +121,7 @@ final class MetadataOps {
         int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         return isOracle(conn)
             ? oracleTablesCursor(req.id, connId, conn, schema)
             : jdbcTablesOneBatch(req.id, conn, catalog, schema);
@@ -237,7 +237,7 @@ final class MetadataOps {
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         String table = req.getString("table");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> cols = isOracle(conn)
             ? getOracleColumns(conn, schema, table, null)
             : getJdbcMetadataColumns(conn, catalog, schema, table, null);
@@ -249,7 +249,7 @@ final class MetadataOps {
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         String prefix = Objects.toString(req.params.get("prefix"), "");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> tables = isOracle(conn)
             ? searchOracleTables(conn, schema, prefix)
             : searchJdbcMetadataTables(conn, catalog, schema, prefix);
@@ -394,7 +394,7 @@ final class MetadataOps {
         String schema = getOptionalString(req, "schema");
         String table = req.getString("table");
         String prefix = Objects.toString(req.params.get("prefix"), "");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> cols = isOracle(conn)
             ? searchOracleColumns(conn, schema, table, prefix)
             : getJdbcMetadataColumns(conn, catalog, schema, table, prefix);
@@ -586,7 +586,7 @@ final class MetadataOps {
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         String table = req.getString("table");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<String> pks = isOracle(conn)
             ? getOraclePrimaryKeys(conn, schema, table)
             : getJdbcMetadataPrimaryKeys(conn, catalog, schema, table);
@@ -655,7 +655,7 @@ final class MetadataOps {
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         String table = req.getString("table");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> fks = isOracle(conn)
             ? getOracleForeignKeys(conn, schema, table)
             : getJdbcMetadataForeignKeys(conn, catalog, schema, table);
@@ -687,7 +687,7 @@ final class MetadataOps {
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         String table = req.getString("table");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> objects = isOracle(conn)
             ? getOracleReferencingObjects(conn, schema, table)
             : getJdbcMetadataReferencingObjects(conn, catalog, schema, table);
@@ -839,7 +839,7 @@ final class MetadataOps {
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         String table = getOptionalString(req, "table");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> indexes = isOracle(conn)
             ? getOracleIndexes(conn, schema, table)
             : getJdbcIndexes(conn, catalog, schema, table);
@@ -977,7 +977,7 @@ final class MetadataOps {
         String schema = getOptionalString(req, "schema");
         String index = req.getString("index");
         String table = getOptionalString(req, "table");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> columns = isOracle(conn)
             ? getOracleIndexColumns(conn, schema, index)
             : getJdbcIndexColumns(conn, catalog, schema, index, table);
@@ -1066,7 +1066,7 @@ final class MetadataOps {
     private Response getSequences(Request req) throws SQLException {
         int connId = req.getInt("conn-id");
         String schema = (String) req.params.get("schema");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> sequences = isOracle(conn)
             ? getOracleSequences(conn, schema)
             : getDialectSequences(conn, schema);
@@ -1156,7 +1156,7 @@ final class MetadataOps {
         int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> procedures = isOracle(conn)
             ? getOracleRoutines(conn, schema, "PROCEDURE")
             : getJdbcRoutines(conn, catalog, schema, true);
@@ -1167,7 +1167,7 @@ final class MetadataOps {
         int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> functions = isOracle(conn)
             ? getOracleRoutines(conn, schema, "FUNCTION")
             : getJdbcRoutines(conn, catalog, schema, false);
@@ -1248,7 +1248,7 @@ final class MetadataOps {
         String schema = getOptionalString(req, "schema");
         String name = req.getString("name");
         String identity = getOptionalString(req, "identity");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> params = isOracle(conn)
             ? getOracleRoutineParams(conn, schema, name)
             : getJdbcRoutineParams(conn, catalog, schema, name, identity, true);
@@ -1261,7 +1261,7 @@ final class MetadataOps {
         String schema = getOptionalString(req, "schema");
         String name = req.getString("name");
         String identity = getOptionalString(req, "identity");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> params = isOracle(conn)
             ? getOracleRoutineParams(conn, schema, name)
             : getJdbcRoutineParams(conn, catalog, schema, name, identity, false);
@@ -1346,7 +1346,7 @@ final class MetadataOps {
         String name = req.getString("name");
         String type = req.getString("type");
         String identity = getOptionalString(req, "identity");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         String source = isOracle(conn)
             ? getOracleObjectSource(conn, schema, name, type)
             : getDialectObjectSource(conn, schema, name, type, identity);
@@ -1359,7 +1359,7 @@ final class MetadataOps {
         String name = req.getString("name");
         String type = req.getString("type");
         String identity = getOptionalString(req, "identity");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         String ddl = isOracle(conn)
             ? getOracleObjectDdl(conn, schema, name, type)
             : getDialectObjectDdl(conn, schema, name, type, identity);
@@ -1510,7 +1510,7 @@ final class MetadataOps {
         int connId = req.getInt("conn-id");
         String schema = (String) req.params.get("schema");
         String table = getOptionalString(req, "table");
-        Connection conn = metadataConnection(connId);
+        Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> triggers = isOracle(conn)
             ? getOracleTriggers(conn, schema, table)
             : getDialectTriggers(conn, schema, table);
@@ -1679,14 +1679,6 @@ final class MetadataOps {
         try (Statement stmt = conn.createStatement()) {
             stmt.execute(sql);
         }
-    }
-
-    private Connection primaryConnection(int connId) throws SQLException {
-        return connMgr.getPrimary(connId);
-    }
-
-    private Connection metadataConnection(int connId) throws SQLException {
-        return connMgr.getMetadata(connId);
     }
 
     private void applyCurrentSchema(Connection conn, String schema) throws SQLException {

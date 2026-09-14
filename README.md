@@ -55,7 +55,7 @@ Then connect as usual:
                            :user "scott" :pass-entry "prod-oracle"))))
 ```
 
-See the [clutch README](https://github.com/LuciusChen/clutch#jdbc-backend-clutch-db-jdbcel)
+See the [Clutch JDBC backend guide](https://github.com/LuciusChen/clutch/blob/main/docs/jdbc-backend.org)
 for the full setup guide.
 
 ## Protocol
@@ -84,8 +84,10 @@ range are rejected before JDBC work or cursor advancement.
 
 Every protocol integer must be represented as an exact signed 32-bit integer;
 fractional and overflowing JSON numbers are rejected instead of truncated.
-If an execute/fetch timeout cannot stop the driver worker within a short grace
-period, the logical connection is closed and cannot be reused concurrently.
+After `Statement.cancel()` returns, execute/fetch timeout recovery waits for the
+driver worker to stop within a short grace period before reusing the session.
+Otherwise it retires the logical connection, or only the metadata session for a
+metadata fetch. Cancellation itself is driver-dependent and may block.
 
 Boolean params are JSON booleans, not strings or numeric sentinels. Staged DML
 uses `execute-params` with a positional JSON `values` array; the agent binds each
@@ -144,37 +146,9 @@ context and a redacted Java stack trace.
 
 ### Operations
 
-| Op                | Description                                      |
-|-------------------|--------------------------------------------------|
-| `ping`            | Health check                                     |
-| `connect`         | Open a JDBC connection, returns `conn-id`        |
-| `disconnect`      | Close a connection and its open cursors          |
-| `commit`          | Commit the current transaction                   |
-| `rollback`        | Roll back the current transaction                |
-| `set-auto-commit` | Toggle JDBC autocommit on the primary session    |
-| `create-savepoint` | Create a savepoint, returning an opaque `savepoint-id` |
-| `rollback-savepoint` | Roll back to and release an opaque savepoint   |
-| `release-savepoint` | Release an opaque savepoint after success       |
-| `set-current-schema` | Update current schema on primary + metadata sessions |
-| `cancel`          | Cancel the currently running statement for a connection |
-| `execute`         | Execute SQL; returns first batch + `cursor-id`   |
-| `execute-params`  | Execute SQL with positional prepared values      |
-| `fetch`           | Fetch next batch from an open cursor             |
-| `close-cursor`    | Close a cursor explicitly                        |
-| `get-schemas`     | List schemas via `DatabaseMetaData`              |
-| `get-tables`      | List schema/browser tables; generic JDBC includes `REMARKS` as optional `comment`; Oracle uses direct SQL over `user_*`, `user_synonyms`, and accessible `all_*` views |
-| `search-tables`   | Prefix-search tables/views for completion; generic JDBC includes optional `comment`; Oracle also includes low-privilege synonym / accessible-owner paths, with system owners filtered in SQL except for `PUBLIC SYNONYM` |
-| `get-columns`     | List columns for a table, including optional `default` expressions |
-| `search-columns`  | Prefix-search columns for completion, including optional `default` expressions |
-| `get-primary-keys`| List primary key columns                         |
-| `get-foreign-keys`| List imported foreign keys                       |
-| `get-indexes` / `get-index-columns` | Index metadata                  |
-| `get-sequences`   | Sequence discovery                               |
-| `get-procedures` / `get-functions` | Routine discovery                |
-| `get-procedure-params` / `get-function-params` | Routine parameter metadata |
-| `get-triggers`    | Trigger discovery                                |
-| `get-object-source` / `get-object-ddl` | Source / DDL fetch             |
-| `get-referencing-objects` | Referencing-object discovery              |
+See the canonical [operation inventory and session contract](https://github.com/LuciusChen/clutch/blob/main/docs/jdbc-agent-protocol.md#core-operations).
+This includes lock-bypassing `force-disconnect` for retiring an unresponsive
+logical connection without blocking on driver cleanup.
 
 ## Type Conversion
 
