@@ -334,10 +334,7 @@ public class ConnectionManager {
      */
     public boolean validatePrimaryIfIdle(int connId, int timeoutSeconds)
             throws SQLException {
-        Session session = connections.get(connId);
-        if (session == null) {
-            throw new SQLException("Unknown connection id: " + connId);
-        }
+        Session session = requireSession(connId);
         long thresholdMillis = session.validateAfterIdleMillis;
         long idleMillis = Math.max(0L, clock.millis() - session.lastPrimaryUseMillis);
         if (thresholdMillis == 0L || idleMillis < thresholdMillis) {
@@ -358,10 +355,7 @@ public class ConnectionManager {
 
     /** Return the live metadata Connection for {@code connId}, or throw if unknown. */
     public Connection getMetadata(int connId) throws SQLException {
-        Session session = connections.get(connId);
-        if (session == null)
-            throw new SQLException("Unknown connection id: " + connId);
-        Connection metadata = session.metadata();
+        Connection metadata = requireSession(connId).metadata();
         if (metadata == null)
             throw new SQLException("Metadata connection is invalid for connection id: " + connId);
         return metadata;
@@ -422,20 +416,12 @@ public class ConnectionManager {
 
     /** Remember the logical session schema so metadata recovery can restore it. */
     public void rememberCurrentSchema(int connId, String schema) throws SQLException {
-        Session session = connections.get(connId);
-        if (session == null) {
-            throw new SQLException("Unknown connection id: " + connId);
-        }
-        session.currentSchema = schema;
+        requireSession(connId).currentSchema = schema;
     }
 
     /** Return the logical session schema last set by the client, or null. */
     public String currentSchema(int connId) throws SQLException {
-        Session session = connections.get(connId);
-        if (session == null) {
-            throw new SQLException("Unknown connection id: " + connId);
-        }
-        return session.currentSchema;
+        return requireSession(connId).currentSchema;
     }
 
     private boolean metadataUsable(Connection connection, SQLException failure) {

@@ -393,7 +393,7 @@ public class Dispatcher {
         if (preflightFailure != null) {
             return preflightFailure;
         }
-        Connection conn = primaryConnection(connId);
+        Connection conn = connMgr.getPrimary(connId);
         Statement stmt = conn.createStatement();
         return executeStatement(
             req, connId, stmt, () -> stmt.execute(sql), fetchSize, executeTimeout, null);
@@ -411,7 +411,7 @@ public class Dispatcher {
         if (preflightFailure != null) {
             return preflightFailure;
         }
-        Connection conn = primaryConnection(connId);
+        Connection conn = connMgr.getPrimary(connId);
         PreparedStatement stmt = conn.prepareStatement(sql);
         List<Blob> blobsToFree = new ArrayList<>();
         try {
@@ -719,10 +719,6 @@ public class Dispatcher {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
-
-    private Connection primaryConnection(int connId) throws SQLException {
-        return connMgr.getPrimary(connId);
-    }
 
     private boolean requestBypassesConnectionLock(Request req) {
         return switch (req.op) {
