@@ -56,8 +56,7 @@ public class Dispatcher {
     private final ConnectionManager connMgr;
     private final CursorManager cursorMgr;
     private final ExecutorService executePool = newExecutePool();
-    private final Map<Integer, ReentrantLock> foregroundLocks = new ConcurrentHashMap<>();
-    private final Map<Integer, ReentrantLock> metadataLocks = new ConcurrentHashMap<>();
+    private final Map<Integer, ConnectionLocks> connectionLocks = new ConcurrentHashMap<>();
     private final Map<Integer, RunningStatement> runningStatements = new ConcurrentHashMap<>();
     private final ThreadLocal<String> generatedSqlContext = new ThreadLocal<>();
     private final ThreadLocal<Boolean> executionNotStartedContext = new ThreadLocal<>();
@@ -77,6 +76,13 @@ public class Dispatcher {
         private boolean cancelRequested() {
             return cancelRequestedFlag.get();
         }
+    }
+
+    private static final class ConnectionLocks {
+        private final ReentrantLock foreground = new ReentrantLock();
+        private final ReentrantLock metadata = new ReentrantLock();
+        // Updated only by atomic map computations for this connection id.
+        private int users;
     }
 
     /** Create a Dispatcher backed by the given connection and cursor managers. */
@@ -116,9 +122,7 @@ public class Dispatcher {
             if (requestUsesBothConnectionLocks(req)) {
                 return withBothConnectionLocks(connId, lockedAction);
             }
-            Map<Integer, ReentrantLock> locks = requestUsesMetadataLock(req)
-                ? metadataLocks : foregroundLocks;
-            return withConnectionLock(locks, connId, lockedAction);
+            return withConnectionLock(connId, requestUsesMetadataLock(req), lockedAction);
         } catch (Exception e) {
             return errorResponse(req, e);
         } finally {
@@ -758,33 +762,54 @@ public class Dispatcher {
         return false;
     }
 
-    private Response withConnectionLock(Map<Integer, ReentrantLock> locks, int connId,
+    private ConnectionLocks reserveConnectionLocks(int connId) {
+        return connectionLocks.compute(connId, (_id, locks) -> {
+            if (locks == null) {
+                locks = new ConnectionLocks();
+            }
+            locks.users++;
+            return locks;
+        });
+    }
+
+    private void releaseConnectionLocks(int connId) {
+        connectionLocks.computeIfPresent(connId, (_id, locks) ->
+            --locks.users == 0 ? null : locks);
+    }
+
+    private Response withConnectionLock(int connId, boolean metadata,
                                         Callable<Response> action) throws Exception {
-        ReentrantLock lock = locks.computeIfAbsent(connId, _id -> new ReentrantLock());
-        lock.lock();
+        ConnectionLocks locks = reserveConnectionLocks(connId);
         try {
-            return action.call();
+            ReentrantLock lock = metadata ? locks.metadata : locks.foreground;
+            lock.lock();
+            try {
+                return action.call();
+            } finally {
+                lock.unlock();
+            }
         } finally {
-            lock.unlock();
+            releaseConnectionLocks(connId);
         }
     }
 
     private Response withBothConnectionLocks(int connId, Callable<Response> action)
             throws Exception {
-        ReentrantLock foreground = foregroundLocks.computeIfAbsent(
-            connId, _id -> new ReentrantLock());
-        ReentrantLock metadata = metadataLocks.computeIfAbsent(
-            connId, _id -> new ReentrantLock());
-        foreground.lock();
+        ConnectionLocks locks = reserveConnectionLocks(connId);
         try {
-            metadata.lock();
+            locks.foreground.lock();
             try {
-                return action.call();
+                locks.metadata.lock();
+                try {
+                    return action.call();
+                } finally {
+                    locks.metadata.unlock();
+                }
             } finally {
-                metadata.unlock();
+                locks.foreground.unlock();
             }
         } finally {
-            foreground.unlock();
+            releaseConnectionLocks(connId);
         }
     }
 

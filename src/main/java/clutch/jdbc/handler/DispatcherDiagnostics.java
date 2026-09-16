@@ -181,24 +181,24 @@ final class DispatcherDiagnostics {
                 "redacted-url", redactJdbcUrl((String) req.params.get("url")),
                 "user", nonBlankString((String) req.params.get("user")),
                 "property-keys", propertyKeys,
-                "connect-timeout-seconds", optionalIntParam(req, "connect-timeout-seconds"),
-                "network-timeout-seconds", optionalIntParam(req, "network-timeout-seconds"));
+                "connect-timeout-seconds", req.intOrNull("connect-timeout-seconds"),
+                "network-timeout-seconds", req.intOrNull("network-timeout-seconds"));
         }
         if ("execute".equals(req.op) || "execute-params".equals(req.op)) {
             String sql = optionalStringParam(req, "sql");
             return entryMap(
                 "sql-length", sql != null ? sql.length() : null,
-                "fetch-size", optionalIntParam(req, "fetch-size"),
-                "query-timeout-seconds", optionalIntParam(req, "query-timeout-seconds"));
+                "fetch-size", req.intOrNull("fetch-size"),
+                "query-timeout-seconds", req.intOrNull("query-timeout-seconds"));
         }
         if ("fetch".equals(req.op)) {
             return entryMap(
-                "cursor-id", optionalIntParam(req, "cursor-id"),
-                "fetch-size", optionalIntParam(req, "fetch-size"),
-                "query-timeout-seconds", optionalIntParam(req, "query-timeout-seconds"));
+                "cursor-id", req.intOrNull("cursor-id"),
+                "fetch-size", req.intOrNull("fetch-size"),
+                "query-timeout-seconds", req.intOrNull("query-timeout-seconds"));
         }
         if ("cancel".equals(req.op)) {
-            return entryMap("target-conn-id", connId != null ? connId : optionalIntParam(req, "conn-id"));
+            return entryMap("target-conn-id", connId != null ? connId : req.intOrNull("conn-id"));
         }
         if (isMetadataOperation(req.op)) {
             return entryMap(
@@ -211,23 +211,6 @@ final class DispatcherDiagnostics {
                 "identity", nonBlankString(optionalStringParam(req, "identity")));
         }
         return Map.of();
-    }
-
-    private Integer optionalIntParam(Request req, String key) {
-        Object value = req.params.get(key);
-        if (value instanceof Byte || value instanceof Short || value instanceof Integer) {
-            return ((Number) value).intValue();
-        }
-        if (value instanceof Long longValue
-            && longValue >= Integer.MIN_VALUE && longValue <= Integer.MAX_VALUE) {
-            return longValue.intValue();
-        }
-        if (value instanceof java.math.BigInteger bigInteger
-            && bigInteger.compareTo(java.math.BigInteger.valueOf(Integer.MIN_VALUE)) >= 0
-            && bigInteger.compareTo(java.math.BigInteger.valueOf(Integer.MAX_VALUE)) <= 0) {
-            return bigInteger.intValue();
-        }
-        return null;
     }
 
     private boolean debugRequested(Request req) {
