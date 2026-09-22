@@ -30,6 +30,7 @@ public class Agent {
 
     private static final System.Logger LOG = System.getLogger(Agent.class.getName());
     static final int MAX_CONCURRENT_REQUESTS = 48;
+    static final int IN_FLIGHT_DRAIN_SECONDS = 5;
     private static final String REQUEST_OVERLOADED_ERROR =
         "Agent overloaded: too many concurrent requests";
 
@@ -68,11 +69,28 @@ public class Agent {
 
         serve(in, out, mapper, dispatcher, requestPool);
 
-        // stdin closed — clean up and exit.
+        // stdin closed — answer what was already read, clean up and exit.
         LOG.log(System.Logger.Level.INFO, "stdin closed, shutting down.");
-        requestPool.shutdownNow();
+        awaitInFlightRequests(requestPool);
         connMgr.disconnectAll();
         dispatcher.shutdown();
+    }
+
+    /**
+     * Wait a bounded time for requests already handed to the pool.  Their
+     * lines were read before stdin closed, so their responses are still owed;
+     * exiting at once would kill the daemon workers mid-answer.
+     */
+    static void awaitInFlightRequests(ExecutorService requestPool) {
+        requestPool.shutdown();
+        try {
+            if (!requestPool.awaitTermination(IN_FLIGHT_DRAIN_SECONDS, TimeUnit.SECONDS)) {
+                requestPool.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            requestPool.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**
