@@ -60,6 +60,40 @@ final class MetadataOps {
         return SUPPORTED_OPS.contains(op);
     }
 
+    /**
+     * Whether {@code req} runs on its connection's bulk session: a listing of
+     * the whole schema rather than one named object, on a product that keeps
+     * such a session so the listing cannot hold the metadata session for
+     * seconds while an interactive lookup waits.  The dispatcher locks the
+     * lane named here, so nothing else may decide it.
+     */
+    boolean runsOnBulkSession(Request req) throws SQLException {
+        boolean listing = switch (req.op) {
+            case "get-tables", "get-sequences", "get-procedures", "get-functions" -> true;
+            case "get-indexes", "get-triggers" -> getOptionalString(req, "table") == null;
+            default -> false;
+        };
+        return listing && connMgr.usesBulkSession(req.getInt("conn-id"));
+    }
+
+    /**
+     * Return the session {@code req} runs on: the bulk session for a
+     * schema-wide listing where the product uses one, opened on first use with
+     * the current schema restored, otherwise the metadata session.
+     */
+    private Connection sessionFor(Request req, int connId) throws SQLException {
+        if (!runsOnBulkSession(req)) {
+            return connMgr.getMetadata(connId);
+        }
+        if (connMgr.openBulkIfAbsent(connId)) {
+            String schema = connMgr.currentSchema(connId);
+            if (schema != null) {
+                applyCurrentSchema(connMgr.getBulk(connId), schema);
+            }
+        }
+        return connMgr.getBulk(connId);
+    }
+
     Response dispatch(Request req) throws SQLException {
         return switch (req.op) {
             case "get-schemas" -> getSchemas(req);
@@ -113,6 +147,8 @@ final class MetadataOps {
         if (metadata != primary) {
             applyCurrentSchema(metadata, schema);
         }
+        // The next listing reopens the bulk session with the remembered schema.
+        connMgr.invalidateBulk(connId);
         connMgr.rememberCurrentSchema(connId, schema);
         return Response.ok(req.id, Map.of("conn-id", connId, "schema", schema));
     }
@@ -121,7 +157,7 @@ final class MetadataOps {
         int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        Connection conn = connMgr.getMetadata(connId);
+        Connection conn = sessionFor(req, connId);
         return isOracle(conn)
             ? oracleTablesCursor(req.id, connId, conn, schema)
             : jdbcTablesOneBatch(req.id, conn, catalog, schema);
@@ -186,7 +222,9 @@ final class MetadataOps {
             }
             ResultSet rs = ps.executeQuery();
             rs.setFetchSize(1000);
-            cursorId = cursorMgr.registerMetadata(connId, ps, rs);
+            cursorId = connMgr.usesBulkSession(connId)
+                ? cursorMgr.registerBulk(connId, ps, rs)
+                : cursorMgr.registerMetadata(connId, ps, rs);
             CursorManager.FetchResult first = cursorMgr.fetch(cursorId, 1000);
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("cursor-id", first.done() ? null : cursorId);
@@ -839,7 +877,7 @@ final class MetadataOps {
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         String table = getOptionalString(req, "table");
-        Connection conn = connMgr.getMetadata(connId);
+        Connection conn = sessionFor(req, connId);
         List<Map<String, Object>> indexes = isOracle(conn)
             ? getOracleIndexes(conn, schema, table)
             : getJdbcIndexes(conn, catalog, schema, table);
@@ -1066,7 +1104,7 @@ final class MetadataOps {
     private Response getSequences(Request req) throws SQLException {
         int connId = req.getInt("conn-id");
         String schema = (String) req.params.get("schema");
-        Connection conn = connMgr.getMetadata(connId);
+        Connection conn = sessionFor(req, connId);
         List<Map<String, Object>> sequences = isOracle(conn)
             ? getOracleSequences(conn, schema)
             : getDialectSequences(conn, schema);
@@ -1156,7 +1194,7 @@ final class MetadataOps {
         int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        Connection conn = connMgr.getMetadata(connId);
+        Connection conn = sessionFor(req, connId);
         List<Map<String, Object>> procedures = isOracle(conn)
             ? getOracleRoutines(conn, schema, "PROCEDURE")
             : getJdbcRoutines(conn, catalog, schema, true);
@@ -1167,7 +1205,7 @@ final class MetadataOps {
         int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        Connection conn = connMgr.getMetadata(connId);
+        Connection conn = sessionFor(req, connId);
         List<Map<String, Object>> functions = isOracle(conn)
             ? getOracleRoutines(conn, schema, "FUNCTION")
             : getJdbcRoutines(conn, catalog, schema, false);
@@ -1510,7 +1548,7 @@ final class MetadataOps {
         int connId = req.getInt("conn-id");
         String schema = (String) req.params.get("schema");
         String table = getOptionalString(req, "table");
-        Connection conn = connMgr.getMetadata(connId);
+        Connection conn = sessionFor(req, connId);
         List<Map<String, Object>> triggers = isOracle(conn)
             ? getOracleTriggers(conn, schema, table)
             : getDialectTriggers(conn, schema, table);

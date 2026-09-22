@@ -636,6 +636,80 @@ class ConnectionManagerTest {
         }
     }
 
+    @Test
+    void bulkSessionOpensLazilyOnceAndClosesWithTheConnection() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(Clock.systemUTC(), _product -> true);
+            int connId = mgr.connect("jdbc:test:inventory", "scott", "tiger",
+                Map.of(), 7, 11, null, true, RecordingDriver.class.getName());
+            assertEquals(2, driver.connectCount, "connect opens primary and metadata only");
+            assertTrue(mgr.usesBulkSession(connId));
+            assertThrows(SQLException.class, () -> mgr.getBulk(connId));
+
+            assertTrue(mgr.openBulkIfAbsent(connId));
+            assertEquals(3, driver.connectCount);
+            assertFalse(mgr.openBulkIfAbsent(connId), "second call reuses the open session");
+            assertEquals(3, driver.connectCount);
+
+            mgr.disconnect(connId);
+            assertEquals(3, driver.closedCount, "disconnect closes the bulk session too");
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void bulkSessionStaysClosedForOtherProducts() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager();
+            int connId = mgr.connect("jdbc:test:inventory", "scott", "tiger",
+                Map.of(), 7, 11, null, true, RecordingDriver.class.getName());
+            assertFalse(mgr.usesBulkSession(connId), "only Oracle lists on a bulk session");
+            assertThrows(SQLException.class, () -> mgr.getBulk(connId));
+            mgr.disconnect(connId);
+            assertEquals(2, driver.closedCount);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void invalidateBulkIfInvalidDropsOnlyADeadBulkSession() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(Clock.systemUTC(), _product -> true);
+            int connId = mgr.connect("jdbc:test:inventory", "scott", "tiger",
+                Map.of(), 7, 11, null, true, RecordingDriver.class.getName());
+            SQLException dead = new SQLException("ORA-12592: TNS:bad packet", "66000", 12592);
+            assertFalse(mgr.invalidateBulkIfInvalid(connId, dead), "nothing open to drop");
+
+            assertTrue(mgr.openBulkIfAbsent(connId));
+            Connection bulk = mgr.getBulk(connId);
+            Connection metadata = mgr.getMetadata(connId);
+            assertFalse(mgr.invalidateBulkIfInvalid(connId,
+                new SQLException("ORA-00942: table or view does not exist", "42000", 942)));
+            assertSame(bulk, mgr.getBulk(connId), "an ordinary SQL error keeps the session");
+
+            assertTrue(mgr.invalidateBulkIfInvalid(connId, dead));
+            assertThrows(SQLException.class, () -> mgr.getBulk(connId));
+            assertSame(metadata, mgr.getMetadata(connId));
+            awaitClosedCount(driver, 1);
+            assertEquals(1, driver.closedCount);
+            assertTrue(mgr.openBulkIfAbsent(connId), "the next listing opens a fresh session");
+            assertEquals(4, driver.connectCount);
+
+            mgr.disconnect(connId);
+            assertEquals(4, driver.closedCount);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
     private static final class RecordingDriver implements Driver {
         private String seenUrl;
         private int seenLoginTimeout = -1;
