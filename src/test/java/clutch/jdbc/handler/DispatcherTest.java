@@ -640,6 +640,148 @@ class DispatcherTest {
     }
 
     @Test
+    void bulkListingDoesNotBlockMetadataLookupOnBulkEligibleConnection() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        CountDownLatch bulkStarted = new CountDownLatch(1);
+        CountDownLatch releaseBulk = new CountDownLatch(1);
+        CountDownLatch alreadyReleased = new CountDownLatch(0);
+        connMgr.bulkEligible = true;
+        connMgr.bulkConnection = connectionBlockingOnGetTables(bulkStarted, releaseBulk);
+        connMgr.metadataConnection = blockingMetadataConnectionWithSchemas(
+            List.of("APP"), new CountDownLatch(1), alreadyReleased);
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<Response> listing = executor.submit(
+            () -> dispatcher.dispatch(request(880, "get-indexes", "conn-id", 7)));
+        try {
+            assertTrue(bulkStarted.await(1, TimeUnit.SECONDS));
+            Response lookup = dispatcher.dispatch(request(881, "get-schemas", "conn-id", 7));
+
+            assertTrue(lookup.ok, "a metadata lookup must not queue behind a bulk listing");
+            assertEquals(List.of("APP"), resultMap(lookup).get("schemas"));
+            releaseBulk.countDown();
+            assertTrue(listing.get(1, TimeUnit.SECONDS).ok);
+        } finally {
+            releaseBulk.countDown();
+            executor.shutdownNow();
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void schemaWideListingStaysOnMetadataSessionWithoutBulkEligibility() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.bulkEligible = false;
+        connMgr.bulkConnection = null;
+        connMgr.metadataConnection = connectionBlockingOnGetTables(
+            new CountDownLatch(1), new CountDownLatch(0));
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response listing = dispatcher.dispatch(request(882, "get-indexes", "conn-id", 7));
+
+            assertTrue(listing.ok, "other products keep listing on the metadata session");
+            assertEquals(List.of(), resultMap(listing).get("indexes"));
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void tableScopedIndexLookupStaysOnMetadataLane() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.bulkEligible = true;
+        connMgr.bulkConnection = null;
+        connMgr.metadataConnection = connectionWithEmptyIndexInfo();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response lookup = dispatcher.dispatch(
+                request(884, "get-indexes", "conn-id", 7, "table", "ORDERS"));
+
+            assertTrue(lookup.ok, "a lookup naming a table is not a listing and keeps the metadata session");
+            assertEquals(List.of(), resultMap(lookup).get("indexes"));
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    /** A metadata connection whose getIndexInfo answers with no rows. */
+    private static Connection connectionWithEmptyIndexInfo() {
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getIndexInfo" -> resultSet(
+                    List.of("TYPE", "INDEX_NAME", "TABLE_NAME", "NON_UNIQUE"), List.of());
+                case "getDatabaseProductName" -> "Test";
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        return (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
+    @Test
+    void bulkListingRetriesOnFreshBulkSessionAfterConnectionFailure() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.bulkEligible = true;
+        connMgr.bulkConnection = metadataConnection(new AtomicInteger(),
+            new SQLException("ORA-12592: TNS:bad packet", "66000", 12592), null);
+        connMgr.bulkReplacement = connectionBlockingOnGetTables(
+            new CountDownLatch(1), new CountDownLatch(0));
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response listing = dispatcher.dispatch(request(883, "get-indexes", "conn-id", 7));
+
+            assertTrue(listing.ok, "a dead bulk session is dropped and the listing retried");
+            assertEquals(List.of(), resultMap(listing).get("indexes"));
+            assertEquals(1, connMgr.bulkInvalidations);
+            assertNull(connMgr.bulkReplacement, "the retry opened the fresh bulk session");
+            assertEquals(0, connMgr.metadataReconnects, "the metadata session is left alone");
+            assertEquals(0, connMgr.metadataInvalidations);
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    /** A connection whose metadata getTables blocks until released, then returns no rows. */
+    private static Connection connectionBlockingOnGetTables(
+            CountDownLatch started, CountDownLatch release) {
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getTables" -> {
+                    started.countDown();
+                    assertTrue(release.await(2, TimeUnit.SECONDS));
+                    yield resultSet(
+                        List.of("TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME", "TABLE_TYPE", "REMARKS"),
+                        List.of());
+                }
+                case "getDatabaseProductName" -> "Test";
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        return (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
+    @Test
     void metadataRequestsSerializePerLogicalConnection() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         CountDownLatch firstStarted = new CountDownLatch(1);
@@ -1012,6 +1154,23 @@ class DispatcherTest {
         assertEquals(List.of("ALTER SESSION SET CURRENT_SCHEMA = \"CJH_TEST\""), metadataSql);
         assertEquals("CJH_TEST", resultMap(response).get("schema"));
         assertEquals("CJH_TEST", connMgr.currentSchema);
+    }
+
+    @Test
+    void setCurrentSchemaDropsTheBulkSession() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = oracleSchemaConnection(new ArrayList<>());
+        connMgr.metadataConnection = oracleSchemaConnection(new ArrayList<>());
+        connMgr.bulkEligible = true;
+        connMgr.bulkConnection = failingOracleSchemaConnection("BULK_NOT_SWITCHED");
+        Response response = dispatch(connMgr, 14, "set-current-schema",
+            "conn-id", 7,
+            "schema", "CJH_TEST");
+
+        assertTrue(response.ok, "the bulk session is dropped, not switched");
+        assertEquals("CJH_TEST", connMgr.currentSchema);
+        assertEquals(1, connMgr.bulkInvalidations);
+        assertNull(connMgr.bulkConnection, "the next listing reopens it with the remembered schema");
     }
 
     @Test
@@ -3591,6 +3750,54 @@ class DispatcherTest {
                 throw new SQLException("Metadata connection is invalid");
             }
             return metadataConnection != null ? metadataConnection : connection;
+        }
+
+        private boolean bulkEligible;
+        private Connection bulkConnection;
+        private Connection bulkReplacement;
+        private int bulkInvalidations;
+
+        @Override
+        public boolean usesBulkSession(int connId) {
+            assertEquals(7, connId);
+            return bulkEligible;
+        }
+
+        @Override
+        public boolean openBulkIfAbsent(int connId) {
+            assertEquals(7, connId);
+            if (bulkConnection != null || bulkReplacement == null) {
+                return false;
+            }
+            bulkConnection = bulkReplacement;
+            bulkReplacement = null;
+            return true;
+        }
+
+        @Override
+        public boolean invalidateBulkIfInvalid(int connId, SQLException failure) {
+            assertEquals(7, connId);
+            if (bulkConnection == null || !ConnectionManager.isConnectionFailure(failure)) {
+                return false;
+            }
+            invalidateBulk(connId);
+            return true;
+        }
+
+        @Override
+        public Connection getBulk(int connId) throws SQLException {
+            assertEquals(7, connId);
+            if (bulkConnection == null) {
+                throw new SQLException("Bulk connection is not open for connection id: " + connId);
+            }
+            return bulkConnection;
+        }
+
+        @Override
+        public void invalidateBulk(int connId) {
+            assertEquals(7, connId);
+            bulkInvalidations++;
+            bulkConnection = null;
         }
 
         @Override
