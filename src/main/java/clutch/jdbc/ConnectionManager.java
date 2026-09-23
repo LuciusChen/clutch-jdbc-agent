@@ -377,6 +377,42 @@ public class ConnectionManager {
         }
     }
 
+    /** Mark use of the metadata or bulk session of {@code connId}, for idle validation. */
+    public void markSessionUsed(int connId, CursorManager.Lane lane) {
+        Session session = connections.get(connId);
+        if (session != null) {
+            session.markUsed(lane, clock.millis());
+        }
+    }
+
+    /**
+     * Return whether the metadata or bulk session of {@code connId} sat idle
+     * past the validation interval and then failed {@code isValid}.  A NAT or
+     * firewall that drops an idle connection leaves its socket silent, so a
+     * request on it waits out the network timeout, and Clutch, whose request
+     * timeout is no longer, retires the whole logical connection first.
+     */
+    public boolean idleSessionDead(int connId, CursorManager.Lane lane, int timeoutSeconds) {
+        Session session = connections.get(connId);
+        if (session == null || session.validateAfterIdleMillis == 0L) {
+            return false;
+        }
+        Connection connection = lane == CursorManager.Lane.BULK
+            ? session.bulk() : session.metadata();
+        if (connection == null
+            || clock.millis() - session.lastUseMillis(lane) < session.validateAfterIdleMillis) {
+            return false;
+        }
+        try {
+            return !connection.isValid(timeoutSeconds);
+        } catch (SQLFeatureNotSupportedException | AbstractMethodError unsupported) {
+            logUnsupportedCapability("isValid(" + timeoutSeconds + "s)", unsupported);
+            return false;
+        } catch (SQLException e) {
+            return true;
+        }
+    }
+
     /** Return whether {@code connId} still names a live logical session. */
     public boolean hasConnection(int connId) {
         return connections.containsKey(connId);
@@ -682,6 +718,8 @@ public class ConnectionManager {
         private final String driverClass;
         private final long validateAfterIdleMillis;
         private volatile long lastPrimaryUseMillis;
+        private volatile long lastMetadataUseMillis;
+        private volatile long lastBulkUseMillis;
         private volatile String currentSchema;
         private final Map<Integer, Savepoint> savepoints = new HashMap<>();
 
@@ -700,6 +738,7 @@ public class ConnectionManager {
             this.driverClass = driverClass;
             this.validateAfterIdleMillis = validateAfterIdleMillis;
             this.lastPrimaryUseMillis = connectedAtMillis;
+            this.lastMetadataUseMillis = connectedAtMillis;
             this.bulkEligible = bulkEligible;
         }
 
@@ -733,6 +772,18 @@ public class ConnectionManager {
 
         private void markPrimaryUsed(long nowMillis) {
             this.lastPrimaryUseMillis = nowMillis;
+        }
+
+        private long lastUseMillis(CursorManager.Lane lane) {
+            return lane == CursorManager.Lane.BULK ? lastBulkUseMillis : lastMetadataUseMillis;
+        }
+
+        private void markUsed(CursorManager.Lane lane, long nowMillis) {
+            if (lane == CursorManager.Lane.BULK) {
+                lastBulkUseMillis = nowMillis;
+            } else {
+                lastMetadataUseMillis = nowMillis;
+            }
         }
 
         private Savepoint savepoint(int savepointId) throws SQLException {

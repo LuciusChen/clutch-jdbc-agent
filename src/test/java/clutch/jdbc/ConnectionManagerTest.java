@@ -712,6 +712,36 @@ class ConnectionManagerTest {
     }
 
     @Test
+    void idleMetadataAndBulkSessionsAreValidatedAfterTheIdleInterval() throws Exception {
+        MutableClock clock = new MutableClock();
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(clock, _product -> true);
+            int connId = mgr.connect("jdbc:test:idle-sessions", "scott", "tiger",
+                Map.of(), null, null, 300, true, RecordingDriver.class.getName());
+            mgr.openBulkIfAbsent(connId);
+            mgr.markSessionUsed(connId, CursorManager.Lane.BULK);
+            // Connection 1 is the metadata session, 2 the bulk session.
+            for (int dead : List.of(1, 2)) {
+                CursorManager.Lane lane = dead == 1
+                    ? CursorManager.Lane.METADATA : CursorManager.Lane.BULK;
+                driver.invalidMetadataConnectionNumber = dead;
+                mgr.markSessionUsed(connId, lane);
+                clock.advanceSeconds(299);
+                assertFalse(mgr.idleSessionDead(connId, lane, 3),
+                    lane + ": a recently used session is trusted without a round trip");
+                clock.advanceSeconds(1);
+                assertTrue(mgr.idleSessionDead(connId, lane, 3),
+                    lane + ": an idle session that fails validation is dead");
+            }
+            mgr.disconnectAll();
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
     void refusedBulkLogonKeepsListingsOnTheMetadataSession() throws Exception {
         RecordingDriver driver = new RecordingDriver();
         driver.refusedConnectionNumber = 2;
