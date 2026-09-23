@@ -710,6 +710,30 @@ class ConnectionManagerTest {
         }
     }
 
+    @Test
+    void refusedBulkLogonKeepsListingsOnTheMetadataSession() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        driver.refusedConnectionNumber = 2;
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(Clock.systemUTC(), _product -> true);
+            int connId = mgr.connect("jdbc:test:inventory", "scott", "tiger",
+                Map.of(), 7, 11, null, true, RecordingDriver.class.getName());
+            Connection metadata = mgr.getMetadata(connId);
+
+            assertThrows(SQLException.class, () -> mgr.openBulkIfAbsent(connId));
+            assertFalse(mgr.usesBulkSession(connId),
+                "a refused bulk logon moves schema-wide listings back to the metadata session");
+            assertThrows(SQLException.class, () -> mgr.openBulkIfAbsent(connId));
+            assertEquals(3, driver.connectCount, "a refused bulk logon is not attempted again");
+            assertSame(metadata, mgr.getMetadata(connId));
+
+            mgr.disconnect(connId);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
     private static final class RecordingDriver implements Driver {
         private String seenUrl;
         private int seenLoginTimeout = -1;
@@ -742,13 +766,18 @@ class ConnectionManagerTest {
         private final CountDownLatch metadataCloseStarted = new CountDownLatch(1);
         private final CountDownLatch releaseMetadataClose = new CountDownLatch(1);
         private int invalidMetadataConnectionNumber = -1;
+        private int refusedConnectionNumber = -1;
 
         @Override
-        public Connection connect(String url, Properties info) {
+        public Connection connect(String url, Properties info) throws SQLException {
             if (!acceptsURL(url)) {
                 return null;
             }
             int connectionNumber = connectCount++;
+            if (connectionNumber == refusedConnectionNumber) {
+                throw new SQLException(
+                    "ORA-02391: exceeded simultaneous SESSIONS_PER_USER limit", "72000", 2391);
+            }
             boolean metadata = connectionNumber > 0;
             seenUrl = url;
             seenLoginTimeout = DriverManager.getLoginTimeout();

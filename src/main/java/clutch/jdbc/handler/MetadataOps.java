@@ -65,7 +65,7 @@ final class MetadataOps {
      * the whole schema rather than one named object, on a product that keeps
      * such a session so the listing cannot hold the metadata session for
      * seconds while an interactive lookup waits.  The dispatcher locks the
-     * lane named here, so nothing else may decide it.
+     * lane named here and passes it on, so nothing else may decide it.
      */
     boolean runsOnBulkSession(Request req) throws SQLException {
         boolean listing = switch (req.op) {
@@ -77,12 +77,12 @@ final class MetadataOps {
     }
 
     /**
-     * Return the session {@code req} runs on: the bulk session for a
-     * schema-wide listing where the product uses one, opened on first use with
-     * the current schema restored, otherwise the metadata session.
+     * Return the session for {@code lane}, the lane the dispatcher locked: the
+     * bulk session opened on first use with the current schema restored, or
+     * the metadata session.
      */
-    private Connection sessionFor(Request req, int connId) throws SQLException {
-        if (!runsOnBulkSession(req)) {
+    private Connection sessionFor(CursorManager.Lane lane, int connId) throws SQLException {
+        if (lane != CursorManager.Lane.BULK) {
             return connMgr.getMetadata(connId);
         }
         if (connMgr.openBulkIfAbsent(connId)) {
@@ -94,27 +94,28 @@ final class MetadataOps {
         return connMgr.getBulk(connId);
     }
 
-    Response dispatch(Request req) throws SQLException {
+    /** Run {@code req} on the session of {@code lane}, which the dispatcher has locked. */
+    Response dispatch(Request req, CursorManager.Lane lane) throws SQLException {
         return switch (req.op) {
             case "get-schemas" -> getSchemas(req);
             case "set-current-schema" -> setCurrentSchema(req);
-            case "get-tables" -> getTables(req);
+            case "get-tables" -> getTables(req, lane);
             case "search-tables" -> searchTables(req);
             case "get-columns" -> getColumns(req);
             case "search-columns" -> searchColumns(req);
             case "get-primary-keys" -> getPrimaryKeys(req);
             case "get-foreign-keys" -> getForeignKeys(req);
             case "get-referencing-objects" -> getReferencingObjects(req);
-            case "get-indexes" -> getIndexes(req);
+            case "get-indexes" -> getIndexes(req, lane);
             case "get-index-columns" -> getIndexColumns(req);
-            case "get-sequences" -> getSequences(req);
-            case "get-procedures" -> getProcedures(req);
-            case "get-functions" -> getFunctions(req);
+            case "get-sequences" -> getSequences(req, lane);
+            case "get-procedures" -> getProcedures(req, lane);
+            case "get-functions" -> getFunctions(req, lane);
             case "get-procedure-params" -> getProcedureParams(req);
             case "get-function-params" -> getFunctionParams(req);
             case "get-object-source" -> getObjectSource(req);
             case "get-object-ddl" -> getObjectDdl(req);
-            case "get-triggers" -> getTriggers(req);
+            case "get-triggers" -> getTriggers(req, lane);
             default -> throw new IllegalArgumentException("Unknown metadata op: " + req.op);
         };
     }
@@ -153,17 +154,18 @@ final class MetadataOps {
         return Response.ok(req.id, Map.of("conn-id", connId, "schema", schema));
     }
 
-    private Response getTables(Request req) throws SQLException {
+    private Response getTables(Request req, CursorManager.Lane lane) throws SQLException {
         int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        Connection conn = sessionFor(req, connId);
+        Connection conn = sessionFor(lane, connId);
         return isOracle(conn)
-            ? oracleTablesCursor(req.id, connId, conn, schema)
+            ? oracleTablesCursor(req.id, connId, conn, schema, lane)
             : jdbcTablesOneBatch(req.id, conn, catalog, schema);
     }
 
-    private Response oracleTablesCursor(int reqId, int connId, Connection conn, String schema)
+    private Response oracleTablesCursor(int reqId, int connId, Connection conn, String schema,
+                                        CursorManager.Lane lane)
             throws SQLException {
         OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
         String sql = os.useUserTables() ? """
@@ -222,7 +224,7 @@ final class MetadataOps {
             }
             ResultSet rs = ps.executeQuery();
             rs.setFetchSize(1000);
-            cursorId = connMgr.usesBulkSession(connId)
+            cursorId = lane == CursorManager.Lane.BULK
                 ? cursorMgr.registerBulk(connId, ps, rs)
                 : cursorMgr.registerMetadata(connId, ps, rs);
             CursorManager.FetchResult first = cursorMgr.fetch(cursorId, 1000);
@@ -872,12 +874,12 @@ final class MetadataOps {
         return objects;
     }
 
-    private Response getIndexes(Request req) throws SQLException {
+    private Response getIndexes(Request req, CursorManager.Lane lane) throws SQLException {
         int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         String table = getOptionalString(req, "table");
-        Connection conn = sessionFor(req, connId);
+        Connection conn = sessionFor(lane, connId);
         List<Map<String, Object>> indexes = isOracle(conn)
             ? getOracleIndexes(conn, schema, table)
             : getJdbcIndexes(conn, catalog, schema, table);
@@ -1101,10 +1103,10 @@ final class MetadataOps {
         return columns;
     }
 
-    private Response getSequences(Request req) throws SQLException {
+    private Response getSequences(Request req, CursorManager.Lane lane) throws SQLException {
         int connId = req.getInt("conn-id");
         String schema = (String) req.params.get("schema");
-        Connection conn = sessionFor(req, connId);
+        Connection conn = sessionFor(lane, connId);
         List<Map<String, Object>> sequences = isOracle(conn)
             ? getOracleSequences(conn, schema)
             : getDialectSequences(conn, schema);
@@ -1190,22 +1192,22 @@ final class MetadataOps {
         return List.of();
     }
 
-    private Response getProcedures(Request req) throws SQLException {
+    private Response getProcedures(Request req, CursorManager.Lane lane) throws SQLException {
         int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        Connection conn = sessionFor(req, connId);
+        Connection conn = sessionFor(lane, connId);
         List<Map<String, Object>> procedures = isOracle(conn)
             ? getOracleRoutines(conn, schema, "PROCEDURE")
             : getJdbcRoutines(conn, catalog, schema, true);
         return Response.ok(req.id, Map.of("procedures", procedures));
     }
 
-    private Response getFunctions(Request req) throws SQLException {
+    private Response getFunctions(Request req, CursorManager.Lane lane) throws SQLException {
         int connId = req.getInt("conn-id");
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
-        Connection conn = sessionFor(req, connId);
+        Connection conn = sessionFor(lane, connId);
         List<Map<String, Object>> functions = isOracle(conn)
             ? getOracleRoutines(conn, schema, "FUNCTION")
             : getJdbcRoutines(conn, catalog, schema, false);
@@ -1544,11 +1546,11 @@ final class MetadataOps {
         return rs.getString(column);
     }
 
-    private Response getTriggers(Request req) throws SQLException {
+    private Response getTriggers(Request req, CursorManager.Lane lane) throws SQLException {
         int connId = req.getInt("conn-id");
         String schema = (String) req.params.get("schema");
         String table = getOptionalString(req, "table");
-        Connection conn = sessionFor(req, connId);
+        Connection conn = sessionFor(lane, connId);
         List<Map<String, Object>> triggers = isOracle(conn)
             ? getOracleTriggers(conn, schema, table)
             : getDialectTriggers(conn, schema, table);

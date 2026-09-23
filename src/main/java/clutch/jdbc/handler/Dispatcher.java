@@ -106,24 +106,25 @@ public class Dispatcher {
         executionNotStartedContext.remove();
         try {
             if (requestBypassesConnectionLock(req)) {
-                return dispatchUnlocked(req);
+                return dispatchUnlocked(req, CursorManager.Lane.PRIMARY);
             }
             Integer connId = lockConnectionId(req);
             if (connId == null) {
-                return dispatchUnlocked(req);
+                return dispatchUnlocked(req, CursorManager.Lane.METADATA);
             }
-            Callable<Response> lockedAction = () -> {
-                try {
-                    return dispatchUnlocked(req);
-                } catch (Exception error) {
-                    poisonOnPrimaryConnectionFailure(req, error);
-                    throw error;
-                }
-            };
             if (requestUsesAllConnectionLocks(req)) {
-                return withAllConnectionLocks(connId, lockedAction);
+                return withAllConnectionLocks(
+                    connId, lockedAction(req, CursorManager.Lane.METADATA));
             }
-            return withConnectionLock(connId, requestLane(req), lockedAction);
+            CursorManager.Lane lane = requestLane(req);
+            try {
+                return withConnectionLock(connId, lane, lockedAction(req, lane));
+            } catch (ConnectionManager.BulkSessionUnavailable unavailable) {
+                // The bulk logon was refused, by this request or while it waited
+                // for the lock; the connection now lists on its metadata session.
+                return withConnectionLock(connId, CursorManager.Lane.METADATA,
+                    lockedAction(req, CursorManager.Lane.METADATA));
+            }
         } catch (Exception e) {
             return errorResponse(req, e);
         } finally {
@@ -191,9 +192,21 @@ public class Dispatcher {
         return null;
     }
 
-    private Response dispatchUnlocked(Request req) throws Exception {
+    private Callable<Response> lockedAction(Request req, CursorManager.Lane lane) {
+        return () -> {
+            try {
+                return dispatchUnlocked(req, lane);
+            } catch (Exception error) {
+                poisonOnPrimaryConnectionFailure(req, error);
+                throw error;
+            }
+        };
+    }
+
+    /** Run {@code req}; a metadata request runs on the session of {@code lane}. */
+    private Response dispatchUnlocked(Request req, CursorManager.Lane lane) throws Exception {
         if (MetadataOps.supports(req.op)) {
-            return dispatchMetadata(req);
+            return dispatchMetadata(req, lane);
         }
         return switch (req.op) {
             case "ping" -> ping(req);
@@ -215,17 +228,17 @@ public class Dispatcher {
         };
     }
 
-    private Response dispatchMetadata(Request req) throws Exception {
+    private Response dispatchMetadata(Request req, CursorManager.Lane lane) throws Exception {
         try {
-            return metadataOps.dispatch(req);
+            return metadataOps.dispatch(req, lane);
         } catch (SQLException error) {
             Integer connId = requestConnectionId(req);
-            if (connId != null && recoverSession(req, connId, error)) {
+            if (connId != null && recoverSession(lane, connId, error)) {
                 try {
-                    return metadataOps.dispatch(req);
+                    return metadataOps.dispatch(req, lane);
                 } catch (SQLException retryError) {
                     try {
-                        recoverSession(req, connId, retryError);
+                        recoverSession(lane, connId, retryError);
                     } catch (SQLException recoveryError) {
                         retryError.addSuppressed(recoveryError);
                     }
@@ -236,10 +249,10 @@ public class Dispatcher {
         }
     }
 
-    /** Replace the session {@code req} ran on when {@code failure} shows it is dead. */
-    private boolean recoverSession(Request req, int connId, SQLException failure)
+    /** Replace the session of {@code lane} when {@code failure} shows it is dead. */
+    private boolean recoverSession(CursorManager.Lane lane, int connId, SQLException failure)
             throws SQLException {
-        if (metadataOps.runsOnBulkSession(req)) {
+        if (lane == CursorManager.Lane.BULK) {
             return connMgr.invalidateBulkIfInvalid(connId, failure);
         }
         return recoverMetadata(connId, failure);
