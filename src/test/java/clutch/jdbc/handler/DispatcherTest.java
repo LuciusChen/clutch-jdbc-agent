@@ -26,10 +26,12 @@ import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -747,6 +749,45 @@ class DispatcherTest {
             assertNull(connMgr.bulkReplacement, "the retry opened the fresh bulk session");
             assertEquals(0, connMgr.metadataReconnects, "the metadata session is left alone");
             assertEquals(0, connMgr.metadataInvalidations);
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void idleDeadSessionIsReplacedBeforeTheRequestUsesIt() throws Exception {
+        // A NAT that drops an idle connection leaves the socket silent: a
+        // request on it waits out the network timeout, and Clutch retires the
+        // whole logical connection first.  Replace the session up front.
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        AtomicInteger staleCalls = new AtomicInteger();
+        connMgr.metadataConnection = metadataConnection(staleCalls, null, "STALE");
+        connMgr.metadataReplacements = List.of(
+            metadataConnection(new AtomicInteger(), null, "FRESH"));
+        connMgr.idleDeadLanes.add(CursorManager.Lane.METADATA);
+
+        Response schemas = dispatch(connMgr, 91, "get-schemas", "conn-id", 7);
+
+        assertTrue(schemas.ok);
+        assertEquals(List.of("FRESH"), resultMap(schemas).get("schemas"));
+        assertEquals(0, staleCalls.get(), "the silent metadata session is not used");
+        assertEquals(List.of(CursorManager.Lane.METADATA), connMgr.usedLanes);
+
+        connMgr.bulkEligible = true;
+        AtomicInteger staleBulkCalls = new AtomicInteger();
+        connMgr.bulkConnection = metadataConnection(staleBulkCalls, null, "STALE");
+        connMgr.bulkReplacement = connectionBlockingOnGetTables(
+            new CountDownLatch(1), new CountDownLatch(0));
+        connMgr.idleDeadLanes.add(CursorManager.Lane.BULK);
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response listing = dispatcher.dispatch(request(92, "get-indexes", "conn-id", 7));
+
+            assertTrue(listing.ok, listing.error);
+            assertEquals(0, staleBulkCalls.get(), "the silent bulk session is not used");
+            assertEquals(1, connMgr.bulkInvalidations);
+            assertNull(connMgr.bulkReplacement, "the listing ran on a fresh bulk session");
+            assertEquals(CursorManager.Lane.BULK, connMgr.usedLanes.get(1));
         } finally {
             dispatcher.shutdown();
         }
@@ -3824,6 +3865,20 @@ class DispatcherTest {
         private boolean bulkRefused;
         private int bulkRefusals;
         private boolean removed;
+        private final Set<CursorManager.Lane> idleDeadLanes = EnumSet.noneOf(CursorManager.Lane.class);
+        private final List<CursorManager.Lane> usedLanes = new ArrayList<>();
+
+        @Override
+        public boolean idleSessionDead(int connId, CursorManager.Lane lane, int timeoutSeconds) {
+            assertEquals(7, connId);
+            return idleDeadLanes.remove(lane);
+        }
+
+        @Override
+        public void markSessionUsed(int connId, CursorManager.Lane lane) {
+            assertEquals(7, connId);
+            usedLanes.add(lane);
+        }
 
         @Override
         public boolean usesBulkSession(int connId) throws SQLException {

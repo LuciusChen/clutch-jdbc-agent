@@ -13,6 +13,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLRecoverableException;
 import java.sql.SQLTimeoutException;
 import java.sql.Statement;
 import java.sql.Types;
@@ -48,7 +49,7 @@ public class Dispatcher {
     static final int DEFAULT_EXECUTE_TIMEOUT = 29; // s; safety net when no client timeout given
     static final int MAX_CONCURRENT_JDBC_TASKS = 16;
     static final long WORKER_CANCEL_GRACE_MILLIS = 250L;
-    static final int PRIMARY_VALIDATION_TIMEOUT_SECONDS = 3;
+    static final int IDLE_VALIDATION_TIMEOUT_SECONDS = 3;
     private static final String EXECUTOR_OVERLOADED_ERROR =
         "Agent overloaded: too many concurrent JDBC operations";
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -229,10 +230,26 @@ public class Dispatcher {
     }
 
     private Response dispatchMetadata(Request req, CursorManager.Lane lane) throws Exception {
+        Integer connId = requestConnectionId(req);
+        try {
+            if (connId != null
+                && connMgr.idleSessionDead(connId, lane, IDLE_VALIDATION_TIMEOUT_SECONDS)) {
+                recoverSession(lane, connId,
+                    new SQLRecoverableException("Session failed validation after idling"));
+            }
+            return dispatchMetadataWithRetry(req, lane, connId);
+        } finally {
+            if (connId != null) {
+                connMgr.markSessionUsed(connId, lane);
+            }
+        }
+    }
+
+    private Response dispatchMetadataWithRetry(Request req, CursorManager.Lane lane,
+                                               Integer connId) throws Exception {
         try {
             return metadataOps.dispatch(req, lane);
         } catch (SQLException error) {
-            Integer connId = requestConnectionId(req);
             if (connId != null && recoverSession(lane, connId, error)) {
                 try {
                     return metadataOps.dispatch(req, lane);
@@ -553,7 +570,7 @@ public class Dispatcher {
         executionNotStartedContext.set(Boolean.TRUE);
         try {
             if (connMgr.validatePrimaryIfIdle(
-                    connId, PRIMARY_VALIDATION_TIMEOUT_SECONDS)) {
+                    connId, IDLE_VALIDATION_TIMEOUT_SECONDS)) {
                 return null;
             }
             SQLException invalid = new SQLException(
