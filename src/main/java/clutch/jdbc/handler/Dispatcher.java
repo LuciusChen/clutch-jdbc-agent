@@ -13,6 +13,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLRecoverableException;
 import java.sql.SQLTimeoutException;
 import java.sql.Statement;
 import java.sql.Types;
@@ -48,7 +49,7 @@ public class Dispatcher {
     static final int DEFAULT_EXECUTE_TIMEOUT = 29; // s; safety net when no client timeout given
     static final int MAX_CONCURRENT_JDBC_TASKS = 16;
     static final long WORKER_CANCEL_GRACE_MILLIS = 250L;
-    static final int PRIMARY_VALIDATION_TIMEOUT_SECONDS = 3;
+    static final int IDLE_VALIDATION_TIMEOUT_SECONDS = 3;
     private static final String EXECUTOR_OVERLOADED_ERROR =
         "Agent overloaded: too many concurrent JDBC operations";
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -81,6 +82,7 @@ public class Dispatcher {
     private static final class ConnectionLocks {
         private final ReentrantLock foreground = new ReentrantLock();
         private final ReentrantLock metadata = new ReentrantLock();
+        private final ReentrantLock bulk = new ReentrantLock();
         // Updated only by atomic map computations for this connection id.
         private int users;
     }
@@ -105,24 +107,25 @@ public class Dispatcher {
         executionNotStartedContext.remove();
         try {
             if (requestBypassesConnectionLock(req)) {
-                return dispatchUnlocked(req);
+                return dispatchUnlocked(req, CursorManager.Lane.PRIMARY);
             }
             Integer connId = lockConnectionId(req);
             if (connId == null) {
-                return dispatchUnlocked(req);
+                return dispatchUnlocked(req, CursorManager.Lane.METADATA);
             }
-            Callable<Response> lockedAction = () -> {
-                try {
-                    return dispatchUnlocked(req);
-                } catch (Exception error) {
-                    poisonOnPrimaryConnectionFailure(req, error);
-                    throw error;
-                }
-            };
-            if (requestUsesBothConnectionLocks(req)) {
-                return withBothConnectionLocks(connId, lockedAction);
+            if (requestUsesAllConnectionLocks(req)) {
+                return withAllConnectionLocks(
+                    connId, lockedAction(req, CursorManager.Lane.METADATA));
             }
-            return withConnectionLock(connId, requestUsesMetadataLock(req), lockedAction);
+            CursorManager.Lane lane = requestLane(req);
+            try {
+                return withConnectionLock(connId, lane, lockedAction(req, lane));
+            } catch (ConnectionManager.BulkSessionUnavailable unavailable) {
+                // The bulk logon was refused, by this request or while it waited
+                // for the lock; the connection now lists on its metadata session.
+                return withConnectionLock(connId, CursorManager.Lane.METADATA,
+                    lockedAction(req, CursorManager.Lane.METADATA));
+            }
         } catch (Exception e) {
             return errorResponse(req, e);
         } finally {
@@ -190,9 +193,21 @@ public class Dispatcher {
         return null;
     }
 
-    private Response dispatchUnlocked(Request req) throws Exception {
+    private Callable<Response> lockedAction(Request req, CursorManager.Lane lane) {
+        return () -> {
+            try {
+                return dispatchUnlocked(req, lane);
+            } catch (Exception error) {
+                poisonOnPrimaryConnectionFailure(req, error);
+                throw error;
+            }
+        };
+    }
+
+    /** Run {@code req}; a metadata request runs on the session of {@code lane}. */
+    private Response dispatchUnlocked(Request req, CursorManager.Lane lane) throws Exception {
         if (MetadataOps.supports(req.op)) {
-            return dispatchMetadata(req);
+            return dispatchMetadata(req, lane);
         }
         return switch (req.op) {
             case "ping" -> ping(req);
@@ -214,17 +229,33 @@ public class Dispatcher {
         };
     }
 
-    private Response dispatchMetadata(Request req) throws Exception {
+    private Response dispatchMetadata(Request req, CursorManager.Lane lane) throws Exception {
+        Integer connId = requestConnectionId(req);
         try {
-            return metadataOps.dispatch(req);
+            if (connId != null
+                && connMgr.idleSessionDead(connId, lane, IDLE_VALIDATION_TIMEOUT_SECONDS)) {
+                recoverSession(lane, connId,
+                    new SQLRecoverableException("Session failed validation after idling"));
+            }
+            return dispatchMetadataWithRetry(req, lane, connId);
+        } finally {
+            if (connId != null) {
+                connMgr.markSessionUsed(connId, lane);
+            }
+        }
+    }
+
+    private Response dispatchMetadataWithRetry(Request req, CursorManager.Lane lane,
+                                               Integer connId) throws Exception {
+        try {
+            return metadataOps.dispatch(req, lane);
         } catch (SQLException error) {
-            Integer connId = requestConnectionId(req);
-            if (connId != null && recoverMetadata(connId, error)) {
+            if (connId != null && recoverSession(lane, connId, error)) {
                 try {
-                    return metadataOps.dispatch(req);
+                    return metadataOps.dispatch(req, lane);
                 } catch (SQLException retryError) {
                     try {
-                        recoverMetadata(connId, retryError);
+                        recoverSession(lane, connId, retryError);
                     } catch (SQLException recoveryError) {
                         retryError.addSuppressed(recoveryError);
                     }
@@ -233,6 +264,15 @@ public class Dispatcher {
             }
             throw error;
         }
+    }
+
+    /** Replace the session of {@code lane} when {@code failure} shows it is dead. */
+    private boolean recoverSession(CursorManager.Lane lane, int connId, SQLException failure)
+            throws SQLException {
+        if (lane == CursorManager.Lane.BULK) {
+            return connMgr.invalidateBulkIfInvalid(connId, failure);
+        }
+        return recoverMetadata(connId, failure);
     }
 
     private boolean recoverMetadata(int connId, SQLException failure) throws SQLException {
@@ -492,7 +532,8 @@ public class Dispatcher {
             CursorManager.FetchResult first;
             try {
                 first = fetchCursorBatch(
-                    connId, cursorId, fetchSize, stmt, executeTimeout, false);
+                    connId, cursorId, fetchSize, stmt, executeTimeout,
+                    CursorManager.Lane.PRIMARY);
             } catch (SQLException e) {
                 poisonOnConnectionFailure(connId, e);
                 return errorResponse(req, e.getMessage(),
@@ -529,7 +570,7 @@ public class Dispatcher {
         executionNotStartedContext.set(Boolean.TRUE);
         try {
             if (connMgr.validatePrimaryIfIdle(
-                    connId, PRIMARY_VALIDATION_TIMEOUT_SECONDS)) {
+                    connId, IDLE_VALIDATION_TIMEOUT_SECONDS)) {
                 return null;
             }
             SQLException invalid = new SQLException(
@@ -685,22 +726,22 @@ public class Dispatcher {
         int fetchTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
             ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
         int connId = cursorMgr.connectionId(cursorId);
-        boolean metadata = cursorMgr.usesMetadataConnection(cursorId);
+        CursorManager.Lane lane = cursorMgr.lane(cursorId);
         Statement stmt = cursorMgr.statement(cursorId);
-        RunningStatement running = metadata
-            ? null
-            : beginRunningStatement(connId, req.id, stmt);
+        RunningStatement running = lane == CursorManager.Lane.PRIMARY
+            ? beginRunningStatement(connId, req.id, stmt)
+            : null;
         try {
             try {
                 CursorManager.FetchResult fr = fetchCursorBatch(
-                    connId, cursorId, fetchSize, stmt, fetchTimeout, metadata);
+                    connId, cursorId, fetchSize, stmt, fetchTimeout, lane);
                 Map<String, Object> result = new java.util.LinkedHashMap<>();
                 result.put("cursor-id", fr.done() ? null : cursorId);
                 result.put("rows", fr.rows());
                 result.put("done", fr.done());
                 return Response.ok(req.id, result);
             } catch (SQLException e) {
-                handleFetchConnectionFailure(connId, metadata, e);
+                handleFetchConnectionFailure(connId, lane, e);
                 return errorResponse(req, e.getMessage(),
                     fetchFailureCategory(running, e), e, connId);
             }
@@ -708,7 +749,7 @@ public class Dispatcher {
             if (running != null) {
                 finishRunningStatement(connId, running);
             }
-            if (!metadata) {
+            if (lane == CursorManager.Lane.PRIMARY) {
                 connMgr.markPrimaryUsed(connId);
             }
         }
@@ -748,18 +789,20 @@ public class Dispatcher {
         };
     }
 
-    private boolean requestUsesBothConnectionLocks(Request req) {
+    private boolean requestUsesAllConnectionLocks(Request req) {
         return "disconnect".equals(req.op) || "set-current-schema".equals(req.op);
     }
 
-    private boolean requestUsesMetadataLock(Request req) throws SQLException {
+    /** Which of the connection's sessions, and so which lock, {@code req} needs. */
+    private CursorManager.Lane requestLane(Request req) throws SQLException {
         if (MetadataOps.supports(req.op)) {
-            return true;
+            return metadataOps.runsOnBulkSession(req)
+                ? CursorManager.Lane.BULK : CursorManager.Lane.METADATA;
         }
         if ("fetch".equals(req.op) || "close-cursor".equals(req.op)) {
-            return cursorMgr.usesMetadataConnection(req.getInt("cursor-id"));
+            return cursorMgr.lane(req.getInt("cursor-id"));
         }
-        return false;
+        return CursorManager.Lane.PRIMARY;
     }
 
     private ConnectionLocks reserveConnectionLocks(int connId) {
@@ -777,11 +820,15 @@ public class Dispatcher {
             --locks.users == 0 ? null : locks);
     }
 
-    private Response withConnectionLock(int connId, boolean metadata,
+    private Response withConnectionLock(int connId, CursorManager.Lane lane,
                                         Callable<Response> action) throws Exception {
         ConnectionLocks locks = reserveConnectionLocks(connId);
         try {
-            ReentrantLock lock = metadata ? locks.metadata : locks.foreground;
+            ReentrantLock lock = switch (lane) {
+                case PRIMARY -> locks.foreground;
+                case METADATA -> locks.metadata;
+                case BULK -> locks.bulk;
+            };
             lock.lock();
             try {
                 return action.call();
@@ -793,7 +840,7 @@ public class Dispatcher {
         }
     }
 
-    private Response withBothConnectionLocks(int connId, Callable<Response> action)
+    private Response withAllConnectionLocks(int connId, Callable<Response> action)
             throws Exception {
         ConnectionLocks locks = reserveConnectionLocks(connId);
         try {
@@ -801,7 +848,12 @@ public class Dispatcher {
             try {
                 locks.metadata.lock();
                 try {
-                    return action.call();
+                    locks.bulk.lock();
+                    try {
+                        return action.call();
+                    } finally {
+                        locks.bulk.unlock();
+                    }
                 } finally {
                     locks.metadata.unlock();
                 }
@@ -828,7 +880,7 @@ public class Dispatcher {
 
     private CursorManager.FetchResult fetchCursorBatch(int connId, int cursorId, int fetchSize,
                                                        Statement stmt, int timeoutSeconds,
-                                                       boolean metadata)
+                                                       CursorManager.Lane lane)
             throws Exception {
         CountDownLatch workerFinished = new CountDownLatch(1);
         Future<CursorManager.FetchResult> future;
@@ -851,11 +903,18 @@ public class Dispatcher {
             cancelStatementQuietly(stmt);
             if (awaitWorkerTermination(workerFinished)) {
                 cursorMgr.close(cursorId);
-            } else if (metadata) {
-                cursorMgr.abandon(cursorId);
-                connMgr.invalidateMetadata(connId);
             } else {
-                poisonConnection(connId);
+                switch (lane) {
+                    case METADATA -> {
+                        cursorMgr.abandon(cursorId);
+                        connMgr.invalidateMetadata(connId);
+                    }
+                    case BULK -> {
+                        cursorMgr.abandon(cursorId);
+                        connMgr.invalidateBulk(connId);
+                    }
+                    case PRIMARY -> poisonConnection(connId);
+                }
             }
             throw new SQLTimeoutException("Query timed out after " + timeoutSeconds + "s");
         } catch (ExecutionException e) {
@@ -925,14 +984,15 @@ public class Dispatcher {
         }
     }
 
-    private void handleFetchConnectionFailure(int connId, boolean metadata, SQLException error) {
+    private void handleFetchConnectionFailure(int connId, CursorManager.Lane lane,
+                                              SQLException error) {
         if (!ConnectionManager.isConnectionFailure(error)) {
             return;
         }
-        if (metadata) {
-            connMgr.invalidateMetadata(connId);
-        } else {
-            poisonConnection(connId);
+        switch (lane) {
+            case METADATA -> connMgr.invalidateMetadata(connId);
+            case BULK -> connMgr.invalidateBulk(connId);
+            case PRIMARY -> poisonConnection(connId);
         }
     }
 

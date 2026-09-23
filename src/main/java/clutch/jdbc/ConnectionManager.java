@@ -12,8 +12,10 @@ import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Predicate;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -41,13 +43,39 @@ public class ConnectionManager {
         return t;
     });
 
+    /**
+     * Products whose schema-wide listings run on a third, lazily opened session
+     * so they cannot hold the metadata session for seconds while an interactive
+     * lookup waits.  Only Oracle has shown that cost; other products keep two
+     * sessions and never pay a third logon.
+     */
+    private final Predicate<String> bulkProducts;
+
     /** Create a connection manager using the system wall clock. */
     public ConnectionManager() {
         this(Clock.systemUTC());
     }
 
     ConnectionManager(Clock clock) {
+        this(clock, ConnectionManager::isOracleProduct);
+    }
+
+    ConnectionManager(Clock clock, Predicate<String> bulkProducts) {
         this.clock = Objects.requireNonNull(clock);
+        this.bulkProducts = Objects.requireNonNull(bulkProducts);
+    }
+
+    private static boolean isOracleProduct(String productName) {
+        return productName != null
+            && productName.toLowerCase(Locale.ROOT).contains("oracle");
+    }
+
+    private String productName(Connection connection) {
+        try {
+            return connection.getMetaData().getDatabaseProductName();
+        } catch (SQLException | RuntimeException e) {
+            return null;
+        }
     }
 
     /**
@@ -81,7 +109,8 @@ public class ConnectionManager {
                 connections.put(id, new Session(
                     primary, metadata, url, p, connectTimeoutSeconds,
                     networkTimeoutSeconds, driverClass,
-                    validateAfterIdleMillis, clock.millis()));
+                    validateAfterIdleMillis, clock.millis(),
+                    bulkProducts.test(productName(primary))));
                 return id;
             } catch (SQLException | RuntimeException e) {
                 closeQuietly(metadata);
@@ -348,6 +377,42 @@ public class ConnectionManager {
         }
     }
 
+    /** Mark use of the metadata or bulk session of {@code connId}, for idle validation. */
+    public void markSessionUsed(int connId, CursorManager.Lane lane) {
+        Session session = connections.get(connId);
+        if (session != null) {
+            session.markUsed(lane, clock.millis());
+        }
+    }
+
+    /**
+     * Return whether the metadata or bulk session of {@code connId} sat idle
+     * past the validation interval and then failed {@code isValid}.  A NAT or
+     * firewall that drops an idle connection leaves its socket silent, so a
+     * request on it waits out the network timeout, and Clutch, whose request
+     * timeout is no longer, retires the whole logical connection first.
+     */
+    public boolean idleSessionDead(int connId, CursorManager.Lane lane, int timeoutSeconds) {
+        Session session = connections.get(connId);
+        if (session == null || session.validateAfterIdleMillis == 0L) {
+            return false;
+        }
+        Connection connection = lane == CursorManager.Lane.BULK
+            ? session.bulk() : session.metadata();
+        if (connection == null
+            || clock.millis() - session.lastUseMillis(lane) < session.validateAfterIdleMillis) {
+            return false;
+        }
+        try {
+            return !connection.isValid(timeoutSeconds);
+        } catch (SQLFeatureNotSupportedException | AbstractMethodError unsupported) {
+            logUnsupportedCapability("isValid(" + timeoutSeconds + "s)", unsupported);
+            return false;
+        } catch (SQLException e) {
+            return true;
+        }
+    }
+
     /** Return whether {@code connId} still names a live logical session. */
     public boolean hasConnection(int connId) {
         return connections.containsKey(connId);
@@ -371,7 +436,7 @@ public class ConnectionManager {
         Connection metadata;
         synchronized (session) {
             metadata = session.metadata();
-            if (metadataUsable(metadata, failure)) {
+            if (sessionUsable(metadata, failure)) {
                 return false;
             }
             Connection replacement = openConnection(
@@ -403,6 +468,119 @@ public class ConnectionManager {
         closeAsync(metadata);
     }
 
+    /** Return whether {@code connId} runs schema-wide listings on a bulk session. */
+    public boolean usesBulkSession(int connId) throws SQLException {
+        return requireSession(connId).bulkEligible();
+    }
+
+    /**
+     * Thrown for a request on the bulk lane of a connection that has no bulk
+     * session: its logon was refused, so the request belongs on the metadata
+     * session instead.
+     */
+    public static final class BulkSessionUnavailable extends SQLException {
+        public BulkSessionUnavailable(int connId, Throwable cause) {
+            super("Bulk session is unavailable for connection id: " + connId, cause);
+        }
+    }
+
+    /**
+     * Open {@code connId}'s bulk session unless it already has one.  Return
+     * whether this call opened it, so the caller can restore the current
+     * schema on a fresh session.  Callers are serialized by the connection's
+     * bulk lock, so the logon runs outside the session monitor and cannot
+     * stall a concurrent commit or rollback.
+     *
+     * <p>A refused logon, for example when the account has no session left,
+     * ends bulk sessions for this connection: its listings return to the
+     * metadata session, as on products that never use one, and the logon is
+     * not attempted again.
+     */
+    public boolean openBulkIfAbsent(int connId) throws SQLException {
+        Session session = requireSession(connId);
+        if (!session.bulkEligible()) {
+            throw new BulkSessionUnavailable(connId, null);
+        }
+        if (session.bulk() != null) {
+            return false;
+        }
+        Connection bulk;
+        try {
+            bulk = openConnection(
+                session.url, session.props, session.connectTimeoutSeconds,
+                session.driverClass);
+            try {
+                configureMetadataConnection(bulk, session.networkTimeoutSeconds);
+            } catch (SQLException | RuntimeException e) {
+                closeQuietly(bulk);
+                throw e;
+            }
+        } catch (SQLException | RuntimeException e) {
+            session.refuseBulk();
+            LOG.log(System.Logger.Level.WARNING,
+                "Bulk session refused for connection {0}; schema-wide listings "
+                    + "use the metadata session: {1}", connId, e.getMessage());
+            throw new BulkSessionUnavailable(connId, e);
+        }
+        synchronized (session) {
+            session.setBulk(bulk);
+        }
+        // A poison or force-disconnect during the logon has already closed
+        // this session's connections; do not leave the new one behind.
+        if (connections.get(connId) != session) {
+            closeQuietly(bulk);
+            throw new SQLException("Unknown connection id: " + connId);
+        }
+        return true;
+    }
+
+    /** Return the open bulk session for {@code connId}, or throw if it has none. */
+    public Connection getBulk(int connId) throws SQLException {
+        Connection bulk = requireSession(connId).bulk();
+        if (bulk == null)
+            throw new SQLException("Bulk connection is not open for connection id: " + connId);
+        return bulk;
+    }
+
+    /** Detach the bulk session for {@code connId}, then close it off-thread. */
+    public void invalidateBulk(int connId) {
+        Session session = connections.get(connId);
+        if (session == null) {
+            return;
+        }
+        Connection bulk;
+        synchronized (session) {
+            bulk = session.bulk();
+            session.setBulk(null);
+        }
+        closeAsync(bulk);
+    }
+
+    /**
+     * Drop {@code connId}'s bulk session when {@code failure} shows it is dead,
+     * so the next listing opens a fresh one; return whether it was dropped.
+     */
+    public boolean invalidateBulkIfInvalid(int connId, SQLException failure) {
+        Session session = connections.get(connId);
+        if (session == null) {
+            return false;
+        }
+        // Validate outside the monitor: isValid is a round trip, and a
+        // concurrent commit or rollback must not wait for it.
+        Connection bulk = session.bulk();
+        if (bulk == null || sessionUsable(bulk, failure)) {
+            return false;
+        }
+        synchronized (session) {
+            if (session.bulk() != bulk) {
+                return false;
+            }
+            session.setBulk(null);
+        }
+        closeAsync(bulk);
+        return true;
+    }
+
     private void closeAsync(Connection connection) {
         if (connection == null) {
             return;
@@ -424,7 +602,7 @@ public class ConnectionManager {
         return requireSession(connId).currentSchema;
     }
 
-    private boolean metadataUsable(Connection connection, SQLException failure) {
+    private boolean sessionUsable(Connection connection, SQLException failure) {
         if (isConnectionFailure(failure)) {
             return false;
         }
@@ -508,6 +686,7 @@ public class ConnectionManager {
     }
 
     private void closeSession(Session session) {
+        closeQuietly(session.bulk());
         closeQuietly(session.metadata());
         closeQuietly(session.primary());
     }
@@ -529,6 +708,9 @@ public class ConnectionManager {
     private static final class Session {
         private final Connection primary;
         private volatile Connection metadata;
+        /** Third session for schema-wide listings; opened on first use, Oracle only. */
+        private volatile Connection bulk;
+        private volatile boolean bulkEligible;
         private final String url;
         private final Properties props;
         private final Integer connectTimeoutSeconds;
@@ -536,13 +718,16 @@ public class ConnectionManager {
         private final String driverClass;
         private final long validateAfterIdleMillis;
         private volatile long lastPrimaryUseMillis;
+        private volatile long lastMetadataUseMillis;
+        private volatile long lastBulkUseMillis;
         private volatile String currentSchema;
         private final Map<Integer, Savepoint> savepoints = new HashMap<>();
 
         private Session(Connection primary, Connection metadata, String url,
                         Properties props, Integer connectTimeoutSeconds,
                         Integer networkTimeoutSeconds, String driverClass,
-                        long validateAfterIdleMillis, long connectedAtMillis) {
+                        long validateAfterIdleMillis, long connectedAtMillis,
+                        boolean bulkEligible) {
             this.primary = primary;
             this.metadata = metadata;
             this.url = url;
@@ -553,6 +738,8 @@ public class ConnectionManager {
             this.driverClass = driverClass;
             this.validateAfterIdleMillis = validateAfterIdleMillis;
             this.lastPrimaryUseMillis = connectedAtMillis;
+            this.lastMetadataUseMillis = connectedAtMillis;
+            this.bulkEligible = bulkEligible;
         }
 
         private Connection primary() {
@@ -567,8 +754,36 @@ public class ConnectionManager {
             this.metadata = metadata;
         }
 
+        private Connection bulk() {
+            return bulk;
+        }
+
+        private void setBulk(Connection bulk) {
+            this.bulk = bulk;
+        }
+
+        private boolean bulkEligible() {
+            return bulkEligible;
+        }
+
+        private void refuseBulk() {
+            this.bulkEligible = false;
+        }
+
         private void markPrimaryUsed(long nowMillis) {
             this.lastPrimaryUseMillis = nowMillis;
+        }
+
+        private long lastUseMillis(CursorManager.Lane lane) {
+            return lane == CursorManager.Lane.BULK ? lastBulkUseMillis : lastMetadataUseMillis;
+        }
+
+        private void markUsed(CursorManager.Lane lane, long nowMillis) {
+            if (lane == CursorManager.Lane.BULK) {
+                lastBulkUseMillis = nowMillis;
+            } else {
+                lastMetadataUseMillis = nowMillis;
+            }
         }
 
         private Savepoint savepoint(int savepointId) throws SQLException {

@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.function.IntConsumer;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -636,6 +637,163 @@ class ConnectionManagerTest {
         }
     }
 
+    @Test
+    void bulkSessionOpensLazilyOnceAndClosesWithTheConnection() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(Clock.systemUTC(), _product -> true);
+            int connId = mgr.connect("jdbc:test:inventory", "scott", "tiger",
+                Map.of(), 7, 11, null, true, RecordingDriver.class.getName());
+            assertEquals(2, driver.connectCount, "connect opens primary and metadata only");
+            assertTrue(mgr.usesBulkSession(connId));
+            assertThrows(SQLException.class, () -> mgr.getBulk(connId));
+
+            assertTrue(mgr.openBulkIfAbsent(connId));
+            assertEquals(3, driver.connectCount);
+            assertFalse(mgr.openBulkIfAbsent(connId), "second call reuses the open session");
+            assertEquals(3, driver.connectCount);
+
+            mgr.disconnect(connId);
+            assertEquals(3, driver.closedCount, "disconnect closes the bulk session too");
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void bulkSessionStaysClosedForOtherProducts() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager();
+            int connId = mgr.connect("jdbc:test:inventory", "scott", "tiger",
+                Map.of(), 7, 11, null, true, RecordingDriver.class.getName());
+            assertFalse(mgr.usesBulkSession(connId), "only Oracle lists on a bulk session");
+            assertThrows(SQLException.class, () -> mgr.getBulk(connId));
+            mgr.disconnect(connId);
+            assertEquals(2, driver.closedCount);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void invalidateBulkIfInvalidDropsOnlyADeadBulkSession() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(Clock.systemUTC(), _product -> true);
+            int connId = mgr.connect("jdbc:test:inventory", "scott", "tiger",
+                Map.of(), 7, 11, null, true, RecordingDriver.class.getName());
+            SQLException dead = new SQLException("ORA-12592: TNS:bad packet", "66000", 12592);
+            assertFalse(mgr.invalidateBulkIfInvalid(connId, dead), "nothing open to drop");
+
+            assertTrue(mgr.openBulkIfAbsent(connId));
+            Connection bulk = mgr.getBulk(connId);
+            Connection metadata = mgr.getMetadata(connId);
+            assertFalse(mgr.invalidateBulkIfInvalid(connId,
+                new SQLException("ORA-00942: table or view does not exist", "42000", 942)));
+            assertSame(bulk, mgr.getBulk(connId), "an ordinary SQL error keeps the session");
+
+            assertTrue(mgr.invalidateBulkIfInvalid(connId, dead));
+            assertThrows(SQLException.class, () -> mgr.getBulk(connId));
+            assertSame(metadata, mgr.getMetadata(connId));
+            awaitClosedCount(driver, 1);
+            assertEquals(1, driver.closedCount);
+            assertTrue(mgr.openBulkIfAbsent(connId), "the next listing opens a fresh session");
+            assertEquals(4, driver.connectCount);
+
+            mgr.disconnect(connId);
+            assertEquals(4, driver.closedCount);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void idleMetadataAndBulkSessionsAreValidatedAfterTheIdleInterval() throws Exception {
+        MutableClock clock = new MutableClock();
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(clock, _product -> true);
+            int connId = mgr.connect("jdbc:test:idle-sessions", "scott", "tiger",
+                Map.of(), null, null, 300, true, RecordingDriver.class.getName());
+            mgr.openBulkIfAbsent(connId);
+            mgr.markSessionUsed(connId, CursorManager.Lane.BULK);
+            // Connection 1 is the metadata session, 2 the bulk session.
+            for (int dead : List.of(1, 2)) {
+                CursorManager.Lane lane = dead == 1
+                    ? CursorManager.Lane.METADATA : CursorManager.Lane.BULK;
+                driver.invalidMetadataConnectionNumber = dead;
+                mgr.markSessionUsed(connId, lane);
+                clock.advanceSeconds(299);
+                assertFalse(mgr.idleSessionDead(connId, lane, 3),
+                    lane + ": a recently used session is trusted without a round trip");
+                clock.advanceSeconds(1);
+                assertTrue(mgr.idleSessionDead(connId, lane, 3),
+                    lane + ": an idle session that fails validation is dead");
+            }
+            mgr.disconnectAll();
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void refusedBulkLogonKeepsListingsOnTheMetadataSession() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        driver.refusedConnectionNumber = 2;
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(Clock.systemUTC(), _product -> true);
+            int connId = mgr.connect("jdbc:test:inventory", "scott", "tiger",
+                Map.of(), 7, 11, null, true, RecordingDriver.class.getName());
+            Connection metadata = mgr.getMetadata(connId);
+
+            assertThrows(SQLException.class, () -> mgr.openBulkIfAbsent(connId));
+            assertFalse(mgr.usesBulkSession(connId),
+                "a refused bulk logon moves schema-wide listings back to the metadata session");
+            assertThrows(SQLException.class, () -> mgr.openBulkIfAbsent(connId));
+            assertEquals(3, driver.connectCount, "a refused bulk logon is not attempted again");
+            assertSame(metadata, mgr.getMetadata(connId));
+
+            mgr.disconnect(connId);
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void bulkLogonFinishingAfterPoisonDoesNotOutliveTheConnection() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(Clock.systemUTC(), _product -> true);
+            int connId = mgr.connect("jdbc:test:inventory", "scott", "tiger",
+                Map.of(), 7, 11, null, true, RecordingDriver.class.getName());
+            driver.onConnect = connectionNumber -> {
+                if (connectionNumber == 2) {
+                    // Let poison close primary and metadata before the logon
+                    // returns, so only the new bulk session is left to close.
+                    mgr.poison(connId);
+                    long deadline = System.nanoTime() + 1_000_000_000L;
+                    while (driver.closedCount < 2 && System.nanoTime() < deadline) {
+                        Thread.onSpinWait();
+                    }
+                }
+            };
+
+            assertThrows(SQLException.class, () -> mgr.openBulkIfAbsent(connId));
+            awaitClosedCount(driver, 3);
+            assertEquals(3, driver.closedCount,
+                "the bulk session opened for a poisoned connection must be closed");
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
     private static final class RecordingDriver implements Driver {
         private String seenUrl;
         private int seenLoginTimeout = -1;
@@ -668,13 +826,22 @@ class ConnectionManagerTest {
         private final CountDownLatch metadataCloseStarted = new CountDownLatch(1);
         private final CountDownLatch releaseMetadataClose = new CountDownLatch(1);
         private int invalidMetadataConnectionNumber = -1;
+        private int refusedConnectionNumber = -1;
+        private IntConsumer onConnect;
 
         @Override
-        public Connection connect(String url, Properties info) {
+        public Connection connect(String url, Properties info) throws SQLException {
             if (!acceptsURL(url)) {
                 return null;
             }
             int connectionNumber = connectCount++;
+            if (onConnect != null) {
+                onConnect.accept(connectionNumber);
+            }
+            if (connectionNumber == refusedConnectionNumber) {
+                throw new SQLException(
+                    "ORA-02391: exceeded simultaneous SESSIONS_PER_USER limit", "72000", 2391);
+            }
             boolean metadata = connectionNumber > 0;
             seenUrl = url;
             seenLoginTimeout = DriverManager.getLoginTimeout();

@@ -25,7 +25,10 @@ public class CursorManager {
 
     private static final System.Logger LOG = System.getLogger(CursorManager.class.getName());
 
-    private record Cursor(int connId, Statement stmt, ResultSet rs, boolean metadata,
+    /** One of a logical connection's JDBC sessions, each serialized by its own lock. */
+    public enum Lane { PRIMARY, METADATA, BULK }
+
+    private record Cursor(int connId, Statement stmt, ResultSet rs, Lane lane,
                           List<String> columnNames, List<String> columnTypes) {}
 
     private final AtomicInteger nextId = new AtomicInteger(1);
@@ -35,15 +38,20 @@ public class CursorManager {
      * Register a newly-opened Statement + ResultSet and return a cursorId.
      */
     public int register(int connId, Statement stmt, ResultSet rs) throws SQLException {
-        return register(connId, stmt, rs, false);
+        return register(connId, stmt, rs, Lane.PRIMARY);
     }
 
     /** Register a cursor backed by the connection's isolated metadata session. */
     public int registerMetadata(int connId, Statement stmt, ResultSet rs) throws SQLException {
-        return register(connId, stmt, rs, true);
+        return register(connId, stmt, rs, Lane.METADATA);
     }
 
-    private int register(int connId, Statement stmt, ResultSet rs, boolean metadata)
+    /** Register a cursor backed by the connection's bulk listing session. */
+    public int registerBulk(int connId, Statement stmt, ResultSet rs) throws SQLException {
+        return register(connId, stmt, rs, Lane.BULK);
+    }
+
+    private int register(int connId, Statement stmt, ResultSet rs, Lane lane)
             throws SQLException {
         ResultSetMetaData meta = rs.getMetaData();
         int colCount = meta.getColumnCount();
@@ -54,7 +62,7 @@ public class CursorManager {
             types.add(meta.getColumnTypeName(i));
         }
         int id = nextId.getAndIncrement();
-        cursors.put(id, new Cursor(connId, stmt, rs, metadata, names, types));
+        cursors.put(id, new Cursor(connId, stmt, rs, lane, names, types));
         return id;
     }
 
@@ -97,11 +105,11 @@ public class CursorManager {
         return c.stmt();
     }
 
-    /** Return whether {@code cursorId} reads from the isolated metadata session. */
-    public boolean usesMetadataConnection(int cursorId) throws SQLException {
+    /** Return which of the connection's sessions {@code cursorId} reads from. */
+    public Lane lane(int cursorId) throws SQLException {
         Cursor c = cursors.get(cursorId);
         if (c == null) throw new SQLException("Unknown cursor id: " + cursorId);
-        return c.metadata();
+        return c.lane();
     }
 
     /** Close and remove the cursor for {@code cursorId}. No-op if already closed. */

@@ -213,6 +213,26 @@ class AgentProtocolIntegrationTest {
     }
 
     @Test
+    void shutdownAnswersRequestsAcceptedBeforeStdinClosed() throws Exception {
+        ExecutorService pool = Agent.newRequestPool();
+        CountDownLatch answered = new CountDownLatch(1);
+        pool.submit(() -> {
+            try {
+                Thread.sleep(300);
+            } catch (InterruptedException e) {
+                return;
+            }
+            answered.countDown();
+        });
+
+        Agent.awaitInFlightRequests(pool);
+
+        assertEquals(0, answered.getCount(),
+            "a request read before EOF must be answered before the agent exits");
+        assertTrue(pool.isTerminated());
+    }
+
+    @Test
     void serveRejectsRequestsBeyondPoolCapacityWithOverloadErrors() throws Exception {
         // Deterministic overload: block every worker on a latch, then submit
         // more requests than pool slots.  The surplus must each get an
