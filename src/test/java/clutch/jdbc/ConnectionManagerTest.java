@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.function.IntConsumer;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -734,6 +735,35 @@ class ConnectionManagerTest {
         }
     }
 
+    @Test
+    void bulkLogonFinishingAfterPoisonDoesNotOutliveTheConnection() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        DriverManager.registerDriver(driver);
+        try {
+            ConnectionManager mgr = new ConnectionManager(Clock.systemUTC(), _product -> true);
+            int connId = mgr.connect("jdbc:test:inventory", "scott", "tiger",
+                Map.of(), 7, 11, null, true, RecordingDriver.class.getName());
+            driver.onConnect = connectionNumber -> {
+                if (connectionNumber == 2) {
+                    // Let poison close primary and metadata before the logon
+                    // returns, so only the new bulk session is left to close.
+                    mgr.poison(connId);
+                    long deadline = System.nanoTime() + 1_000_000_000L;
+                    while (driver.closedCount < 2 && System.nanoTime() < deadline) {
+                        Thread.onSpinWait();
+                    }
+                }
+            };
+
+            assertThrows(SQLException.class, () -> mgr.openBulkIfAbsent(connId));
+            awaitClosedCount(driver, 3);
+            assertEquals(3, driver.closedCount,
+                "the bulk session opened for a poisoned connection must be closed");
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
     private static final class RecordingDriver implements Driver {
         private String seenUrl;
         private int seenLoginTimeout = -1;
@@ -767,6 +797,7 @@ class ConnectionManagerTest {
         private final CountDownLatch releaseMetadataClose = new CountDownLatch(1);
         private int invalidMetadataConnectionNumber = -1;
         private int refusedConnectionNumber = -1;
+        private IntConsumer onConnect;
 
         @Override
         public Connection connect(String url, Properties info) throws SQLException {
@@ -774,6 +805,9 @@ class ConnectionManagerTest {
                 return null;
             }
             int connectionNumber = connectCount++;
+            if (onConnect != null) {
+                onConnect.accept(connectionNumber);
+            }
             if (connectionNumber == refusedConnectionNumber) {
                 throw new SQLException(
                     "ORA-02391: exceeded simultaneous SESSIONS_PER_USER limit", "72000", 2391);
