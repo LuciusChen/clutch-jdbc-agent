@@ -489,6 +489,12 @@ public class ConnectionManager {
         synchronized (session) {
             session.setBulk(bulk);
         }
+        // A poison or force-disconnect during the logon has already closed
+        // this session's connections; do not leave the new one behind.
+        if (connections.get(connId) != session) {
+            closeQuietly(bulk);
+            throw new SQLException("Unknown connection id: " + connId);
+        }
         return true;
     }
 
@@ -523,10 +529,14 @@ public class ConnectionManager {
         if (session == null) {
             return false;
         }
-        Connection bulk;
+        // Validate outside the monitor: isValid is a round trip, and a
+        // concurrent commit or rollback must not wait for it.
+        Connection bulk = session.bulk();
+        if (bulk == null || sessionUsable(bulk, failure)) {
+            return false;
+        }
         synchronized (session) {
-            bulk = session.bulk();
-            if (bulk == null || sessionUsable(bulk, failure)) {
+            if (session.bulk() != bulk) {
                 return false;
             }
             session.setBulk(null);
