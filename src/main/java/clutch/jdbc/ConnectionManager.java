@@ -438,25 +438,53 @@ public class ConnectionManager {
     }
 
     /**
+     * Thrown for a request on the bulk lane of a connection that has no bulk
+     * session: its logon was refused, so the request belongs on the metadata
+     * session instead.
+     */
+    public static final class BulkSessionUnavailable extends SQLException {
+        public BulkSessionUnavailable(int connId, Throwable cause) {
+            super("Bulk session is unavailable for connection id: " + connId, cause);
+        }
+    }
+
+    /**
      * Open {@code connId}'s bulk session unless it already has one.  Return
      * whether this call opened it, so the caller can restore the current
      * schema on a fresh session.  Callers are serialized by the connection's
      * bulk lock, so the logon runs outside the session monitor and cannot
      * stall a concurrent commit or rollback.
+     *
+     * <p>A refused logon, for example when the account has no session left,
+     * ends bulk sessions for this connection: its listings return to the
+     * metadata session, as on products that never use one, and the logon is
+     * not attempted again.
      */
     public boolean openBulkIfAbsent(int connId) throws SQLException {
         Session session = requireSession(connId);
+        if (!session.bulkEligible()) {
+            throw new BulkSessionUnavailable(connId, null);
+        }
         if (session.bulk() != null) {
             return false;
         }
-        Connection bulk = openConnection(
-            session.url, session.props, session.connectTimeoutSeconds,
-            session.driverClass);
+        Connection bulk;
         try {
-            configureMetadataConnection(bulk, session.networkTimeoutSeconds);
+            bulk = openConnection(
+                session.url, session.props, session.connectTimeoutSeconds,
+                session.driverClass);
+            try {
+                configureMetadataConnection(bulk, session.networkTimeoutSeconds);
+            } catch (SQLException | RuntimeException e) {
+                closeQuietly(bulk);
+                throw e;
+            }
         } catch (SQLException | RuntimeException e) {
-            closeQuietly(bulk);
-            throw e;
+            session.refuseBulk();
+            LOG.log(System.Logger.Level.WARNING,
+                "Bulk session refused for connection {0}; schema-wide listings "
+                    + "use the metadata session: {1}", connId, e.getMessage());
+            throw new BulkSessionUnavailable(connId, e);
         }
         synchronized (session) {
             session.setBulk(bulk);
@@ -636,7 +664,7 @@ public class ConnectionManager {
         private volatile Connection metadata;
         /** Third session for schema-wide listings; opened on first use, Oracle only. */
         private volatile Connection bulk;
-        private final boolean bulkEligible;
+        private volatile boolean bulkEligible;
         private final String url;
         private final Properties props;
         private final Integer connectTimeoutSeconds;
@@ -687,6 +715,10 @@ public class ConnectionManager {
 
         private boolean bulkEligible() {
             return bulkEligible;
+        }
+
+        private void refuseBulk() {
+            this.bulkEligible = false;
         }
 
         private void markPrimaryUsed(long nowMillis) {

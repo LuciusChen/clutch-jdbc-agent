@@ -507,7 +507,8 @@ class DispatcherTest {
         Request request = request(822, "get-schemas", "conn-id", connId);
 
         IllegalArgumentException error = assertThrows(
-            IllegalArgumentException.class, () -> metadataOps.dispatch(request));
+            IllegalArgumentException.class,
+            () -> metadataOps.dispatch(request, CursorManager.Lane.METADATA));
 
         assertTrue(error.getMessage().contains("conn-id"), error.getMessage());
     }
@@ -749,6 +750,70 @@ class DispatcherTest {
         } finally {
             dispatcher.shutdown();
         }
+    }
+
+    @Test
+    void refusedBulkLogonListsOnTheMetadataSession() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.bulkEligible = true;
+        connMgr.bulkRefused = true;
+        connMgr.metadataConnection = connectionBlockingOnGetTables(
+            new CountDownLatch(1), new CountDownLatch(0));
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response listing = dispatcher.dispatch(request(886, "get-indexes", "conn-id", 7));
+
+            assertTrue(listing.ok, "a refused bulk logon must not fail the listing");
+            assertEquals(List.of(), resultMap(listing).get("indexes"));
+            assertEquals(1, connMgr.bulkRefusals);
+            assertFalse(connMgr.bulkEligible);
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void bulkListingKeepsItsOwnErrorWhenTheConnectionIsRemovedMeanwhile() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.bulkEligible = true;
+        connMgr.bulkConnection = connectionFailingOnGetTables(
+            () -> connMgr.removed = true,
+            new SQLException("ORA-00942: table or view does not exist", "42000", 942));
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        try {
+            Response listing = dispatcher.dispatch(request(885, "get-indexes", "conn-id", 7));
+
+            assertFalse(listing.ok);
+            assertTrue(listing.error.contains("ORA-00942"), listing.error);
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    /** A connection whose metadata getTables runs BEFORE and then throws FAILURE. */
+    private static Connection connectionFailingOnGetTables(Runnable before, SQLException failure) {
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getTables" -> {
+                    before.run();
+                    throw failure;
+                }
+                case "getDatabaseProductName" -> "Test";
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        return (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
     }
 
     /** A connection whose metadata getTables blocks until released, then returns no rows. */
@@ -3756,16 +3821,28 @@ class DispatcherTest {
         private Connection bulkConnection;
         private Connection bulkReplacement;
         private int bulkInvalidations;
+        private boolean bulkRefused;
+        private int bulkRefusals;
+        private boolean removed;
 
         @Override
-        public boolean usesBulkSession(int connId) {
+        public boolean usesBulkSession(int connId) throws SQLException {
             assertEquals(7, connId);
+            if (removed) {
+                throw new SQLException("Unknown connection id: " + connId);
+            }
             return bulkEligible;
         }
 
         @Override
-        public boolean openBulkIfAbsent(int connId) {
+        public boolean openBulkIfAbsent(int connId) throws SQLException {
             assertEquals(7, connId);
+            if (bulkRefused) {
+                bulkRefusals++;
+                bulkEligible = false;
+                throw new ConnectionManager.BulkSessionUnavailable(connId, new SQLException(
+                    "ORA-02391: exceeded simultaneous SESSIONS_PER_USER limit", "72000", 2391));
+            }
             if (bulkConnection != null || bulkReplacement == null) {
                 return false;
             }
