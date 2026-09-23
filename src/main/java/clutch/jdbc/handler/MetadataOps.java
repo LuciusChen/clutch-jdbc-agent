@@ -365,23 +365,23 @@ final class MetadataOps {
             sql = """
                 SELECT object_name, object_type, owner, owner AS source_owner
                 FROM (
-                  SELECT table_name AS object_name, 'TABLE' AS object_type, owner
+                  SELECT table_name AS object_name, 'TABLE' AS object_type, owner, 0 AS source_rank
                   FROM all_tables
                   WHERE owner = ? AND table_name LIKE ?
                   UNION ALL
-                  SELECT view_name AS object_name, 'VIEW' AS object_type, owner
+                  SELECT view_name AS object_name, 'VIEW' AS object_type, owner, 0 AS source_rank
                   FROM all_views
                   WHERE owner = ? AND view_name LIKE ?
                   UNION ALL
-                  SELECT synonym_name AS object_name, 'SYNONYM' AS object_type, owner
+                  SELECT synonym_name AS object_name, 'SYNONYM' AS object_type, owner, 1 AS source_rank
                   FROM all_synonyms
                   WHERE owner = ? AND synonym_name LIKE ?
                   UNION ALL
-                  SELECT synonym_name AS object_name, 'SYNONYM' AS object_type, owner
+                  SELECT synonym_name AS object_name, 'SYNONYM' AS object_type, owner, 2 AS source_rank
                   FROM all_synonyms
                   WHERE owner = 'PUBLIC' AND synonym_name LIKE ?
                 )
-                ORDER BY object_name
+                ORDER BY object_name, source_rank
                 """;
         }
         LinkedHashMap<String, Map<String, Object>> tablesByName = new LinkedHashMap<>();
