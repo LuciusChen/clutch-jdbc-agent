@@ -21,6 +21,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLRecoverableException;
 import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
@@ -1277,6 +1278,100 @@ class DispatcherTest {
         assertEquals("CJH_TEST", connMgr.currentSchema);
         assertEquals(1, connMgr.bulkInvalidations);
         assertNull(connMgr.bulkConnection, "the next listing reopens it with the remembered schema");
+    }
+
+    @Test
+    void setCurrentSchemaClosesCursorsOfTheDroppedBulkSession() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = oracleSchemaConnection(new ArrayList<>());
+        connMgr.metadataConnection = oracleSchemaConnection(new ArrayList<>());
+        connMgr.bulkEligible = true;
+        connMgr.bulkConnection = oracleSchemaConnection(new ArrayList<>());
+        CursorManager cursorMgr = new CursorManager();
+        AtomicInteger closes = new AtomicInteger();
+        int listing = cursorMgr.registerBulk(7, closeCountingStatement(closes), cursorResult(null));
+        Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
+        try {
+            Response response = dispatcher.dispatch(request(15, "set-current-schema",
+                "conn-id", 7,
+                "schema", "CJH_TEST"));
+
+            assertTrue(response.ok);
+            assertThrows(SQLException.class, () -> cursorMgr.lane(listing),
+                "a listing of the old schema ends with its session");
+            assertEquals(1, closes.get(), "a healthy session's cursors are closed");
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void failedBulkFetchForgetsTheOtherCursorsOfThatSession() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.bulkEligible = true;
+        connMgr.bulkConnection = oracleSchemaConnection(new ArrayList<>());
+        CursorManager cursorMgr = new CursorManager();
+        AtomicInteger closes = new AtomicInteger();
+        int failing = cursorMgr.registerBulk(7, closeCountingStatement(closes),
+            cursorResult(new SQLRecoverableException("socket closed")));
+        int sibling = cursorMgr.registerBulk(7, closeCountingStatement(closes), cursorResult(null));
+        Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
+        try {
+            Response fetch = dispatcher.dispatch(request(16, "fetch", "cursor-id", failing));
+
+            assertFalse(fetch.ok);
+            assertEquals(1, connMgr.bulkInvalidations);
+            assertThrows(SQLException.class, () -> cursorMgr.lane(sibling),
+                "cursors of the failed session go with it");
+            assertEquals(0, closes.get(), "cursors of a failed session are forgotten, not closed");
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    /** A one-column cursor whose next row fails with {@code failure}, or which is empty. */
+    private static ResultSet cursorResult(SQLException failure) {
+        ResultSetMetaData meta = (ResultSetMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{ResultSetMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getColumnCount" -> 1;
+                case "getColumnLabel", "getColumnName" -> "NAME";
+                case "getColumnTypeName" -> "VARCHAR";
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        return (ResultSet) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{ResultSet.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "next" -> {
+                    if (failure != null) {
+                        throw failure;
+                    }
+                    yield false;
+                }
+                case "close", "setFetchSize" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
+    private static Statement closeCountingStatement(AtomicInteger closes) {
+        return (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "close" -> {
+                    closes.incrementAndGet();
+                    yield null;
+                }
+                case "cancel", "setQueryTimeout" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
     }
 
     @Test

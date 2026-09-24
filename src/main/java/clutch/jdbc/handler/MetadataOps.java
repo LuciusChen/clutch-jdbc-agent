@@ -148,7 +148,9 @@ final class MetadataOps {
         if (metadata != primary) {
             applyCurrentSchema(metadata, schema);
         }
-        // The next listing reopens the bulk session with the remembered schema.
+        // The next listing reopens the bulk session with the remembered schema;
+        // cursors still paging a listing of the old schema go with it.
+        cursorMgr.closeForLane(connId, CursorManager.Lane.BULK);
         connMgr.invalidateBulk(connId);
         connMgr.rememberCurrentSchema(connId, schema);
         return Response.ok(req.id, Map.of("conn-id", connId, "schema", schema));

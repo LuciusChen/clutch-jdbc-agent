@@ -266,13 +266,19 @@ public class Dispatcher {
         }
     }
 
-    /** Replace the session of {@code lane} when {@code failure} shows it is dead. */
+    /**
+     * Replace the session of {@code lane} when {@code failure} shows it is
+     * dead, forgetting the cursors that read from the old one.
+     */
     private boolean recoverSession(CursorManager.Lane lane, int connId, SQLException failure)
             throws SQLException {
-        if (lane == CursorManager.Lane.BULK) {
-            return connMgr.invalidateBulkIfInvalid(connId, failure);
+        boolean replaced = lane == CursorManager.Lane.BULK
+            ? connMgr.invalidateBulkIfInvalid(connId, failure)
+            : recoverMetadata(connId, failure);
+        if (replaced) {
+            cursorMgr.abandonForLane(connId, lane);
         }
-        return recoverMetadata(connId, failure);
+        return replaced;
     }
 
     private boolean recoverMetadata(int connId, SQLException failure) throws SQLException {
@@ -283,7 +289,7 @@ public class Dispatcher {
             metadataOps.restoreCurrentSchema(connId);
             return true;
         } catch (SQLException recoveryError) {
-            connMgr.invalidateMetadata(connId);
+            retireSession(connId, CursorManager.Lane.METADATA);
             throw recoveryError;
         }
     }
@@ -905,14 +911,7 @@ public class Dispatcher {
                 cursorMgr.close(cursorId);
             } else {
                 switch (lane) {
-                    case METADATA -> {
-                        cursorMgr.abandon(cursorId);
-                        connMgr.invalidateMetadata(connId);
-                    }
-                    case BULK -> {
-                        cursorMgr.abandon(cursorId);
-                        connMgr.invalidateBulk(connId);
-                    }
+                    case METADATA, BULK -> retireSession(connId, lane);
                     case PRIMARY -> poisonConnection(connId);
                 }
             }
@@ -990,9 +989,22 @@ public class Dispatcher {
             return;
         }
         switch (lane) {
-            case METADATA -> connMgr.invalidateMetadata(connId);
-            case BULK -> connMgr.invalidateBulk(connId);
+            case METADATA, BULK -> retireSession(connId, lane);
             case PRIMARY -> poisonConnection(connId);
+        }
+    }
+
+    /**
+     * Retire {@code connId}'s failed metadata or bulk session.  Its cursors are
+     * forgotten rather than closed, since closing them would call into the
+     * failed driver; closing the session releases them.
+     */
+    private void retireSession(int connId, CursorManager.Lane lane) {
+        cursorMgr.abandonForLane(connId, lane);
+        if (lane == CursorManager.Lane.BULK) {
+            connMgr.invalidateBulk(connId);
+        } else {
+            connMgr.invalidateMetadata(connId);
         }
     }
 

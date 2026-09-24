@@ -138,6 +138,24 @@ public class CursorManager {
         cursors.entrySet().removeIf(e -> e.getValue().connId() == connId);
     }
 
+    /** Close the cursors {@code connId} holds on {@code lane}. */
+    public void closeForLane(int connId, Lane lane) {
+        cursors.forEach((cursorId, cursor) -> {
+            if (cursor.connId() == connId && cursor.lane() == lane) {
+                close(cursorId);
+            }
+        });
+    }
+
+    /**
+     * Forget the cursors {@code connId} holds on {@code lane} without calling
+     * into the failed session they read from; closing it releases them.
+     */
+    public void abandonForLane(int connId, Lane lane) {
+        cursors.entrySet().removeIf(e -> e.getValue().connId() == connId
+            && e.getValue().lane() == lane);
+    }
+
     /** Forget one cursor without calling into its possibly blocked JDBC resources. */
     public void abandon(int cursorId) {
         cursors.remove(cursorId);
