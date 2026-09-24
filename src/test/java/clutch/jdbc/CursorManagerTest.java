@@ -94,6 +94,36 @@ class CursorManagerTest {
     }
 
     @Test
+    void closeForLaneClosesOnlyThatLanesCursorsOfThatConnection() throws SQLException {
+        CursorManager mgr = new CursorManager();
+        int bulk = mgr.registerBulk(10, mockStatement(),
+            mockResultSet(List.of("a"), List.of("INT"), rows(new Object[]{1})));
+        int metadata = mgr.registerMetadata(10, mockStatement(),
+            mockResultSet(List.of("b"), List.of("INT"), rows(new Object[]{2})));
+        int otherConnection = mgr.registerBulk(20, mockStatement(),
+            mockResultSet(List.of("c"), List.of("INT"), rows(new Object[]{3})));
+
+        mgr.closeForLane(10, CursorManager.Lane.BULK);
+
+        assertThrows(SQLException.class, () -> mgr.fetch(bulk, 1));
+        assertEquals(2, mgr.fetch(metadata, 10).rows().get(0).get(0));
+        assertEquals(3, mgr.fetch(otherConnection, 10).rows().get(0).get(0));
+    }
+
+    @Test
+    void abandonForLaneForgetsCursorsWithoutClosingThem() throws SQLException {
+        CursorManager mgr = new CursorManager();
+        AtomicInteger closes = new AtomicInteger();
+        int bulk = mgr.registerBulk(10, closeCountingStatement(closes),
+            mockResultSet(List.of("a"), List.of("INT"), rows(new Object[]{1})));
+
+        mgr.abandonForLane(10, CursorManager.Lane.BULK);
+
+        assertThrows(SQLException.class, () -> mgr.fetch(bulk, 1));
+        assertEquals(0, closes.get(), "an abandoned cursor must not call into its driver");
+    }
+
+    @Test
     void fetchAutoClosesWhenDone() throws SQLException {
         CursorManager mgr = new CursorManager();
         int cursorId = mgr.register(1, mockStatement(),
@@ -128,6 +158,21 @@ class CursorManagerTest {
             new Class<?>[]{Statement.class},
             (_proxy, method, _args) -> switch (method.getName()) {
                 case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
+    private static Statement closeCountingStatement(AtomicInteger closes) {
+        return (Statement) Proxy.newProxyInstance(
+            CursorManagerTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "close" -> {
+                    closes.incrementAndGet();
+                    yield null;
+                }
                 case "unwrap" -> null;
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
