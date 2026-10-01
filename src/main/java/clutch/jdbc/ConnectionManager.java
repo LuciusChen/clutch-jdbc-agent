@@ -101,7 +101,7 @@ public class ConnectionManager {
 
         Connection primary = openConnection(url, p, connectTimeoutSeconds, driverClass);
         try {
-            configurePrimaryConnection(primary, autoCommit, networkTimeoutSeconds);
+            configurePrimaryConnection(primary, autoCommit);
             Connection metadata = openConnection(url, p, connectTimeoutSeconds, driverClass);
             try {
                 configureMetadataConnection(metadata, networkTimeoutSeconds);
@@ -133,8 +133,12 @@ public class ConnectionManager {
         return validateAfterIdleSeconds * 1_000L;
     }
 
-    private void configurePrimaryConnection(Connection conn, boolean autoCommit,
-                                            Integer networkTimeoutSeconds)
+    /**
+     * Configure the session that runs the user's statements.  It gets no
+     * network timeout: a statement may rightly keep the socket silent for
+     * longer, and its limit is the statement timeout its request asks for.
+     */
+    private void configurePrimaryConnection(Connection conn, boolean autoCommit)
             throws SQLException {
         if (!autoCommit) {
             try {
@@ -143,7 +147,6 @@ public class ConnectionManager {
                 throw new SQLException("JDBC driver does not support manual commit mode", e);
             }
         }
-        applyNetworkTimeout(conn, networkTimeoutSeconds);
     }
 
     private void configureMetadataConnection(Connection conn, Integer networkTimeoutSeconds)
