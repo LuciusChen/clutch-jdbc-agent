@@ -59,4 +59,10 @@ Maintain a thin, debuggable Java 17+ JDBC-to-JSON bridge. Prefer direct implemen
 - Keep README and the canonical protocol document consistent with changed behavior. Coordinate wire field/semantic changes with `clutch-db-jdbc.el`; distinguish compatible additions from actual contract breaks.
 - Java 17 is the published baseline. An intentional baseline change must update pom.xml, README, Clutch's requirements and release metadata, with a rationale.
 - Published jar bytes are what Clutch consumes. Prefer a version bump for a changed release artifact; update Clutch's version/checksum pair against the published bytes. Do not substitute the checksum of an arbitrary local build.
+- Cut a release in this order:
+  1. Bump `<version>` in `pom.xml`, the only place that holds it, as the last commit of the PR being released, so that PR's merge commit is the release target.
+  2. Build that commit with `mvn package` and keep the jar it produced; builds are not reproducible, so only those bytes may be published. The release asset is the shaded `target/clutch-jdbc-agent-X.Y.Z.jar`, not the unshaded `target/original-clutch-jdbc-agent-X.Y.Z.jar` beside it.
+  3. Smoke-test startup and ping against that jar (see Verification) and run the affected live workflow through Clutch's runner with `CLUTCH_TEST_JDBC_AGENT_JAR` pointing at it.
+  4. After the merge, check that the merge commit's tree matches the built commit's, tag `vX.Y.Z` at the merge commit, and publish a GitHub release with the jar attached. The notes end with the jar's SHA-256 and say which cases ran as unit, fault-injection or live tests.
+  5. Download the published asset and compare its SHA-256 before opening the Clutch PR that sets `clutch-jdbc-agent-version` and `clutch-jdbc-agent-sha256` in `clutch-db-jdbc.el`, together with Clutch's README pin line and CHANGELOG entry.
 - Keep a concise postmortem for non-obvious protocol, lifecycle, driver or compatibility decisions, abandoned designs and deliberately deferred limitations. Routine cleanup, wording or instruction maintenance does not require a new record; preserve historical records as history.
