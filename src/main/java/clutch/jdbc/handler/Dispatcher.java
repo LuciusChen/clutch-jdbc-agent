@@ -46,7 +46,7 @@ public class Dispatcher {
 
     private static final int DEFAULT_FETCH_SIZE = 500;
     private static final int MAX_FETCH_SIZE = 10_000;
-    static final int DEFAULT_EXECUTE_TIMEOUT = 29; // s; safety net when no client timeout given
+    static final int DEFAULT_EXECUTE_TIMEOUT = 29; // s; when a request omits its timeout
     static final int MAX_CONCURRENT_JDBC_TASKS = 16;
     static final long WORKER_CANCEL_GRACE_MILLIS = 250L;
     static final int IDLE_VALIDATION_TIMEOUT_SECONDS = 3;
@@ -435,9 +435,7 @@ public class Dispatcher {
         int connId = req.getInt("conn-id");
         String sql = normalizedSql(req);
         int fetchSize = getFetchSize(req);
-        Integer queryTimeoutSeconds = req.getOptionalInt("query-timeout-seconds");
-        int executeTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
-            ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
+        int executeTimeout = getQueryTimeout(req);
 
         Response preflightFailure = idlePrimaryPreflight(req, connId);
         if (preflightFailure != null) {
@@ -453,9 +451,7 @@ public class Dispatcher {
         int connId = req.getInt("conn-id");
         String sql = normalizedSql(req);
         int fetchSize = getFetchSize(req);
-        Integer queryTimeoutSeconds = req.getOptionalInt("query-timeout-seconds");
-        int executeTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
-            ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
+        int executeTimeout = getQueryTimeout(req);
         List<?> values = preparedValues(req);
         Response preflightFailure = idlePrimaryPreflight(req, connId);
         if (preflightFailure != null) {
@@ -507,7 +503,7 @@ public class Dispatcher {
             }
             boolean isQuery;
             try {
-                isQuery = future.get(executeTimeout + 1L, TimeUnit.SECONDS);
+                isQuery = awaitTask(future, executeTimeout);
             } catch (TimeoutException e) {
                 cleanupOnWorkerExit.set(true);
                 future.cancel(true);
@@ -728,9 +724,7 @@ public class Dispatcher {
     private Response fetch(Request req) throws Exception {
         int cursorId = req.getInt("cursor-id");
         int fetchSize = getFetchSize(req);
-        Integer queryTimeoutSeconds = req.getOptionalInt("query-timeout-seconds");
-        int fetchTimeout = (queryTimeoutSeconds != null && queryTimeoutSeconds > 0)
-            ? queryTimeoutSeconds : DEFAULT_EXECUTE_TIMEOUT;
+        int fetchTimeout = getQueryTimeout(req);
         int connId = cursorMgr.connectionId(cursorId);
         CursorManager.Lane lane = cursorMgr.lane(cursorId);
         Statement stmt = cursorMgr.statement(cursorId);
@@ -788,6 +782,7 @@ public class Dispatcher {
         return switch (req.op) {
             case "fetch" -> {
                 getFetchSize(req);
+                getQueryTimeout(req);
                 yield cursorMgr.connectionId(req.getInt("cursor-id"));
             }
             case "close-cursor" -> cursorMgr.connectionId(req.getInt("cursor-id"));
@@ -903,7 +898,7 @@ public class Dispatcher {
             throw new SQLException(EXECUTOR_OVERLOADED_ERROR);
         }
         try {
-            return future.get(timeoutSeconds + 1L, TimeUnit.SECONDS);
+            return awaitTask(future, timeoutSeconds);
         } catch (TimeoutException e) {
             future.cancel(true);
             cancelStatementQuietly(stmt);
@@ -936,6 +931,18 @@ public class Dispatcher {
             }
             throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
         }
+    }
+
+    /**
+     * Wait for {@code task} a second longer than {@code timeoutSeconds}, so the
+     * driver's own timeout fires first.  A timeout of 0 waits until the task
+     * ends; cancel and force-disconnect are what end it early.
+     */
+    private static <T> T awaitTask(Future<T> task, int timeoutSeconds)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        return timeoutSeconds == 0
+            ? task.get()
+            : task.get(timeoutSeconds + 1L, TimeUnit.SECONDS);
     }
 
     private boolean awaitWorkerTermination(CountDownLatch workerFinished) {
@@ -1049,6 +1056,22 @@ public class Dispatcher {
                 "fetch-size must be between 1 and " + MAX_FETCH_SIZE);
         }
         return (int) fetchSize;
+    }
+
+    /**
+     * Return the statement timeout {@code req} asks for in seconds, 0 meaning
+     * none.  Omitting it keeps {@link #DEFAULT_EXECUTE_TIMEOUT} for clients
+     * that predate the explicit 0.
+     */
+    private int getQueryTimeout(Request req) {
+        Integer seconds = req.getOptionalInt("query-timeout-seconds");
+        if (seconds == null) {
+            return DEFAULT_EXECUTE_TIMEOUT;
+        }
+        if (seconds < 0) {
+            throw new IllegalArgumentException("query-timeout-seconds must not be negative");
+        }
+        return seconds;
     }
 
     private boolean getBoolean(Request req, String key, boolean defaultValue) {
