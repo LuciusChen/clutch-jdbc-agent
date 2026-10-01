@@ -19,6 +19,7 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
@@ -55,7 +56,9 @@ class ConnectionManagerTest {
             assertEquals("scott", driver.seenProps.getProperty("user"));
             assertEquals("tiger", driver.seenProps.getProperty("password"));
             assertEquals("reporting", driver.seenProps.getProperty("role"));
-            assertEquals(11_000, driver.seenNetworkTimeoutMillis);
+            assertEquals(Map.of(1, 11_000), driver.networkTimeoutMillisByConnection,
+                "only the metadata session gets a network timeout; "
+                + "the primary session runs statements that may stay silent longer");
             assertEquals(3, DriverManager.getLoginTimeout());
             mgr.disconnect(connId);
             assertEquals(2, driver.closedCount);
@@ -798,7 +801,8 @@ class ConnectionManagerTest {
         private String seenUrl;
         private int seenLoginTimeout = -1;
         private Properties seenProps;
-        private int seenNetworkTimeoutMillis = -1;
+        private final Map<Integer, Integer> networkTimeoutMillisByConnection =
+            new ConcurrentHashMap<>();
         private boolean primaryAutoCommitDisabled;
         private int primarySetAutoCommitCalls;
         private int primaryCommitCalls;
@@ -855,7 +859,7 @@ class ConnectionManagerTest {
                         if (throwOnSetNetworkTimeout) {
                             throw new SQLFeatureNotSupportedException("setNetworkTimeout");
                         }
-                        seenNetworkTimeoutMillis = (Integer) args[1];
+                        networkTimeoutMillisByConnection.put(connectionNumber, (Integer) args[1]);
                         yield null;
                     }
                     case "setAutoCommit" -> {
