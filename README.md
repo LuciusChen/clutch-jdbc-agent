@@ -75,7 +75,7 @@ Timeout-related params are explicit:
 
 - `connect-timeout-seconds`: JDBC login/connect timeout for `connect`
 - `network-timeout-seconds`: socket/network timeout applied to the JDBC `Connection`
-- `query-timeout-seconds`: statement timeout applied before `execute`
+- `query-timeout-seconds`: statement timeout for `execute`, `execute-params` and `fetch`. A positive value limits the statement, and the agent waits one second longer before cancelling it itself. `0` sets no limit: the statement runs until it ends, is cancelled, or its connection is force-disconnected. Omitting it keeps a 29-second limit for older clients. Negative values are rejected before JDBC work or cursor advancement.
 - `validate-after-idle-seconds`: validate the primary connection before new SQL, and the metadata or bulk session before a metadata request, after this many idle seconds; omitted or zero disables the check
 
 `execute`, `execute-params`, and `fetch` accept an optional integer
