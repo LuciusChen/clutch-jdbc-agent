@@ -1456,6 +1456,59 @@ class DispatcherTest {
     }
 
     @ParameterizedTest
+    @MethodSource("foregroundExecuteOps")
+    void executeOperationsRejectNegativeQueryTimeoutBeforeJdbcAccess(String op)
+            throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
+        Request req = request(88, op,
+            "conn-id", 7,
+            "sql", "SELECT 1",
+            "query-timeout-seconds", -1);
+        if ("execute-params".equals(op)) {
+            req.params.put("values", List.of());
+        }
+
+        try {
+            Response response = dispatcher.dispatch(req);
+
+            assertFalse(response.ok);
+            assertTrue(response.error.contains("query-timeout-seconds"), response.error);
+            assertEquals(0, connMgr.primaryConnectionCalls,
+                "a negative query timeout must be rejected before JDBC access");
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    void fetchRejectsNegativeQueryTimeoutBeforeAdvancingCursor() throws Exception {
+        CursorManager cursorMgr = new CursorManager() {
+            @Override
+            public int connectionId(int cursorId) {
+                assertEquals(91, cursorId);
+                return 7;
+            }
+
+            @Override
+            public Statement statement(int cursorId) {
+                throw new AssertionError("a negative query timeout must not read the statement");
+            }
+        };
+        Dispatcher dispatcher = new Dispatcher(new RecordingConnectionManager(), cursorMgr);
+        try {
+            Response response = dispatcher.dispatch(request(89, "fetch",
+                "cursor-id", 91,
+                "query-timeout-seconds", -1));
+
+            assertFalse(response.ok);
+            assertTrue(response.error.contains("query-timeout-seconds"), response.error);
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @ParameterizedTest
     @MethodSource("executeDmlCases")
     void executeAppliesQueryTimeoutBeforeRunningStatement(String sql,
                                                           int queryTimeoutSeconds,
@@ -2210,8 +2263,10 @@ class DispatcherTest {
         assertEquals("dml", resultMap(response).get("type"));
     }
 
-    @Test
-    void cancelInterruptsRunningExecuteAndKeepsConnectionUsable() throws Exception {
+    @ParameterizedTest
+    @MethodSource("queryTimeoutsEndedByCancel")
+    void cancelInterruptsRunningExecuteAndKeepsConnectionUsable(Integer queryTimeoutSeconds)
+            throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         CountDownLatch executeStarted = new CountDownLatch(1);
         CountDownLatch cancelCalled = new CountDownLatch(1);
@@ -2258,8 +2313,11 @@ class DispatcherTest {
         Dispatcher dispatcher = new Dispatcher(connMgr, new CursorManager());
         ExecutorService pool = Executors.newSingleThreadExecutor();
         try {
-            Future<Response> executeFuture = pool.submit(
-                () -> dispatcher.dispatch(request(40, "execute", "conn-id", 7, "sql", "SELECT * FROM t")));
+            Request execute = request(40, "execute", "conn-id", 7, "sql", "SELECT * FROM t");
+            if (queryTimeoutSeconds != null) {
+                execute.params.put("query-timeout-seconds", queryTimeoutSeconds);
+            }
+            Future<Response> executeFuture = pool.submit(() -> dispatcher.dispatch(execute));
 
             assertTrue(executeStarted.await(2, TimeUnit.SECONDS), "execute should start before cancel");
 
@@ -2356,8 +2414,10 @@ class DispatcherTest {
         }
     }
 
-    @Test
-    void cancelInterruptsRunningFetchAndKeepsConnectionUsable() throws Exception {
+    @ParameterizedTest
+    @MethodSource("queryTimeoutsEndedByCancel")
+    void cancelInterruptsRunningFetchAndKeepsConnectionUsable(Integer queryTimeoutSeconds)
+            throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         CountDownLatch fetchStarted = new CountDownLatch(1);
         CountDownLatch cancelCalled = new CountDownLatch(1);
@@ -2424,8 +2484,11 @@ class DispatcherTest {
         Dispatcher dispatcher = new Dispatcher(connMgr, cursorMgr);
         ExecutorService pool = Executors.newSingleThreadExecutor();
         try {
-            Future<Response> fetchFuture = pool.submit(
-                () -> dispatcher.dispatch(request(43, "fetch", "cursor-id", cursorId, "fetch-size", 10)));
+            Request fetch = request(43, "fetch", "cursor-id", cursorId, "fetch-size", 10);
+            if (queryTimeoutSeconds != null) {
+                fetch.params.put("query-timeout-seconds", queryTimeoutSeconds);
+            }
+            Future<Response> fetchFuture = pool.submit(() -> dispatcher.dispatch(fetch));
 
             assertTrue(fetchStarted.await(2, TimeUnit.SECONDS), "fetch should start before cancel");
 
@@ -3353,7 +3416,8 @@ class DispatcherTest {
     private static Stream<Arguments> executeDmlCases() {
         return Stream.of(
             Arguments.of("update demo set x = 1;", 16, 17, "update demo set x = 1"),
-            Arguments.of("DELETE FROM audit_log WHERE id = 99;;", 5, 2, "DELETE FROM audit_log WHERE id = 99")
+            Arguments.of("DELETE FROM audit_log WHERE id = 99;;", 5, 2, "DELETE FROM audit_log WHERE id = 99"),
+            Arguments.of("DELETE FROM staging", 0, 4, "DELETE FROM staging")
         );
     }
 
@@ -3399,6 +3463,11 @@ class DispatcherTest {
         return Stream.of("execute", "execute-params")
             .flatMap(op -> invalidFetchSizeValues()
                 .map(value -> Arguments.of(op, value)));
+    }
+
+    private static Stream<Arguments> queryTimeoutsEndedByCancel() {
+        // Omitted keeps the agent's default limit; 0 waits without one.
+        return Stream.of(Arguments.of((Object) null), Arguments.of(0));
     }
 
     private static Stream<String> foregroundExecuteOps() {
