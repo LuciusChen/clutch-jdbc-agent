@@ -64,12 +64,13 @@ class CursorManagerTest {
     @Test
     void closeIsIdempotent() throws SQLException {
         CursorManager mgr = new CursorManager();
-        boolean[] closed = {false};
-        int cursorId = mgr.register(1, mockStatement(),
+        AtomicInteger closes = new AtomicInteger();
+        int cursorId = mgr.register(1, closeCountingStatement(closes),
             mockResultSet(List.of("x"), List.of("INT"), List.of()));
 
         mgr.close(cursorId);
         mgr.close(cursorId); // second close is a no-op
+        assertEquals(1, closes.get(), "a second close must not close the statement again");
         // fetch after close should throw
         assertThrows(SQLException.class, () -> mgr.fetch(cursorId, 1));
     }
@@ -126,11 +127,15 @@ class CursorManagerTest {
     @Test
     void fetchAutoClosesWhenDone() throws SQLException {
         CursorManager mgr = new CursorManager();
-        int cursorId = mgr.register(1, mockStatement(),
-            mockResultSet(List.of("x"), List.of("INT"), rows(new Object[]{1})));
+        AtomicInteger statementCloses = new AtomicInteger();
+        AtomicInteger resultSetCloses = new AtomicInteger();
+        int cursorId = mgr.register(1, closeCountingStatement(statementCloses),
+            mockResultSet(List.of("x"), List.of("INT"), rows(new Object[]{1}), resultSetCloses));
 
         CursorManager.FetchResult result = mgr.fetch(cursorId, 10);
         assertTrue(result.done());
+        assertEquals(1, resultSetCloses.get(), "an exhausted cursor must close its result set");
+        assertEquals(1, statementCloses.get(), "an exhausted cursor must close its statement");
 
         // cursor should be auto-closed after done
         assertThrows(SQLException.class, () -> mgr.fetch(cursorId, 1));
@@ -181,6 +186,11 @@ class CursorManagerTest {
 
     private static ResultSet mockResultSet(List<String> colNames, List<String> colTypes,
                                            List<Object[]> rows) {
+        return mockResultSet(colNames, colTypes, rows, new AtomicInteger());
+    }
+
+    private static ResultSet mockResultSet(List<String> colNames, List<String> colTypes,
+                                           List<Object[]> rows, AtomicInteger closes) {
         AtomicInteger rowIndex = new AtomicInteger(-1);
         ResultSetMetaData meta = (ResultSetMetaData) Proxy.newProxyInstance(
             CursorManagerTest.class.getClassLoader(),
@@ -213,7 +223,10 @@ class CursorManagerTest {
                     Object v = (idx >= 0 && idx < rows.size()) ? rows.get(idx)[col - 1] : null;
                     yield v == null ? null : v.toString();
                 }
-                case "close" -> null;
+                case "close" -> {
+                    closes.incrementAndGet();
+                    yield null;
+                }
                 case "unwrap" -> null;
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());

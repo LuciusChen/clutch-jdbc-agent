@@ -68,7 +68,8 @@ public class CursorManager {
 
     /**
      * Fetch up to fetchSize rows from cursor.
-     * Returns null columns list when the cursor is exhausted (done=true).
+     * The cursor is closed once it is exhausted (done=true); the result still
+     * carries its column names and types.
      */
     public FetchResult fetch(int cursorId, int fetchSize) throws SQLException {
         Cursor c = cursors.get(cursorId);
