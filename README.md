@@ -177,7 +177,7 @@ clutch-db-jdbc.el (Emacs)
         ▼
 clutch-jdbc-agent (JVM process)
   ├── Agent.java          — main(), stdin loop, driver loading
-  ├── ConnectionManager   — connId → primary + metadata JDBC session
+  ├── ConnectionManager   — connId → primary + metadata JDBC sessions, and a bulk session on Oracle
   ├── CursorManager       — cursorId → (Statement, ResultSet)
   ├── TypeConverter       — JDBC value → JSON-safe Java object
   └── handler/
