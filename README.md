@@ -248,4 +248,4 @@ default because it is the safest line across Oracle 11g/12c/19c. Installing
 
 ## License
 
-GPL-3.0-or-later
+GPL-3.0-or-later. See [LICENSE](LICENSE).
