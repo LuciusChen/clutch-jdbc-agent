@@ -15,6 +15,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLTimeoutException;
+import java.sql.SQLWarning;
 import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
@@ -431,6 +432,37 @@ public class Dispatcher {
     // Execute / Fetch / Close
     // -------------------------------------------------------------------------
 
+    /** Most warnings one response carries; a loop of PRINTs can make thousands. */
+    static final int MAX_WARNING_MESSAGES = 100;
+
+    /**
+     * Return the warnings the driver attached to STMT while it ran, oldest
+     * first, such as SQL Server PRINT output or PostgreSQL notices.  Past
+     * {@link #MAX_WARNING_MESSAGES}, one message counts the rest.  The
+     * statement already succeeded, so a failure to read them becomes a
+     * message instead of the statement's error.
+     */
+    static List<String> statementWarnings(Statement stmt) {
+        List<String> messages = new ArrayList<>();
+        int omitted = 0;
+        try {
+            for (SQLWarning warning = stmt.getWarnings(); warning != null;
+                 warning = warning.getNextWarning()) {
+                if (messages.size() < MAX_WARNING_MESSAGES) {
+                    messages.add(warning.getMessage());
+                } else {
+                    omitted++;
+                }
+            }
+        } catch (SQLException e) {
+            messages.add("Warnings could not be read: " + e.getMessage());
+        }
+        if (omitted > 0) {
+            messages.add(omitted + " more warnings not shown");
+        }
+        return messages;
+    }
+
     private Response execute(Request req) throws Exception {
         int connId = req.getInt("conn-id");
         String sql = normalizedSql(req);
@@ -523,9 +555,13 @@ public class Dispatcher {
                 throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
             }
 
+            List<String> messages = statementWarnings(stmt);
             if (!isQuery) {
-                int affected = stmt.getUpdateCount();
-                return Response.ok(req.id, Map.of("type", "dml", "affected-rows", affected));
+                Map<String, Object> result = new java.util.LinkedHashMap<>();
+                result.put("type", "dml");
+                result.put("affected-rows", stmt.getUpdateCount());
+                if (!messages.isEmpty()) result.put("messages", messages);
+                return Response.ok(req.id, result);
             }
 
             ResultSet rs = stmt.getResultSet();
@@ -548,6 +584,7 @@ public class Dispatcher {
             result.put("col-types", first.types());
             result.put("rows", first.rows());
             result.put("done", first.done());
+            if (!messages.isEmpty()) result.put("messages", messages);
             cursorResponseReady = true;
             return Response.ok(req.id, result);
         } finally {
