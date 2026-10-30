@@ -122,6 +122,8 @@ auto-commit mode.
 {"id": 1, "ok": true, "result": {"type": "query", "columns": ["1"], "rows": [[1]], "done": true}}
 ```
 
+An `execute` or `execute-params` result also carries `messages` when the driver attached warnings to the statement while it ran: the text of its `SQLWarning` chain, oldest first, such as SQL Server `PRINT` output or PostgreSQL notices. Warnings attached later, to a following result or while fetching, are not read. At most 100 are sent, followed by one message counting the rest. A failure to read the chain becomes one message, since the statement itself succeeded.
+
 Error response:
 ```json
 {"id": 1, "ok": false, "error": "ORA-01435: user does not exist", "diag": {"category": "metadata", "op": "set-current-schema", "request-id": 1, "context": {"schema": "APP", "generated-sql": "ALTER SESSION SET CURRENT_SCHEMA = \"APP\""}}}

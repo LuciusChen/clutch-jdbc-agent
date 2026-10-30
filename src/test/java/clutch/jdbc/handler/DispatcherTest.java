@@ -21,6 +21,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLWarning;
 import java.sql.SQLRecoverableException;
 import java.sql.Statement;
 import java.sql.Types;
@@ -1532,6 +1533,54 @@ class DispatcherTest {
     }
 
     @Test
+    void executeReturnsTheStatementsWarningsAsMessages() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        RecordingStatementHandler stmt = new RecordingStatementHandler();
+        stmt.warnings = new SQLWarning("10 records moved");
+        stmt.warnings.setNextWarning(new SQLWarning("done"));
+        connMgr.connection = proxyConnection(stmt);
+
+        Response response = dispatch(connMgr, 2, "execute",
+            "conn-id", 7, "sql", "EXEC move_records");
+        assertTrue(response.ok);
+        assertEquals(List.of("10 records moved", "done"),
+            resultMap(response).get("messages"));
+
+        stmt.warnings = null;
+        response = dispatch(connMgr, 3, "execute",
+            "conn-id", 7, "sql", "UPDATE t SET n = 1");
+        assertTrue(response.ok);
+        assertFalse(resultMap(response).containsKey("messages"));
+
+        // A long chain is cut, with one message counting the rest.
+        stmt.warnings = new SQLWarning("warning 1");
+        SQLWarning last = stmt.warnings;
+        for (int i = 2; i <= Dispatcher.MAX_WARNING_MESSAGES + 5; i++) {
+            SQLWarning next = new SQLWarning("warning " + i);
+            last.setNextWarning(next);
+            last = next;
+        }
+        response = dispatch(connMgr, 5, "execute",
+            "conn-id", 7, "sql", "EXEC print_loop");
+        @SuppressWarnings("unchecked")
+        List<String> cut = (List<String>) resultMap(response).get("messages");
+        assertEquals(Dispatcher.MAX_WARNING_MESSAGES + 1, cut.size());
+        assertEquals("warning " + Dispatcher.MAX_WARNING_MESSAGES,
+            cut.get(Dispatcher.MAX_WARNING_MESSAGES - 1));
+        assertEquals("5 more warnings not shown", cut.get(Dispatcher.MAX_WARNING_MESSAGES));
+
+        // The statement already ran, so an unreadable warning chain is no error.
+        stmt.warnings = null;
+        stmt.warningsFailure = new SQLException("statement closed");
+        response = dispatch(connMgr, 4, "execute",
+            "conn-id", 7, "sql", "UPDATE t SET n = 2");
+        assertTrue(response.ok);
+        assertEquals(3, ((Number) resultMap(response).get("affected-rows")).intValue());
+        assertEquals(List.of("Warnings could not be read: statement closed"),
+            resultMap(response).get("messages"));
+    }
+
+    @Test
     void executeClosesStatementWhenTimeoutConfigurationFails() throws Exception {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         RecordingStatementHandler stmt = new RecordingStatementHandler();
@@ -1556,6 +1605,7 @@ class DispatcherTest {
             (_proxy, method, args) -> switch (method.getName()) {
                 case "setQueryTimeout" -> null;
                 case "execute"         -> true;  // pretend it's a SELECT
+                case "getWarnings" -> null;
                 case "getResultSet"    -> throw new java.sql.SQLException("simulated rs failure");
                 case "close"           -> { closed[0] = true; yield null; }
                 case "unwrap"          -> null;
@@ -1814,6 +1864,7 @@ class DispatcherTest {
                     emptyBlobLifecycle.add("execute");
                     yield false;
                 }
+                case "getWarnings" -> null;
                 case "getUpdateCount" -> 1;
                 case "close" -> {
                     emptyBlobLifecycle.add("closeStatement");
@@ -1980,6 +2031,7 @@ class DispatcherTest {
                     executeRunning.set(false);
                     yield false;
                 }
+                case "getWarnings" -> null;
                 case "getUpdateCount" -> 1;
                 case "unwrap" -> null;
                 case "isWrapperFor" -> false;
@@ -2187,6 +2239,7 @@ class DispatcherTest {
                     yield false;
                 }
                 case "cancel", "close" -> null;
+                case "getWarnings" -> null;
                 case "getUpdateCount" -> 0;
                 case "unwrap" -> null;
                 case "isWrapperFor" -> false;
@@ -2237,6 +2290,7 @@ class DispatcherTest {
             (_proxy, method, args) -> switch (method.getName()) {
                 case "setQueryTimeout" -> { capturedTimeout[0] = (Integer) args[0]; yield null; }
                 case "execute"         -> false;   // DML
+                case "getWarnings" -> null;
                 case "getUpdateCount"  -> 0;
                 case "close"           -> null;
                 case "unwrap"          -> null;
@@ -2819,6 +2873,7 @@ class DispatcherTest {
             (_proxy, method, args) -> switch (method.getName()) {
                 case "setQueryTimeout" -> null;
                 case "execute" -> true;
+                case "getWarnings" -> null;
                 case "getResultSet" -> blockingRs;
                 case "cancel" -> {
                     cancelled[0] = true;
@@ -4150,6 +4205,8 @@ class DispatcherTest {
         private SQLException queryTimeoutFailure;
         private String executedSql;
         private int updateCount = 3;
+        private SQLWarning warnings;
+        private SQLException warningsFailure;
         private boolean closed;
 
         private Statement proxy() {
@@ -4165,6 +4222,10 @@ class DispatcherTest {
                     case "execute" -> {
                         executedSql = (String) args[0];
                         yield false;
+                    }
+                    case "getWarnings" -> {
+                        if (warningsFailure != null) throw warningsFailure;
+                        yield warnings;
                     }
                     case "getUpdateCount" -> updateCount;
                     case "close" -> {
