@@ -892,26 +892,7 @@ final class MetadataOps {
     private List<Map<String, Object>> getOracleReferencingKeys(Connection conn, String schema, String table)
             throws SQLException {
         OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
-        String sql;
-        if (os.useUserTables()) {
-            sql = """
-                SELECT ac.table_name AS fk_table,
-                       USER AS fk_schema,
-                       acc.column_name AS fk_column,
-                       ucc.column_name AS pk_column,
-                       ac.constraint_name AS fk_name
-                FROM user_constraints uc
-                JOIN user_constraints ac ON ac.r_constraint_name = uc.constraint_name
-                JOIN user_cons_columns acc ON acc.constraint_name = ac.constraint_name
-                JOIN user_cons_columns ucc ON ucc.constraint_name = uc.constraint_name
-                                          AND ucc.position = acc.position
-                WHERE uc.constraint_type IN ('P', 'U')
-                  AND uc.table_name = ?
-                  AND ac.constraint_type = 'R'
-                ORDER BY ac.table_name, ac.constraint_name, acc.position
-                """;
-        } else {
-            sql = """
+        String sql = """
                 SELECT ac.table_name AS fk_table,
                        ac.owner AS fk_schema,
                        acc.column_name AS fk_column,
@@ -931,15 +912,11 @@ final class MetadataOps {
                   AND ac.constraint_type = 'R'
                 ORDER BY ac.owner, ac.table_name, ac.constraint_name, acc.position
                 """;
-        }
         List<Map<String, Object>> keys = new ArrayList<>();
         try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
             ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
-            int i = 1;
-            if (!os.useUserTables()) {
-                ps.setString(i++, os.owner());
-            }
-            ps.setString(i, table.toUpperCase(Locale.ROOT));
+            ps.setString(1, os.owner());
+            ps.setString(2, table.toUpperCase(Locale.ROOT));
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     keys.add(Map.of(

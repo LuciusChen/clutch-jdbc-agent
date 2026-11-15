@@ -3418,8 +3418,9 @@ class DispatcherTest {
             "table", "customers");
 
         assertTrue(response.ok);
-        assertTrue(oracle.lastSqlNormalized().contains("user_constraints"));
-        assertEquals(List.of("CUSTOMERS"), oracle.params);
+        assertTrue(oracle.lastSqlNormalized().contains("all_constraints"));
+        assertTrue(oracle.lastSqlNormalized().contains("ac.r_owner = uc.owner"));
+        assertEquals(List.of("ZJSY", "CUSTOMERS"), oracle.params);
         assertEquals(5, oracle.queryTimeoutSeconds);
         List<Map<String, Object>> keys = resultList(response, "keys");
         assertEquals(Map.of("fk-table", "ORDERS", "fk-schema", "ZJSY",
