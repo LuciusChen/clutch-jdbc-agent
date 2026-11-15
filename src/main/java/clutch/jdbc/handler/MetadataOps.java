@@ -28,7 +28,8 @@ final class MetadataOps {
     static final Set<String> SUPPORTED_OPS = Set.of(
         "get-schemas", "set-current-schema", "get-tables", "search-tables",
         "get-columns", "search-columns", "get-primary-keys", "get-foreign-keys",
-        "get-referencing-objects", "get-indexes", "get-index-columns",
+        "get-referencing-objects", "get-referencing-keys", "get-indexes",
+        "get-index-columns",
         "get-sequences", "get-procedures", "get-functions",
         "get-procedure-params", "get-function-params", "get-object-source",
         "get-object-ddl", "get-triggers");
@@ -106,6 +107,7 @@ final class MetadataOps {
             case "get-primary-keys" -> getPrimaryKeys(req);
             case "get-foreign-keys" -> getForeignKeys(req);
             case "get-referencing-objects" -> getReferencingObjects(req);
+            case "get-referencing-keys" -> getReferencingKeys(req);
             case "get-indexes" -> getIndexes(req, lane);
             case "get-index-columns" -> getIndexColumns(req);
             case "get-sequences" -> getSequences(req, lane);
@@ -704,24 +706,85 @@ final class MetadataOps {
         return Response.ok(req.id, Map.of("foreign-keys", fks));
     }
 
+    /**
+     * Orders key columns so that the columns of one key come together, in
+     * key order.  JDBC orders imported keys by the referenced table and
+     * position, which interleaves two keys that reference the same table.
+     */
+    private static final Comparator<KeyColumn> KEY_ORDER =
+        Comparator.comparing(KeyColumn::table)
+            .thenComparing(KeyColumn::name, Comparator.nullsFirst(Comparator.naturalOrder()))
+            .thenComparingInt(KeyColumn::position);
+
+    /** One column of a key, with the table it groups by and its fields. */
+    private record KeyColumn(String table, String name, int position, Map<String, Object> fields) {
+        static KeyColumn of(String schema, String table, String name, int position,
+                            Map<String, Object> fields) {
+            if (name != null) {
+                fields.put("fk-name", name);
+            }
+            return new KeyColumn(schema + "\u0000" + table, name, position, fields);
+        }
+    }
+
+    private static List<Map<String, Object>> inKeyOrder(List<KeyColumn> columns) {
+        return columns.stream().sorted(KEY_ORDER).map(KeyColumn::fields).toList();
+    }
+
     private List<Map<String, Object>> getJdbcMetadataForeignKeys(Connection conn, String catalog,
                                                                  String schema, String table)
             throws SQLException {
-        List<Map<String, Object>> fks = new ArrayList<>();
+        List<KeyColumn> columns = new ArrayList<>();
         try (ResultSet rs = conn.getMetaData().getImportedKeys(catalog, schema, table)) {
             while (rs.next()) {
                 if (!matchesRequestedCatalog(rs, catalog, "FKTABLE_CAT", "FKTABLE_SCHEM")) {
                     continue;
                 }
-                fks.add(Map.of(
-                    "fk-column", rs.getString("FKCOLUMN_NAME"),
-                    "pk-table", rs.getString("PKTABLE_NAME"),
-                    "pk-schema", Objects.toString(rs.getString("PKTABLE_SCHEM"), ""),
-                    "pk-column", rs.getString("PKCOLUMN_NAME")
-                ));
+                String pkSchema = Objects.toString(rs.getString("PKTABLE_SCHEM"), "");
+                Map<String, Object> fk = new LinkedHashMap<>();
+                fk.put("fk-column", rs.getString("FKCOLUMN_NAME"));
+                fk.put("pk-table", rs.getString("PKTABLE_NAME"));
+                fk.put("pk-schema", pkSchema);
+                fk.put("pk-column", rs.getString("PKCOLUMN_NAME"));
+                columns.add(KeyColumn.of(pkSchema, rs.getString("PKTABLE_NAME"),
+                                         rs.getString("FK_NAME"), rs.getInt("KEY_SEQ"), fk));
             }
         }
-        return fks;
+        return inKeyOrder(columns);
+    }
+
+    private Response getReferencingKeys(Request req) throws SQLException {
+        int connId = req.getInt("conn-id");
+        String catalog = getOptionalString(req, "catalog");
+        String schema = getOptionalString(req, "schema");
+        String table = req.getString("table");
+        Connection conn = connMgr.getMetadata(connId);
+        List<Map<String, Object>> keys = isOracle(conn)
+            ? getOracleReferencingKeys(conn, schema, table)
+            : getJdbcMetadataReferencingKeys(conn, catalog, schema, table);
+        return Response.ok(req.id, Map.of("keys", keys));
+    }
+
+    private List<Map<String, Object>> getJdbcMetadataReferencingKeys(Connection conn, String catalog,
+                                                                     String schema, String table)
+            throws SQLException {
+        List<KeyColumn> columns = new ArrayList<>();
+        try (ResultSet rs = conn.getMetaData().getExportedKeys(catalog, schema, table)) {
+            while (rs.next()) {
+                if (!matchesRequestedCatalog(rs, catalog, "PKTABLE_CAT", "PKTABLE_SCHEM")) {
+                    continue;
+                }
+                String fkSchema = Objects.toString(rs.getString("FKTABLE_SCHEM"), "");
+                Map<String, Object> key = new LinkedHashMap<>();
+                key.put("fk-table", rs.getString("FKTABLE_NAME"));
+                key.put("fk-schema", fkSchema);
+                key.put("fk-column", rs.getString("FKCOLUMN_NAME"));
+                key.put("pk-column", rs.getString("PKCOLUMN_NAME"));
+                columns.add(KeyColumn.of(fkSchema, rs.getString("FKTABLE_NAME"),
+                                         rs.getString("FK_NAME"), rs.getInt("KEY_SEQ"), key));
+            }
+        }
+        return inKeyOrder(columns);
     }
 
     private Response getReferencingObjects(Request req) throws SQLException {
@@ -769,34 +832,38 @@ final class MetadataOps {
                 SELECT ucc.column_name AS fk_column,
                        ruc.table_name AS pk_table,
                        ruc.owner AS pk_schema,
-                       rucc.column_name AS pk_column
+                       rucc.column_name AS pk_column,
+                       uc.constraint_name AS fk_name
                 FROM user_constraints uc
                 JOIN user_cons_columns ucc ON uc.constraint_name = ucc.constraint_name
                 JOIN all_constraints ruc ON uc.r_constraint_name = ruc.constraint_name
+                                        AND uc.r_owner = ruc.owner
                 JOIN all_cons_columns rucc ON ruc.constraint_name = rucc.constraint_name
                                           AND ruc.owner = rucc.owner
                                           AND ucc.position = rucc.position
                 WHERE uc.constraint_type = 'R'
                   AND uc.table_name = ?
-                ORDER BY ucc.position
+                ORDER BY uc.constraint_name, ucc.position
                 """;
         } else {
             sql = """
                 SELECT acc.column_name AS fk_column,
                        ruc.table_name AS pk_table,
                        ruc.owner AS pk_schema,
-                       rucc.column_name AS pk_column
+                       rucc.column_name AS pk_column,
+                       ac.constraint_name AS fk_name
                 FROM all_constraints ac
                 JOIN all_cons_columns acc ON ac.constraint_name = acc.constraint_name
                                          AND ac.owner = acc.owner
                 JOIN all_constraints ruc ON ac.r_constraint_name = ruc.constraint_name
+                                        AND ac.r_owner = ruc.owner
                 JOIN all_cons_columns rucc ON ruc.constraint_name = rucc.constraint_name
                                           AND ruc.owner = rucc.owner
                                           AND acc.position = rucc.position
                 WHERE ac.constraint_type = 'R'
                   AND ac.owner = ?
                   AND ac.table_name = ?
-                ORDER BY acc.position
+                ORDER BY ac.constraint_name, acc.position
                 """;
         }
         List<Map<String, Object>> fks = new ArrayList<>();
@@ -813,12 +880,79 @@ final class MetadataOps {
                         "fk-column", rs.getString("fk_column"),
                         "pk-table", rs.getString("pk_table"),
                         "pk-schema", Objects.toString(rs.getString("pk_schema"), ""),
-                        "pk-column", rs.getString("pk_column")
+                        "pk-column", rs.getString("pk_column"),
+                        "fk-name", rs.getString("fk_name")
                     ));
                 }
             }
         }
         return fks;
+    }
+
+    private List<Map<String, Object>> getOracleReferencingKeys(Connection conn, String schema, String table)
+            throws SQLException {
+        OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
+        String sql;
+        if (os.useUserTables()) {
+            sql = """
+                SELECT ac.table_name AS fk_table,
+                       USER AS fk_schema,
+                       acc.column_name AS fk_column,
+                       ucc.column_name AS pk_column,
+                       ac.constraint_name AS fk_name
+                FROM user_constraints uc
+                JOIN user_constraints ac ON ac.r_constraint_name = uc.constraint_name
+                JOIN user_cons_columns acc ON acc.constraint_name = ac.constraint_name
+                JOIN user_cons_columns ucc ON ucc.constraint_name = uc.constraint_name
+                                          AND ucc.position = acc.position
+                WHERE uc.constraint_type IN ('P', 'U')
+                  AND uc.table_name = ?
+                  AND ac.constraint_type = 'R'
+                ORDER BY ac.table_name, ac.constraint_name, acc.position
+                """;
+        } else {
+            sql = """
+                SELECT ac.table_name AS fk_table,
+                       ac.owner AS fk_schema,
+                       acc.column_name AS fk_column,
+                       ucc.column_name AS pk_column,
+                       ac.constraint_name AS fk_name
+                FROM all_constraints uc
+                JOIN all_constraints ac ON ac.r_constraint_name = uc.constraint_name
+                                       AND ac.r_owner = uc.owner
+                JOIN all_cons_columns acc ON acc.owner = ac.owner
+                                         AND acc.constraint_name = ac.constraint_name
+                JOIN all_cons_columns ucc ON ucc.owner = uc.owner
+                                         AND ucc.constraint_name = uc.constraint_name
+                                         AND ucc.position = acc.position
+                WHERE uc.owner = ?
+                  AND uc.constraint_type IN ('P', 'U')
+                  AND uc.table_name = ?
+                  AND ac.constraint_type = 'R'
+                ORDER BY ac.owner, ac.table_name, ac.constraint_name, acc.position
+                """;
+        }
+        List<Map<String, Object>> keys = new ArrayList<>();
+        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            int i = 1;
+            if (!os.useUserTables()) {
+                ps.setString(i++, os.owner());
+            }
+            ps.setString(i, table.toUpperCase(Locale.ROOT));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    keys.add(Map.of(
+                        "fk-table", rs.getString("fk_table"),
+                        "fk-schema", Objects.toString(rs.getString("fk_schema"), ""),
+                        "fk-column", rs.getString("fk_column"),
+                        "pk-column", rs.getString("pk_column"),
+                        "fk-name", rs.getString("fk_name")
+                    ));
+                }
+            }
+        }
+        return keys;
     }
 
     private List<Map<String, Object>> getOracleReferencingObjects(Connection conn, String schema, String table)

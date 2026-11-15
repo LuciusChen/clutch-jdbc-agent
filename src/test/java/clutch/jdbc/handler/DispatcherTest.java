@@ -3379,6 +3379,7 @@ class DispatcherTest {
         fkRow.put("pk_table",  "CUSTOMERS");
         fkRow.put("pk_schema", "ZJSY");
         fkRow.put("pk_column", "ID");
+        fkRow.put("fk_name",   "FK_CUSTOMER");
         oracle.resultRows = List.of(fkRow);
         Response response = dispatchOracle(oracle, 6, "get-foreign-keys",
             "conn-id", 7,
@@ -3396,6 +3397,35 @@ class DispatcherTest {
         assertEquals("CUSTOMERS",   fks.get(0).get("pk-table"));
         assertEquals("ZJSY",        fks.get(0).get("pk-schema"));
         assertEquals("ID",          fks.get(0).get("pk-column"));
+        assertEquals("FK_CUSTOMER", fks.get(0).get("fk-name"));
+        assertTrue(oracle.lastSqlNormalized().contains("ORDER BY uc.constraint_name, ucc.position"),
+            "the columns of one key should come together, in key order");
+    }
+
+    @Test
+    void getReferencingKeysUsesOracleFastPath() throws Exception {
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        Map<String, Object> row = new HashMap<>();
+        row.put("fk_table",  "ORDERS");
+        row.put("fk_schema", "ZJSY");
+        row.put("fk_column", "CUSTOMER_ID");
+        row.put("pk_column", "ID");
+        row.put("fk_name",   "FK_CUSTOMER");
+        oracle.resultRows = List.of(row);
+        Response response = dispatchOracle(oracle, 34, "get-referencing-keys",
+            "conn-id", 7,
+            "schema", "ZJSY",
+            "table", "customers");
+
+        assertTrue(response.ok);
+        assertTrue(oracle.lastSqlNormalized().contains("user_constraints"));
+        assertEquals(List.of("CUSTOMERS"), oracle.params);
+        assertEquals(5, oracle.queryTimeoutSeconds);
+        List<Map<String, Object>> keys = resultList(response, "keys");
+        assertEquals(Map.of("fk-table", "ORDERS", "fk-schema", "ZJSY",
+                            "fk-column", "CUSTOMER_ID", "pk-column", "ID",
+                            "fk-name", "FK_CUSTOMER"),
+                     keys.get(0));
     }
 
     @Test
