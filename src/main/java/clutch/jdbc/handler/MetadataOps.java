@@ -916,7 +916,7 @@ final class MetadataOps {
         try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
             ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
             ps.setString(1, os.owner());
-            ps.setString(2, table.toUpperCase(Locale.ROOT));
+            ps.setString(2, table);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     keys.add(Map.of(

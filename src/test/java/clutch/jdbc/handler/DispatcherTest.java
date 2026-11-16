@@ -3404,29 +3404,31 @@ class DispatcherTest {
 
     @Test
     void getReferencingKeysUsesOracleFastPath() throws Exception {
-        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
-        Map<String, Object> row = new HashMap<>();
-        row.put("fk_table",  "ORDERS");
-        row.put("fk_schema", "ZJSY");
-        row.put("fk_column", "CUSTOMER_ID");
-        row.put("pk_column", "ID");
-        row.put("fk_name",   "FK_CUSTOMER");
-        oracle.resultRows = List.of(row);
-        Response response = dispatchOracle(oracle, 34, "get-referencing-keys",
-            "conn-id", 7,
-            "schema", "ZJSY",
-            "table", "customers");
+        for (String table : List.of("CUSTOMERS", "MixedCustomers", "customers")) {
+            OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+            Map<String, Object> row = new HashMap<>();
+            row.put("fk_table",  "ORDERS");
+            row.put("fk_schema", "ZJSY");
+            row.put("fk_column", "CUSTOMER_ID");
+            row.put("pk_column", "ID");
+            row.put("fk_name",   "FK_CUSTOMER");
+            oracle.resultRows = List.of(row);
+            Response response = dispatchOracle(oracle, 34, "get-referencing-keys",
+                "conn-id", 7,
+                "schema", "ZJSY",
+                "table", table);
 
-        assertTrue(response.ok);
-        assertTrue(oracle.lastSqlNormalized().contains("all_constraints"));
-        assertTrue(oracle.lastSqlNormalized().contains("ac.r_owner = uc.owner"));
-        assertEquals(List.of("ZJSY", "CUSTOMERS"), oracle.params);
-        assertEquals(5, oracle.queryTimeoutSeconds);
-        List<Map<String, Object>> keys = resultList(response, "keys");
-        assertEquals(Map.of("fk-table", "ORDERS", "fk-schema", "ZJSY",
-                            "fk-column", "CUSTOMER_ID", "pk-column", "ID",
-                            "fk-name", "FK_CUSTOMER"),
-                     keys.get(0));
+            assertTrue(response.ok);
+            assertTrue(oracle.lastSqlNormalized().contains("all_constraints"));
+            assertTrue(oracle.lastSqlNormalized().contains("ac.r_owner = uc.owner"));
+            assertEquals(List.of("ZJSY", table), oracle.params);
+            assertEquals(5, oracle.queryTimeoutSeconds);
+            List<Map<String, Object>> keys = resultList(response, "keys");
+            assertEquals(Map.of("fk-table", "ORDERS", "fk-schema", "ZJSY",
+                                "fk-column", "CUSTOMER_ID", "pk-column", "ID",
+                                "fk-name", "FK_CUSTOMER"),
+                         keys.get(0));
+        }
     }
 
     @Test
