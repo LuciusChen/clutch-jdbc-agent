@@ -18,6 +18,7 @@ import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashSet;
 import java.util.List;
@@ -335,6 +336,63 @@ class AgentProtocolIntegrationTest {
             connections.disconnectAll();
             dispatcher.shutdown();
         }
+    }
+
+    @Test
+    void jsonProtocolReportsEachKeyInOrderInBothDirections() throws Exception {
+        Class.forName("org.h2.Driver");
+        ObjectMapper mapper = new ObjectMapper();
+        ConnectionManager connections = new ConnectionManager();
+        Dispatcher dispatcher = new Dispatcher(connections, new CursorManager());
+        try {
+            JsonNode connect = roundTrip(mapper, dispatcher, """
+                {"id":1,"op":"connect","params":{
+                  "url":"jdbc:h2:mem:keys;DB_CLOSE_DELAY=-1",
+                  "driver-class":"org.h2.Driver","user":"sa","password":""}}
+                """);
+            int connId = connect.path("result").path("conn-id").asInt();
+            // Two keys over two columns reference one table, so JDBC's
+            // order, by referenced table and position, interleaves them.
+            for (String sql : List.of(
+                    "CREATE TABLE PAIR (A INT, B INT, PRIMARY KEY (A, B))",
+                    "CREATE TABLE CHILD (X1 INT, Y1 INT, X2 INT, Y2 INT,"
+                        + " CONSTRAINT FK_FIRST FOREIGN KEY (X1, Y1) REFERENCES PAIR (A, B),"
+                        + " CONSTRAINT FK_SECOND FOREIGN KEY (X2, Y2) REFERENCES PAIR (A, B))")) {
+                assertTrue(roundTrip(mapper, dispatcher, """
+                    {"id":2,"op":"execute","params":{"conn-id":%d,"sql":"%s"}}
+                    """.formatted(connId, sql)).path("ok").asBoolean());
+            }
+
+            JsonNode imported = roundTrip(mapper, dispatcher, """
+                {"id":3,"op":"get-foreign-keys","params":{"conn-id":%d,"table":"CHILD"}}
+                """.formatted(connId)).path("result").path("foreign-keys");
+            assertEquals(List.of("X1 A FK_FIRST", "Y1 B FK_FIRST",
+                                 "X2 A FK_SECOND", "Y2 B FK_SECOND"),
+                         keyColumns(imported, "fk-column", "pk-column"));
+            assertEquals("PAIR", imported.path(0).path("pk-table").asText());
+            assertEquals("PUBLIC", imported.path(0).path("pk-schema").asText());
+
+            JsonNode exported = roundTrip(mapper, dispatcher, """
+                {"id":4,"op":"get-referencing-keys","params":{"conn-id":%d,"table":"PAIR"}}
+                """.formatted(connId)).path("result").path("keys");
+            assertEquals(List.of("X1 A FK_FIRST", "Y1 B FK_FIRST",
+                                 "X2 A FK_SECOND", "Y2 B FK_SECOND"),
+                         keyColumns(exported, "fk-column", "pk-column"));
+            assertEquals("CHILD", exported.path(0).path("fk-table").asText());
+            assertEquals("PUBLIC", exported.path(0).path("fk-schema").asText());
+        } finally {
+            connections.disconnectAll();
+            dispatcher.shutdown();
+        }
+    }
+
+    private static List<String> keyColumns(JsonNode keys, String column, String referenced) {
+        List<String> columns = new ArrayList<>();
+        for (JsonNode key : keys) {
+            columns.add(key.path(column).asText() + " " + key.path(referenced).asText()
+                        + " " + key.path("fk-name").asText());
+        }
+        return columns;
     }
 
     @Test
