@@ -148,6 +148,15 @@ public class TypeConverter {
             return java.util.Map.of("__type", "blob", "length", len);
         }
         if (val instanceof byte[] bytes) return blobBytesToMap(bytes, bytes.length);
+        if (val instanceof ByteBuffer buffer) {
+            int length = buffer.remaining();
+            if (length > MAX_INLINE_BINARY_BYTES) {
+                return Map.of("__type", "blob", "length", (long) length);
+            }
+            byte[] bytes = new byte[length];
+            buffer.duplicate().get(bytes);
+            return blobBytesToMap(bytes, length);
+        }
 
         // Fallback: getString() for anything else (e.g. Oracle-specific types).
         String s = rs.getString(col);
