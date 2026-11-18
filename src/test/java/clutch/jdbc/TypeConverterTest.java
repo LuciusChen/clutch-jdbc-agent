@@ -18,6 +18,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Time;
 import java.sql.Timestamp;
+import java.util.Base64;
 import java.util.Map;
 import java.util.TimeZone;
 import java.util.stream.Stream;
@@ -37,12 +38,14 @@ class TypeConverterTest {
         buffer.position(1);
 
         assertEquals(Map.of("__type", "blob", "length", 8L,
-                            "text", "{\"id\":1}", "encoding", "UTF-8"),
+                            "text", "{\"id\":1}", "encoding", "UTF-8",
+                            "preview-base64", "eyJpZCI6MX0="),
                      TypeConverter.convert(resultSetReturning(buffer), 1));
         assertEquals(1, buffer.position());
 
         var large = ByteBuffer.allocate(TypeConverter.MAX_INLINE_BINARY_BYTES + 1);
-        assertEquals(Map.of("__type", "blob", "length", (long) large.remaining()),
+        assertEquals(Map.of("__type", "blob", "length", (long) large.remaining(),
+                            "preview-base64", Base64.getEncoder().encodeToString(new byte[256])),
                      TypeConverter.convert(resultSetReturning(large), 1));
         assertEquals(0, large.position());
     }
@@ -188,6 +191,7 @@ class TypeConverterTest {
 
         assertEquals("blob", converted.get("__type"));
         assertEquals(2L, converted.get("length"));
+        assertEquals("wyg=", converted.get("preview-base64"));
         assertFalse(converted.containsKey("text"));
     }
 
@@ -297,14 +301,14 @@ class TypeConverterTest {
     }
 
     @Test
-    void convertLargeBlobReturnsPlaceholderWithoutBytes() throws SQLException {
+    void convertLargeBlobReportsLengthWithoutReadingLocator() throws SQLException {
         long largeSize = 100_000L;
         Blob blob = (Blob) Proxy.newProxyInstance(
             TypeConverterTest.class.getClassLoader(),
             new Class<?>[]{Blob.class},
             (_proxy, method, _args) -> switch (method.getName()) {
                 case "length" -> largeSize;
-                case "getBytes" -> throw new AssertionError("should not read bytes for large blob");
+                case "getBytes" -> throw new AssertionError("large locator should stay unread");
                 case "unwrap" -> null;
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
@@ -313,13 +317,11 @@ class TypeConverterTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> result = (Map<String, Object>) TypeConverter.convert(
             resultSetReturning(blob), 1);
-        assertEquals("blob", result.get("__type"));
-        assertEquals(largeSize, result.get("length"));
-        assertFalse(result.containsKey("text"));
+        assertEquals(Map.of("__type", "blob", "length", largeSize), result);
     }
 
     @Test
-    void convertLargeByteArrayReturnsPlaceholderWithoutTextDecoding() throws SQLException {
+    void convertLargeByteArrayReturnsOnlyPrefixWithoutTextDecoding() throws SQLException {
         byte[] bytes = new byte[65_537];
         bytes[0] = '{';
         bytes[bytes.length - 1] = '}';
@@ -330,6 +332,9 @@ class TypeConverterTest {
 
         assertEquals("blob", result.get("__type"));
         assertEquals((long) bytes.length, result.get("length"));
+        byte[] prefix = Base64.getDecoder().decode((String) result.get("preview-base64"));
+        assertEquals(256, prefix.length);
+        assertEquals((byte) '{', prefix[0]);
         assertFalse(result.containsKey("text"));
     }
 

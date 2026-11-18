@@ -13,6 +13,8 @@ import java.sql.*;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 
@@ -28,6 +30,7 @@ import java.util.Map;
 public class TypeConverter {
 
     static final int MAX_INLINE_BINARY_BYTES = 65_536;
+    private static final int MAX_BLOB_PREVIEW_BYTES = 256;
     static final int MAX_TEXT_CELL_CHARS = 1_048_576;
     private static final ObjectMapper JSON_VALIDATOR = new ObjectMapper();
     private static final List<Charset> BLOB_TEXT_CHARSETS =
@@ -38,24 +41,26 @@ public class TypeConverter {
         DateTimeFormatter.ofPattern("HH:mm:ss");
 
     /**
-     * Convert a small BLOB's raw bytes to a map preserving the blob origin.
-     * If the bytes decode as supported text and look like JSON/XML, includes
-     * the text content and detected encoding.  Otherwise returns a placeholder.
+     * Preserve a bounded byte prefix and any complete structured text.
+     * The byte array may contain only the prefix of a large value.
      */
     static Map<String, Object> blobBytesToMap(byte[] bytes, long length) {
-        if (bytes.length > MAX_INLINE_BINARY_BYTES) {
-            return Map.of("__type", "blob", "length", length);
-        }
-        for (Charset charset : BLOB_TEXT_CHARSETS) {
-            String text = decodeBlobText(bytes, charset);
-            if (text != null && structuredBlobText(text)) {
-                return Map.of("__type", "blob",
-                              "length", length,
-                              "text", text,
-                              "encoding", charset.name());
+        byte[] prefix = bytes.length > MAX_BLOB_PREVIEW_BYTES
+            ? Arrays.copyOf(bytes, MAX_BLOB_PREVIEW_BYTES) : bytes;
+        String preview = Base64.getEncoder().encodeToString(prefix);
+        if (length <= MAX_INLINE_BINARY_BYTES && bytes.length == length) {
+            for (Charset charset : BLOB_TEXT_CHARSETS) {
+                String text = decodeBlobText(bytes, charset);
+                if (text != null && structuredBlobText(text)) {
+                    return Map.of("__type", "blob",
+                                  "length", length,
+                                  "preview-base64", preview,
+                                  "text", text,
+                                  "encoding", charset.name());
+                }
             }
         }
-        return Map.of("__type", "blob", "length", length);
+        return Map.of("__type", "blob", "length", length, "preview-base64", preview);
     }
 
     private static String decodeBlobText(byte[] bytes, Charset charset) {
@@ -127,7 +132,7 @@ public class TypeConverter {
         if (val instanceof Date) return ((Date) val).toLocalDate().toString();
         if (val instanceof Time) return formatTime((Time) val);
 
-        // Large objects: return a placeholder, not the full content.
+        // Bound large-object reads.
         if (val instanceof Clob) {
             Clob clob = (Clob) val;
             long len = clob.length();
@@ -142,18 +147,17 @@ public class TypeConverter {
         if (val instanceof Blob) {
             Blob blob = (Blob) val;
             long len = blob.length();
-            if (len <= MAX_INLINE_BINARY_BYTES) {
-                return blobBytesToMap(blob.getBytes(1, (int) len), len);
+            // A locator read can make a database round trip for each row.
+            if (len > MAX_INLINE_BINARY_BYTES) {
+                return Map.of("__type", "blob", "length", len);
             }
-            return java.util.Map.of("__type", "blob", "length", len);
+            return blobBytesToMap(blob.getBytes(1, (int) len), len);
         }
         if (val instanceof byte[] bytes) return blobBytesToMap(bytes, bytes.length);
         if (val instanceof ByteBuffer buffer) {
             int length = buffer.remaining();
-            if (length > MAX_INLINE_BINARY_BYTES) {
-                return Map.of("__type", "blob", "length", (long) length);
-            }
-            byte[] bytes = new byte[length];
+            byte[] bytes = new byte[length <= MAX_INLINE_BINARY_BYTES
+                ? length : MAX_BLOB_PREVIEW_BYTES];
             buffer.duplicate().get(bytes);
             return blobBytesToMap(bytes, length);
         }
