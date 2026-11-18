@@ -7,7 +7,9 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import java.lang.reflect.Proxy;
 import java.math.BigDecimal;
+import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.sql.Blob;
 import java.sql.Clob;
 import java.sql.Date;
@@ -27,6 +29,23 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TypeConverterTest {
+
+    @Test
+    void byteBufferExposesOnlyRemainingBytesWithoutAdvancing() throws SQLException {
+        ByteBuffer buffer = ByteBuffer.allocateDirect(64);
+        buffer.put((byte) 0).put("{\"id\":1}".getBytes(StandardCharsets.UTF_8)).flip();
+        buffer.position(1);
+
+        assertEquals(Map.of("__type", "blob", "length", 8L,
+                            "text", "{\"id\":1}", "encoding", "UTF-8"),
+                     TypeConverter.convert(resultSetReturning(buffer), 1));
+        assertEquals(1, buffer.position());
+
+        var large = ByteBuffer.allocate(TypeConverter.MAX_INLINE_BINARY_BYTES + 1);
+        assertEquals(Map.of("__type", "blob", "length", (long) large.remaining()),
+                     TypeConverter.convert(resultSetReturning(large), 1));
+        assertEquals(0, large.position());
+    }
 
     @Test
     void clobPreviewKeepsWholeSurrogatePairs() throws SQLException {
