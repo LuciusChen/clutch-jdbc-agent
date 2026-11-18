@@ -167,7 +167,7 @@ JDBC column values are converted to a stable set of JSON-safe types:
 | `Date`                      | Date string (`2024-01-15`)                    |
 | `Time`                      | Time string (`13:45:30`)                      |
 | `Clob`                      | `{"__type":"clob","length":N,"preview":"..."}`; at most 256 UTF-16 units, without splitting surrogate pairs; original length retained |
-| `Blob` / `byte[]` / `ByteBuffer` | `{"__type":"blob","length":N}`, with complete `text` and `encoding` for UTF-8/GB18030 JSON/XML up to 64 KiB; original whitespace is preserved. For `ByteBuffer`, only the remaining bytes count and the buffer position is preserved. |
+| `Blob` / `byte[]` / `ByteBuffer` | `{"__type":"blob","length":N,"preview-base64":"..."}` with at most 256 leading bytes, plus complete `text` and `encoding` for UTF-8/GB18030 JSON/XML up to 64 KiB. Larger JDBC `Blob` locators carry only the length to avoid extra reads. `ByteBuffer` is read from its current position without moving it. |
 | String / textual fallback   | String, limited to 1,048,576 characters per cell |
 | Anything else               | `rs.getString(col)` fallback                  |
 
