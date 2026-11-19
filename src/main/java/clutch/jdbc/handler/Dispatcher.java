@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -59,11 +60,23 @@ public class Dispatcher {
     private final CursorManager cursorMgr;
     private final ExecutorService executePool = newExecutePool();
     private final Map<Integer, ConnectionLocks> connectionLocks = new ConcurrentHashMap<>();
+    private final Map<Integer, StartingExecution> startingExecutions = new ConcurrentHashMap<>();
     private final Map<Integer, RunningStatement> runningStatements = new ConcurrentHashMap<>();
     private final ThreadLocal<String> generatedSqlContext = new ThreadLocal<>();
     private final ThreadLocal<Boolean> executionNotStartedContext = new ThreadLocal<>();
     private final DispatcherDiagnostics diagnostics;
     private final MetadataOps metadataOps;
+
+    private record StartingExecution(int connId, AtomicBoolean claimed) {
+        private StartingExecution(int connId) {
+            this(connId, new AtomicBoolean());
+        }
+
+        // Either the execute worker or a matching cancel claims the start.
+        private boolean claim() {
+            return claimed.compareAndSet(false, true);
+        }
+    }
 
     private record RunningStatement(int requestId, Statement statement,
                                     AtomicBoolean cancelRequestedFlag) {
@@ -100,6 +113,21 @@ public class Dispatcher {
     /** Shut down the execute thread pool. Called on agent shutdown. */
     public void shutdown() {
         executePool.shutdownNow();
+    }
+
+    /** Make an execute request visible to cancel before dispatch can be reordered. */
+    public void registerRequest(Request req) {
+        if (("execute".equals(req.op) || "execute-params".equals(req.op)) && req.params != null) {
+            Integer connId = req.intOrNull("conn-id");
+            if (connId != null) {
+                startingExecutions.put(req.id, new StartingExecution(connId));
+            }
+        }
+    }
+
+    /** Forget startup state once an accepted request has settled or been rejected. */
+    public void finishRequest(Request req) {
+        startingExecutions.remove(req.id);
     }
 
     /** Route {@code req} to the appropriate handler and return its response. */
@@ -411,8 +439,14 @@ public class Dispatcher {
 
     private Response cancel(Request req) {
         int connId = req.getInt("conn-id");
+        Integer target = req.getOptionalInt("request-id");
+        StartingExecution starting = target == null ? null : startingExecutions.get(target);
+        if (starting != null && starting.connId() == connId && starting.claim()) {
+            return Response.ok(req.id, Map.of(
+                "conn-id", connId, "request-id", target, "cancelled", true));
+        }
         RunningStatement running = runningStatements.get(connId);
-        if (running == null) {
+        if (running == null || (target != null && target != running.requestId())) {
             return Response.ok(req.id, Map.of("conn-id", connId, "cancelled", false));
         }
         try {
@@ -517,11 +551,15 @@ public class Dispatcher {
         try {
             stmt.setQueryTimeout(executeTimeout);
             running = beginRunningStatement(connId, req.id, stmt);
+            StartingExecution starting = startingExecutions.get(req.id);
             CountDownLatch workerFinished = new CountDownLatch(1);
             Future<Boolean> future;
             try {
                 future = executePool.submit(() -> {
                     try {
+                        if (starting != null && !starting.claim()) {
+                            throw new CancellationException("Query cancelled before execution");
+                        }
                         return executeAction.call();
                     } finally {
                         if (cleanupOnWorkerExit.get()) {
@@ -548,6 +586,9 @@ public class Dispatcher {
                     "timeout", e, connId);
             } catch (ExecutionException e) {
                 Throwable cause = e.getCause();
+                if (cause instanceof CancellationException cancelled) {
+                    return errorResponse(req, cancelled.getMessage(), "cancel", cancelled, connId);
+                }
                 if (running.cancelRequested() && cause instanceof SQLException sqlException) {
                     poisonOnConnectionFailure(connId, sqlException);
                     return errorResponse(req, sqlException.getMessage(), "cancel", sqlException, connId);

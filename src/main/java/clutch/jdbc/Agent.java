@@ -122,9 +122,11 @@ public class Agent {
                 continue;
             }
 
+            dispatcher.registerRequest(req);
             try {
                 requestPool.submit(() -> handleRequest(dispatcher, mapper, out, req));
             } catch (RejectedExecutionException e) {
+                dispatcher.finishRequest(req);
                 LOG.log(System.Logger.Level.WARNING,
                         "Rejecting request {0}: request pool saturated",
                         req.id);
@@ -165,6 +167,8 @@ public class Agent {
                         "Error writing error response for request {0}: {1}",
                         req.id, ioException.getMessage());
             }
+        } finally {
+            dispatcher.finishRequest(req);
         }
     }
 
