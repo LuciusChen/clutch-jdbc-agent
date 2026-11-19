@@ -20,8 +20,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -277,6 +279,74 @@ class AgentProtocolIntegrationTest {
             }
         }
         assertEquals(surplus, overloaded);
+    }
+
+    @Test
+    void cancelStopsAnExecuteWhoseWorkerHasNotDispatchedItYet() throws Exception {
+        Class.forName("org.h2.Driver");
+        ObjectMapper mapper = new ObjectMapper();
+        ConnectionManager connections = new ConnectionManager();
+        CountDownLatch cancelled = new CountDownLatch(1);
+        Dispatcher dispatcher = new Dispatcher(connections, new CursorManager()) {
+            @Override
+            public Response dispatch(Request request) {
+                if (request.id == 3) {
+                    try {
+                        if (!cancelled.await(5, TimeUnit.SECONDS)) {
+                            return Response.error(request.id, "Cancel did not dispatch");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return Response.error(request.id, "Test worker interrupted");
+                    }
+                }
+                try {
+                    return super.dispatch(request);
+                } finally {
+                    if (request.id == 4) cancelled.countDown();
+                }
+            }
+        };
+        ExecutorService pool = Agent.newRequestPool();
+        try {
+            JsonNode connect = roundTrip(mapper, dispatcher, """
+                {"id":1,"op":"connect","params":{
+                  "url":"jdbc:h2:mem:earlycancel","driver-class":"org.h2.Driver",
+                  "user":"sa","password":"","auto-commit":true}}
+                """);
+            assertTrue(connect.path("ok").asBoolean(), connect::toString);
+            int connId = connect.path("result").path("conn-id").asInt();
+            try (var stmt = connections.getPrimary(connId).createStatement()) {
+                stmt.execute("CREATE TABLE markers (id INT)");
+                ByteArrayOutputStream sink = new ByteArrayOutputStream();
+                Agent.serve(new BufferedReader(new StringReader("""
+                    {"id":3,"op":"execute","params":{"conn-id":%d,"sql":"INSERT INTO markers VALUES (1)"}}
+                    {"id":4,"op":"cancel","params":{"conn-id":%d,"request-id":3}}
+                    """.formatted(connId, connId))), sink, mapper, dispatcher, pool);
+                Agent.awaitInFlightRequests(pool);
+
+                Map<Integer, JsonNode> replies = new HashMap<>();
+                for (String line : sink.toString(StandardCharsets.UTF_8).split("\n")) {
+                    JsonNode reply = mapper.readTree(line);
+                    assertNull(replies.put(reply.path("id").asInt(), reply), line);
+                }
+                assertEquals(Set.of(0, 3, 4), replies.keySet());
+                JsonNode cancel = replies.get(4).path("result");
+                assertTrue(cancel.path("cancelled").asBoolean(), () -> replies.get(4).toString());
+                assertEquals(3, cancel.path("request-id").asInt());
+                JsonNode execute = replies.get(3);
+                assertFalse(execute.path("ok").asBoolean(), execute::toString);
+                assertEquals("cancel", execute.path("diag").path("category").asText(), execute::toString);
+                try (var rows = stmt.executeQuery("SELECT COUNT(*) FROM markers")) {
+                    assertTrue(rows.next());
+                    assertEquals(0, rows.getInt(1));
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+            connections.disconnectAll();
+            dispatcher.shutdown();
+        }
     }
 
     @Test
