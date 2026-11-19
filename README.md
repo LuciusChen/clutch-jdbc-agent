@@ -3,22 +3,6 @@
 A minimal JVM sidecar process that bridges [clutch](https://github.com/LuciusChen/clutch)
 (an Emacs database client) to JDBC-compatible databases.
 
-clutch has pure Elisp backends for MySQL, PostgreSQL, and SQLite.
-For everything else — Oracle, SQL Server, DB2, Snowflake, Amazon Redshift, and
-any other database with a JDBC driver — `clutch-db-jdbc.el` delegates to this
-agent over a simple JSON protocol on stdin/stdout.
-
-## Supported Databases
-
-| Database             | Driver                          | Auto-install via Maven |
-|----------------------|---------------------------------|------------------------|
-| Oracle Database      | `ojdbc8` (default) / `ojdbc11`  | Yes                    |
-| Microsoft SQL Server | `mssql-jdbc` (Microsoft)        | Yes                    |
-| Amazon Redshift      | `redshift-jdbc` (AWS)           | Yes                    |
-| Snowflake            | `snowflake-jdbc` (Snowflake)    | Yes                    |
-| IBM DB2              | `db2jcc4` (IBM)                 | No — manual download   |
-| Any JDBC database    | Place jar in `drivers/`         | —                      |
-
 ## Requirements
 
 - Java 17+
@@ -30,9 +14,7 @@ agent over a simple JSON protocol on stdin/stdout.
 mvn package
 ```
 
-Produces `target/clutch-jdbc-agent-<version>.jar` (fat jar with Jackson bundled).
-JDBC driver jars are **not** bundled — they are loaded at runtime from a
-`drivers/` directory next to the jar.
+Produces `target/clutch-jdbc-agent-<version>.jar` with Jackson bundled. See [Driver Setup](#driver-setup) for external JDBC jars.
 
 ## Usage
 
@@ -45,18 +27,7 @@ The agent is not meant to be invoked manually.
 (clutch-jdbc-install-driver 'oracle) ; downloads ojdbc8.jar + orai18n.jar from Maven Central
 ```
 
-Then connect as usual:
-
-```elisp
-(setq clutch-connection-alist
-      '(("prod-oracle" . (:backend oracle
-                           :host "db.corp.com" :port 1521
-                           :database "ORCL"
-                           :user "scott" :pass-entry "prod-oracle"))))
-```
-
-See the [Clutch JDBC backend guide](https://github.com/LuciusChen/clutch/blob/main/docs/jdbc-backend.org)
-for the full setup guide.
+The [Clutch JDBC backend guide](https://github.com/LuciusChen/clutch/blob/main/docs/jdbc-backend.org) lists supported drivers and connection options.
 
 ## Protocol
 
@@ -191,7 +162,7 @@ clutch-jdbc-agent (JVM process)
   drivers/*.jar           — JDBC drivers (loaded at runtime via URLClassLoader)
 ```
 
-The agent no longer runs requests on one global synchronous lane. The stdin loop parses requests and hands them to a small request pool. The dispatcher uses independent per-connection foreground and metadata locks, so ordinary queries and metadata may run in parallel without allowing two operations to race on either JDBC session. On Oracle a third, lazily opened bulk session carries schema-wide listings (`get-tables`, `get-sequences`, `get-procedures`, `get-functions`, and `get-indexes`/`get-triggers` without a `table`), so a listing that takes seconds on a large schema cannot hold the metadata session while an interactive lookup such as `get-primary-keys` waits; other products keep two sessions. A bulk session that a connection failure has made unusable is dropped and the listing retried once on a fresh one, without touching the metadata session, and a schema change drops it so the next listing reopens it with the remembered schema. The third session counts against the account's session limits; if Oracle refuses it, that connection stops using a bulk session and its schema-wide listings run on the metadata session, as on other products. Schema changes and disconnect acquire all locks in foreground-then-metadata-then-bulk order. If an idle timeout or Oracle `ORA-12592` makes the metadata session unsafe, the agent replaces only that session, restores the remembered schema, and retries the metadata request once; a failed retry or schema restore invalidates that replacement for the next request instead of reusing uncertain state. A metadata or bulk session idle for `validate-after-idle-seconds` is checked with `Connection.isValid(3)` before the request and replaced the same way when the check fails: a NAT or firewall that drops an idle connection leaves its socket silent, so a request on it would wait out the network timeout, and Clutch, whose request timeout is no longer, would retire the whole logical connection and its open transaction first. The primary transaction is untouched. `cancel` bypasses serialization. With a `request-id` it can stop an execute request before it starts. For a running statement it calls `Statement.cancel()` without tearing down the whole session.
+The dispatcher uses separate locks for foreground SQL and metadata. Oracle also gets a session for schema-wide listings. See the [runtime model](https://github.com/LuciusChen/clutch/blob/main/docs/jdbc-agent-protocol.md#runtime-model) for lock ordering, session recovery and cancellation.
 
 Savepoint operations are direct translations of the standard JDBC
 `Connection` API. `create-savepoint` rejects auto-commit sessions and checks
@@ -216,37 +187,10 @@ logical release: the agent forgets its opaque handle and the database discards
 the physical savepoint at the enclosing commit or rollback. Other release
 errors still propagate because their transaction outcome is not known.
 
-This is still intentionally much simpler than a fully async server: no
-connection pooling, no SQL rewriting, and no multi-statement scheduling inside
-one JDBC connection.
-
-For metadata recovery, a driver that does not implement `Connection.isValid`
-is treated as lacking that optional probe, not as having a dead session. A
-non-null, open metadata connection remains usable unless the triggering failure
-is itself classified as a connection failure.
-
 ## Driver Setup
 
 Drivers are loaded from `drivers/` next to `clutch-jdbc-agent.jar` at startup.
 Each jar is scanned via `ServiceLoader<java.sql.Driver>`.
-
-From Emacs:
-```elisp
-(clutch-jdbc-install-driver 'oracle)     ; → drivers/ojdbc8.jar + drivers/orai18n.jar
-(clutch-jdbc-install-driver 'oracle-11)  ; → drivers/ojdbc11.jar + drivers/orai18n.jar
-(clutch-jdbc-install-driver 'oracle-i18n); → drivers/orai18n.jar  (installed automatically for oracle)
-(clutch-jdbc-install-driver 'sqlserver)  ; → drivers/mssql-jdbc.jar
-(clutch-jdbc-install-driver 'snowflake)  ; → drivers/snowflake-jdbc.jar
-(clutch-jdbc-install-driver 'redshift)   ; → drivers/redshift-jdbc.jar
-```
-
-For DB2, download `db2jcc4.jar` from IBM manually and place it in the `drivers/`
-directory (`~/.emacs.d/clutch-jdbc/drivers/` by default).
-
-For Oracle, `clutch-jdbc-install-driver 'oracle` now chooses `ojdbc8` by
-default because it is the safest line across Oracle 11g/12c/19c. Installing
-`oracle` automatically removes a conflicting `ojdbc11.jar`; installing
-`oracle-11` does the inverse.
 
 ## License
 
