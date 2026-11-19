@@ -79,17 +79,22 @@ class TypeConverterTest {
 
     @Test
     void blobTextPreservesOriginalWhitespaceAndEncoding() {
-        for (String payload : new String[] {" \n{\"ok\":true}\t\n",
-                                           "\t<root>中文</root>\r\n"}) {
-            for (String encoding : new String[] {"UTF-8", "GB18030"}) {
-                byte[] bytes = payload.getBytes(Charset.forName(encoding));
-                Map<String, Object> converted = TypeConverter.blobBytesToMap(bytes, bytes.length);
-                assertEquals(payload, converted.get("text"));
-                assertEquals((long) bytes.length, converted.get("length"));
-                assertTrue(java.util.Arrays.equals(bytes,
-                    converted.get("text").toString().getBytes(
-                        Charset.forName(converted.get("encoding").toString()))));
-            }
+        String[][] cases = {
+            {"{\"hello\":1}", "UTF-8"},
+            {" \n{\"ok\":true}\t\n", "UTF-8"},
+            {"{\"head\":{\"name\":\"大王电扇\"}}", "GB18030"},
+            {"<root><name>demo</name></root>", "UTF-8"},
+            {"\t<root>中文</root>\r\n", "UTF-8"},
+            {"\t<root>中文</root>\r\n", "GB18030"}
+        };
+        for (String[] testCase : cases) {
+            String text = testCase[0];
+            String encoding = testCase[1];
+            byte[] bytes = text.getBytes(Charset.forName(encoding));
+            assertEquals(Map.of("__type", "blob", "length", (long) bytes.length,
+                                "text", text, "encoding", encoding,
+                                "preview-base64", Base64.getEncoder().encodeToString(bytes)),
+                         TypeConverter.blobBytesToMap(bytes, bytes.length));
         }
     }
 
@@ -132,62 +137,18 @@ class TypeConverterTest {
     }
 
     @Test
-    void blobBytesToMapIncludesJsonTextWhenUtf8PayloadLooksStructured() {
-        @SuppressWarnings("unchecked")
-        Map<String, Object> converted = (Map<String, Object>)
-            TypeConverter.blobBytesToMap("{\"hello\":1}".getBytes(java.nio.charset.StandardCharsets.UTF_8), 11L);
-
-        assertEquals("blob", converted.get("__type"));
-        assertEquals(11L, converted.get("length"));
-        assertEquals("{\"hello\":1}", converted.get("text"));
-        assertEquals("UTF-8", converted.get("encoding"));
-    }
-
-    @Test
-    void blobBytesToMapIncludesJsonTextWhenGb18030PayloadLooksStructured() {
-        String json = "{\"head\":{\"name\":\"大王电扇\"}}";
-        byte[] bytes = json.getBytes(Charset.forName("GB18030"));
-
-        @SuppressWarnings("unchecked")
-        Map<String, Object> converted = (Map<String, Object>)
-            TypeConverter.blobBytesToMap(bytes, bytes.length);
-
-        assertEquals("blob", converted.get("__type"));
-        assertEquals((long) bytes.length, converted.get("length"));
-        assertEquals(json, converted.get("text"));
-        assertEquals("GB18030", converted.get("encoding"));
-    }
-
-    @Test
-    void blobBytesToMapIncludesXmlTextWhenPayloadLooksStructured() {
-        String xml = "<root><name>demo</name></root>";
-
-        @SuppressWarnings("unchecked")
-        Map<String, Object> converted = (Map<String, Object>)
-            TypeConverter.blobBytesToMap(xml.getBytes(java.nio.charset.StandardCharsets.UTF_8), xml.length());
-
-        assertEquals("blob", converted.get("__type"));
-        assertEquals(xml, converted.get("text"));
-        assertEquals("UTF-8", converted.get("encoding"));
-    }
-
-    @Test
     void blobBytesToMapRejectsInvalidJsonText() {
         byte[] bytes = "{\"hello\":".getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
-        @SuppressWarnings("unchecked")
-        Map<String, Object> converted = (Map<String, Object>)
-            TypeConverter.blobBytesToMap(bytes, bytes.length);
+        var converted = TypeConverter.blobBytesToMap(bytes, bytes.length);
 
         assertEquals("blob", converted.get("__type"));
         assertFalse(converted.containsKey("text"));
     }
 
     @Test
-    void blobBytesToMapFallsBackToPlainPlaceholderForInvalidUtf8() {
-        @SuppressWarnings("unchecked")
-        Map<String, Object> converted = (Map<String, Object>)
-            TypeConverter.blobBytesToMap(new byte[]{(byte) 0xC3, 0x28}, 2L);
+    void blobBytesToMapFallsBackToBytePreviewForInvalidUtf8() {
+        var converted = TypeConverter.blobBytesToMap(new byte[]{(byte) 0xC3, 0x28}, 2L);
 
         assertEquals("blob", converted.get("__type"));
         assertEquals(2L, converted.get("length"));
