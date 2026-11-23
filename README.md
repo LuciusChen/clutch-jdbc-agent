@@ -27,7 +27,7 @@ The agent is not meant to be invoked manually.
 (clutch-jdbc-install-driver 'oracle) ; downloads ojdbc8.jar + orai18n.jar from Maven Central
 ```
 
-The [Clutch JDBC backend guide](https://github.com/LuciusChen/clutch/blob/main/docs/jdbc-backend.org) lists supported drivers and connection options.
+The [Clutch JDBC backend guide](https://github.com/LuciusChen/clutch/blob/main/docs/jdbc-backend.md) lists supported drivers and connection options.
 
 ## Protocol
 
