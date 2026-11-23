@@ -8,6 +8,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import java.io.InputStream;
 import java.lang.reflect.Proxy;
@@ -16,6 +17,7 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.sql.Blob;
 import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -706,6 +708,50 @@ class DispatcherTest {
             assertEquals(List.of(), resultMap(lookup).get("indexes"));
         } finally {
             dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "TEST_POSTGRES_URL", matches = ".+")
+    void postgresMetadataDescribesTheRequestedObject() throws Exception {
+        try (Connection conn = DriverManager.getConnection(System.getenv("TEST_POSTGRES_URL"));
+             Statement sql = conn.createStatement()) {
+            conn.setAutoCommit(false);
+            sql.execute("CREATE SCHEMA meta_a");
+            sql.execute("CREATE SCHEMA meta_b");
+            sql.execute("SET LOCAL search_path TO meta_a");
+            sql.execute("CREATE FUNCTION f(i int) RETURNS int LANGUAGE sql AS 'SELECT i'");
+            sql.execute("CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'");
+            for (String schema : List.of("meta_a", "meta_b")) {
+                sql.execute("CREATE VIEW " + schema + ".\"Mixed View\" AS SELECT '" + schema + "'::text AS owner");
+                sql.execute("CREATE TABLE " + schema + ".items (id int)");
+                sql.execute("CREATE TRIGGER changed BEFORE INSERT ON " + schema + ".items "
+                    + "FOR EACH ROW EXECUTE FUNCTION touch()");
+            }
+
+            RecordingConnectionManager manager = new RecordingConnectionManager();
+            manager.metadataConnection = conn;
+            Response view = dispatch(manager, 1, "get-object-ddl", "conn-id", 7,
+                "schema", "meta_b", "type", "VIEW", "name", "Mixed View");
+            assertTrue(view.ok, view.error);
+            assertTrue(resultMap(view).get("ddl").toString().contains("'meta_b'"));
+            Response function = dispatch(manager, 2, "get-function-params", "conn-id", 7,
+                "schema", "meta_a", "name", "f");
+            assertTrue(function.ok, function.error);
+            List<Map<String, Object>> params = resultList(function, "params");
+            assertEquals("RETURN", params.get(0).get("mode"));
+            for (String schema : List.of("meta_a", "meta_b")) {
+                Response triggers = dispatch(manager, 3, "get-triggers", "conn-id", 7,
+                    "schema", schema, "table", "items");
+                assertTrue(triggers.ok, triggers.error);
+                List<Map<String, Object>> entries = resultList(triggers, "triggers");
+                try (ResultSet rs = sql.executeQuery("SELECT oid FROM pg_trigger WHERE tgname = 'changed'"
+                        + " AND tgrelid = '" + schema + ".items'::regclass")) {
+                    assertTrue(rs.next());
+                    assertEquals("OID:" + rs.getLong(1),
+                        entries.get(0).get("identity"));
+                }
+            }
         }
     }
 
