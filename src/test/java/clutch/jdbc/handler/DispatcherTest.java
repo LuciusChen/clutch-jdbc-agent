@@ -3503,6 +3503,7 @@ class DispatcherTest {
 
     private static Stream<Arguments> executeDmlCases() {
         return Stream.of(
+            Arguments.of("-- init\nBEGIN NULL; END;", 5, 0, "-- init\nBEGIN NULL; END;"),
             Arguments.of("update demo set x = 1;", 16, 17, "update demo set x = 1"),
             Arguments.of("DELETE FROM audit_log WHERE id = 99;;", 5, 2, "DELETE FROM audit_log WHERE id = 99"),
             Arguments.of("DELETE FROM staging", 0, 4, "DELETE FROM staging")
@@ -3774,6 +3775,7 @@ class DispatcherTest {
             (_proxy, method, _args) -> switch (method.getName()) {
                 case "isValid"         -> true;
                 case "createStatement" -> stmt.proxy();
+                case "getMetaData" -> new OracleMetadataRecorder().connection().getMetaData();
                 case "unwrap"          -> null;
                 case "isWrapperFor"    -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
