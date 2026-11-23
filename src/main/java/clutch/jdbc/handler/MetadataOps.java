@@ -1613,28 +1613,28 @@ final class MetadataOps {
                 conn,
                 "SELECT pg_get_indexdef(i.oid) " +
                     "FROM pg_class i JOIN pg_namespace n ON n.oid = i.relnamespace " +
-                    "WHERE i.relkind = 'i' AND i.relname = ? AND n.nspname = current_schema()",
-                name);
+                    "WHERE i.relkind = 'i' AND i.relname = ? AND n.nspname = COALESCE(?, current_schema())",
+                name, schema);
             case "VIEW" -> querySingleString(
                 conn,
-                "SELECT 'CREATE OR REPLACE VIEW ' || quote_ident(viewname) || E' AS\\n' || " +
-                    "pg_get_viewdef((quote_ident(schemaname) || ''.'' || quote_ident(viewname))::regclass, true) " +
-                    "FROM pg_views WHERE schemaname = current_schema() AND viewname = ?",
-                name);
+                "SELECT format('CREATE OR REPLACE VIEW %I.%I AS', schemaname, viewname) || E'\\n' || definition " +
+                    "FROM pg_catalog.pg_views WHERE viewname = ? AND schemaname = COALESCE(?, current_schema())",
+                name, schema);
             case "SEQUENCE" -> querySingleString(
                 conn,
                 "SELECT format('CREATE SEQUENCE %I.%I INCREMENT BY %s MINVALUE %s MAXVALUE %s START WITH %s;', " +
                     "schemaname, sequencename, increment_by, min_value, max_value, start_value) " +
-                    "FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = ?",
-                name);
+                    "FROM pg_sequences WHERE sequencename = ? AND schemaname = COALESCE(?, current_schema())",
+                name, schema);
             case "TRIGGER" -> getDialectObjectSource(conn, schema, name, type, identity);
             default -> null;
         };
     }
 
-    private String querySingleString(Connection conn, String sql, String value) throws SQLException {
+    private String querySingleString(Connection conn, String sql, String value, String schema) throws SQLException {
         try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
             ps.setString(1, value);
+            ps.setString(2, schema == null || schema.isBlank() ? null : schema);
             try (ResultSet rs = ps.executeQuery()) {
                 return rs.next() ? rs.getString(1) : null;
             }
@@ -1738,7 +1738,7 @@ final class MetadataOps {
                    t.action_timing, pg_t.oid
             FROM information_schema.triggers t
             JOIN pg_class c ON c.relname = t.event_object_table
-            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = t.event_object_schema
             JOIN pg_trigger pg_t ON pg_t.tgrelid = c.oid
                                 AND pg_t.tgname = t.trigger_name
             WHERE t.trigger_schema = %s
@@ -1885,21 +1885,14 @@ final class MetadataOps {
     }
 
     private String routinesColumnMode(int columnType, boolean procedures) {
-        if (columnType == DatabaseMetaData.procedureColumnIn
-            || columnType == DatabaseMetaData.functionColumnIn) {
-            return "IN";
-        }
-        if (columnType == DatabaseMetaData.procedureColumnInOut
-            || columnType == DatabaseMetaData.functionColumnInOut) {
+        if (columnType == (procedures ? DatabaseMetaData.procedureColumnInOut : DatabaseMetaData.functionColumnInOut)) {
             return "INOUT";
         }
-        if (columnType == DatabaseMetaData.procedureColumnOut
-            || columnType == DatabaseMetaData.functionColumnOut) {
+        if (columnType == (procedures ? DatabaseMetaData.procedureColumnOut : DatabaseMetaData.functionColumnOut)) {
             return "OUT";
         }
-        if (columnType == DatabaseMetaData.procedureColumnReturn
-            || columnType == DatabaseMetaData.functionReturn
-            || columnType == DatabaseMetaData.functionColumnResult) {
+        if (columnType == (procedures ? DatabaseMetaData.procedureColumnReturn : DatabaseMetaData.functionReturn)
+                || columnType == (procedures ? DatabaseMetaData.procedureColumnResult : DatabaseMetaData.functionColumnResult)) {
             return "RETURN";
         }
         return "IN";

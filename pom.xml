@@ -35,6 +35,12 @@
       <version>2.3.232</version>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <version>42.7.9</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
