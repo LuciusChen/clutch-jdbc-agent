@@ -1912,7 +1912,7 @@ final class MetadataOps {
         return identity.substring("OID:".length());
     }
 
-    private boolean isOracle(Connection conn) throws SQLException {
+    static boolean isOracle(Connection conn) throws SQLException {
         String productName = conn.getMetaData().getDatabaseProductName();
         return productName != null && productName.toLowerCase(Locale.ROOT).contains("oracle");
     }

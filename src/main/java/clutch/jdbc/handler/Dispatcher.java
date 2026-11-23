@@ -37,6 +37,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.regex.Pattern;
 
 /**
  * Routes incoming requests to the appropriate handler method.
@@ -45,6 +46,15 @@ import java.util.concurrent.locks.ReentrantLock;
 public class Dispatcher {
 
     private static final System.Logger LOG = System.getLogger(Dispatcher.class.getName());
+
+    // SQL*Plus removes the slash from a PL/SQL unit, but END; belongs to the driver.
+    private static final String TRIVIA = "(?:\\s++|--[^\\r\\n]*+|/\\*.*?\\*/)*+";
+    private static final Pattern PLSQL_UNIT = Pattern.compile(
+        TRIVIA + "(?:<<|(?:BEGIN|DECLARE)\\b|CREATE\\b" + TRIVIA
+        + "(?:OR\\b" + TRIVIA + "REPLACE\\b" + TRIVIA + ")?"
+        + "(?:(?:NON)?EDITIONABLE\\b" + TRIVIA + ")?"
+        + "(?:PROCEDURE|FUNCTION|PACKAGE|TRIGGER|TYPE)\\b)",
+        Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
     private static final int DEFAULT_FETCH_SIZE = 500;
     private static final int MAX_FETCH_SIZE = 10_000;
@@ -499,7 +509,7 @@ public class Dispatcher {
 
     private Response execute(Request req) throws Exception {
         int connId = req.getInt("conn-id");
-        String sql = normalizedSql(req);
+        String input = req.getString("sql");
         int fetchSize = getFetchSize(req);
         int executeTimeout = getQueryTimeout(req);
 
@@ -508,6 +518,7 @@ public class Dispatcher {
             return preflightFailure;
         }
         Connection conn = connMgr.getPrimary(connId);
+        String sql = normalizedSql(conn, input);
         Statement stmt = conn.createStatement();
         return executeStatement(
             req, connId, stmt, () -> stmt.execute(sql), fetchSize, executeTimeout, null);
@@ -515,7 +526,7 @@ public class Dispatcher {
 
     private Response executeParams(Request req) throws Exception {
         int connId = req.getInt("conn-id");
-        String sql = normalizedSql(req);
+        String input = req.getString("sql");
         int fetchSize = getFetchSize(req);
         int executeTimeout = getQueryTimeout(req);
         List<?> values = preparedValues(req);
@@ -524,6 +535,7 @@ public class Dispatcher {
             return preflightFailure;
         }
         Connection conn = connMgr.getPrimary(connId);
+        String sql = normalizedSql(conn, input);
         PreparedStatement stmt = conn.prepareStatement(sql);
         List<Blob> blobsToFree = new ArrayList<>();
         try {
@@ -669,8 +681,12 @@ public class Dispatcher {
         }
     }
 
-    private String normalizedSql(Request req) {
-        return req.getString("sql").stripTrailing().replaceAll(";+$", "");
+    private String normalizedSql(Connection conn, String input) throws SQLException {
+        String sql = input.stripTrailing();
+        if (!sql.endsWith(";") || (PLSQL_UNIT.matcher(sql).lookingAt() && MetadataOps.isOracle(conn))) {
+            return sql;
+        }
+        return sql.replaceAll(";+$", "");
     }
 
     private List<?> preparedValues(Request req) {
