@@ -154,16 +154,16 @@ public class Dispatcher {
             }
             if (requestUsesAllConnectionLocks(req)) {
                 return withAllConnectionLocks(
-                    connId, lockedAction(req, CursorManager.Lane.METADATA));
+                    connId, lockedAction(req, connId, CursorManager.Lane.METADATA));
             }
             CursorManager.Lane lane = requestLane(req);
             try {
-                return withConnectionLock(connId, lane, lockedAction(req, lane));
+                return withConnectionLock(connId, lane, lockedAction(req, connId, lane));
             } catch (ConnectionManager.BulkSessionUnavailable unavailable) {
                 // The bulk logon was refused, by this request or while it waited
                 // for the lock; the connection now lists on its metadata session.
                 return withConnectionLock(connId, CursorManager.Lane.METADATA,
-                    lockedAction(req, CursorManager.Lane.METADATA));
+                    lockedAction(req, connId, CursorManager.Lane.METADATA));
             }
         } catch (Exception e) {
             return errorResponse(req, e);
@@ -232,14 +232,20 @@ public class Dispatcher {
         return null;
     }
 
-    private Callable<Response> lockedAction(Request req, CursorManager.Lane lane) {
+    private Callable<Response> lockedAction(Request req, int connId, CursorManager.Lane lane) {
         return () -> {
+            Response reply;
             try {
-                return dispatchUnlocked(req, lane);
+                reply = dispatchUnlocked(req, lane);
             } catch (Exception error) {
                 poisonOnPrimaryConnectionFailure(req, error);
-                throw error;
+                if (lane != CursorManager.Lane.PRIMARY) throw error;
+                reply = errorResponse(req, error);
             }
+            // Statement/cursor cleanup has consumed any trailing database change.
+            // Sample before another foreground request can acquire the lane.
+            if (lane == CursorManager.Lane.PRIMARY) reply.catalog = connMgr.sqlServerCatalog(connId);
+            return reply;
         };
     }
 
@@ -374,8 +380,15 @@ public class Dispatcher {
         int connId = connMgr.connect(url, user, password, props,
             connectTimeoutSeconds, networkTimeoutSeconds, validateAfterIdleSeconds,
             autoCommit, driverClass);
-        if (url.toLowerCase(Locale.ROOT).startsWith("jdbc:sqlserver:")) {
-            return Response.ok(req.id, Map.of("conn-id", connId, "describe-source-columns", true));
+        String catalog;
+        try {
+            catalog = connMgr.sqlServerCatalog(connId);
+        } catch (SQLException error) {
+            connMgr.disconnect(connId);
+            throw error;
+        }
+        if (catalog != null) {
+            return Response.ok(req.id, Map.of("conn-id", connId, "describe-source-columns", true, "catalog", catalog));
         }
         return Response.ok(req.id, Map.of("conn-id", connId));
     }

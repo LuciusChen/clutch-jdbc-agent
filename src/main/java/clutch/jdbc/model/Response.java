@@ -25,6 +25,10 @@ public class Response {
     @JsonProperty("result")
     public Object result;
 
+    /** SQL Server's current database after a foreground request settles. */
+    @JsonProperty("catalog")
+    public String catalog;
+
     /** Present on error. */
     @JsonProperty("error")
     public String error;
