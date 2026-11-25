@@ -374,6 +374,9 @@ public class Dispatcher {
         int connId = connMgr.connect(url, user, password, props,
             connectTimeoutSeconds, networkTimeoutSeconds, validateAfterIdleSeconds,
             autoCommit, driverClass);
+        if (url.toLowerCase(Locale.ROOT).startsWith("jdbc:sqlserver:")) {
+            return Response.ok(req.id, Map.of("conn-id", connId, "describe-source-columns", true));
+        }
         return Response.ok(req.id, Map.of("conn-id", connId));
     }
 

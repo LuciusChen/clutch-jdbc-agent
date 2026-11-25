@@ -119,6 +119,8 @@ context and a redacted Java stack trace.
 
 ### Operations
 
+SQL Server connections advertise `describe-source-columns` for looking up the physical columns of a projection on the metadata session. Describing a projection does not execute it.
+
 See the canonical [operation inventory and session contract](https://github.com/LuciusChen/clutch/blob/main/docs/jdbc-agent-protocol.md#core-operations).
 This includes lock-bypassing `force-disconnect` for retiring an unresponsive
 logical connection without blocking on driver cleanup.
