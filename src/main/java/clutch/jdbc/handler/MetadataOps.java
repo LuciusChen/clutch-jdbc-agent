@@ -27,7 +27,7 @@ final class MetadataOps {
 
     static final Set<String> SUPPORTED_OPS = Set.of(
         "get-schemas", "set-current-schema", "get-tables", "search-tables",
-        "get-columns", "search-columns", "get-primary-keys", "get-foreign-keys",
+        "get-columns", "search-columns", "describe-source-columns", "get-primary-keys", "get-foreign-keys",
         "get-referencing-objects", "get-referencing-keys", "get-indexes",
         "get-index-columns",
         "get-sequences", "get-procedures", "get-functions",
@@ -104,6 +104,7 @@ final class MetadataOps {
             case "search-tables" -> searchTables(req);
             case "get-columns" -> getColumns(req);
             case "search-columns" -> searchColumns(req);
+            case "describe-source-columns" -> describeSourceColumns(req);
             case "get-primary-keys" -> getPrimaryKeys(req);
             case "get-foreign-keys" -> getForeignKeys(req);
             case "get-referencing-objects" -> getReferencingObjects(req);
@@ -120,6 +121,23 @@ final class MetadataOps {
             case "get-triggers" -> getTriggers(req, lane);
             default -> throw new IllegalArgumentException("Unknown metadata op: " + req.op);
         };
+    }
+
+    private Response describeSourceColumns(Request req) throws SQLException {
+        Connection conn = connMgr.getMetadata(req.getInt("conn-id"));
+        // Browse mode 2 preserves the view's columns when the projection reads a view.
+        String sql = "SELECT source_column FROM sys.dm_exec_describe_first_result_set(?, NULL, 2) "
+            + "WHERE is_hidden = 0 ORDER BY column_ordinal";
+        List<String> names = new ArrayList<>();
+        try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setNString(1, req.getString("projection"));
+            try (ResultSet rows = stmt.executeQuery()) {
+                while (rows.next()) {
+                    names.add(rows.getString(1));
+                }
+            }
+        }
+        return Response.ok(req.id, Map.of("columns", names));
     }
 
     void restoreCurrentSchema(int connId) throws SQLException {

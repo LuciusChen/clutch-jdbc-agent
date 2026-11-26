@@ -231,6 +231,14 @@ public class ConnectionManager {
         return session.primary();
     }
 
+    /** The Microsoft driver tracks database changes locally as it consumes replies. */
+    public String sqlServerCatalog(int connId) throws SQLException {
+        Session session = connections.get(connId);
+        String prefix = "jdbc:sqlserver:";
+        return session != null && session.url.regionMatches(true, 0, prefix, 0, prefix.length())
+            ? session.primary().getCatalog() : null;
+    }
+
     /** Commit the primary transaction and invalidate its savepoint handles. */
     public void commit(int connId) throws SQLException {
         Session session = requireSession(connId);
