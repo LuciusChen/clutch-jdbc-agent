@@ -755,6 +755,18 @@ class DispatcherTest {
         }
     }
 
+    private static Connection connectionWithMetadata(DatabaseMetaData meta) {
+        return (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+    }
+
     /** A metadata connection whose getIndexInfo answers with no rows. */
     private static Connection connectionWithEmptyIndexInfo() {
         DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
@@ -768,15 +780,7 @@ class DispatcherTest {
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
-        return (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, _args) -> switch (method.getName()) {
-                case "getMetaData" -> meta;
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
+        return connectionWithMetadata(meta);
     }
 
     @Test
@@ -894,15 +898,7 @@ class DispatcherTest {
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
-        return (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, _args) -> switch (method.getName()) {
-                case "getMetaData" -> meta;
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
+        return connectionWithMetadata(meta);
     }
 
     /** A connection whose metadata getTables blocks until released, then returns no rows. */
@@ -924,15 +920,7 @@ class DispatcherTest {
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
-        return (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, _args) -> switch (method.getName()) {
-                case "getMetaData" -> meta;
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
+        return connectionWithMetadata(meta);
     }
 
     @Test
@@ -3840,15 +3828,7 @@ class DispatcherTest {
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
-        return (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, _args) -> switch (method.getName()) {
-                case "getMetaData" -> meta;
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
+        return connectionWithMetadata(meta);
     }
 
     private static Connection metadataConnection(
@@ -3890,15 +3870,7 @@ class DispatcherTest {
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
-        return (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, _args) -> switch (method.getName()) {
-                case "getMetaData" -> meta;
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
+        return connectionWithMetadata(meta);
     }
 
     private static Connection metadataConnectionBlockingFirstCall(
@@ -3923,15 +3895,7 @@ class DispatcherTest {
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
-        return (Connection) Proxy.newProxyInstance(
-            DispatcherTest.class.getClassLoader(),
-            new Class<?>[]{Connection.class},
-            (_proxy, method, _args) -> switch (method.getName()) {
-                case "getMetaData" -> meta;
-                case "unwrap" -> null;
-                case "isWrapperFor" -> false;
-                default -> throw new UnsupportedOperationException(method.getName());
-            });
+        return connectionWithMetadata(meta);
     }
 
     private static Connection oracleSchemaConnection(List<String> executedSql) {
