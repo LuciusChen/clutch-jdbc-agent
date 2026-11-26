@@ -3842,7 +3842,7 @@ class DispatcherTest {
     }
 
     @Test
-    void jdbcIndexesKeepRowsWhenDriverOmitsCatalogAndSchemaLikeSqlite() throws Exception {
+    void sqliteCatalogFilterMatchesMainAndRejectsUnknownCatalog() throws Exception {
         DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
             DispatcherTest.class.getClassLoader(),
             new Class<?>[]{DatabaseMetaData.class},
@@ -3852,21 +3852,51 @@ class DispatcherTest {
                     List.of("TABLE_CAT", "TABLE_SCHEM", "TYPE", "INDEX_NAME", "TABLE_NAME", "NON_UNIQUE"),
                     List.of(
                         java.util.Arrays.asList(null, null, DatabaseMetaData.tableIndexOther,
-                            "idx_items_code", "items", false)));
+                            "idx_t_label", "t", false)));
+                case "getColumns" -> resultSet(
+                    List.of("TABLE_CAT", "TABLE_SCHEM", "COLUMN_NAME", "TYPE_NAME", "NULLABLE", "COLUMN_DEF", "ORDINAL_POSITION"),
+                    List.of(
+                        java.util.Arrays.asList(null, null, "v", "INTEGER", DatabaseMetaData.columnNoNulls, null, 1),
+                        java.util.Arrays.asList(null, null, "label", "TEXT", DatabaseMetaData.columnNullable, null, 2)));
+                case "getPrimaryKeys" -> resultSet(
+                    List.of("TABLE_CAT", "TABLE_SCHEM", "COLUMN_NAME", "KEY_SEQ"),
+                    List.of(
+                        java.util.Arrays.asList(null, null, "v", (short) 1)));
                 default -> throw new UnsupportedOperationException(method.getName());
             });
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         connMgr.metadataConnection = connectionWithMetadata(meta);
 
-        Response resp = dispatch(connMgr, 60, "get-indexes",
-            "conn-id", 7, "catalog", "main", "table", "items");
-        assertTrue(resp.ok, resp.error);
-        List<Map<String, Object>> indexes = resultList(resp, "indexes");
-        assertEquals(1, indexes.size(),
-            "SQLite getIndexInfo returns NULL TABLE_CAT/TABLE_SCHEM even when catalog='main' is requested");
-        assertEquals("idx_items_code", indexes.get(0).get("name"));
-        assertEquals("items", indexes.get(0).get("table"));
-        assertEquals(true, indexes.get(0).get("unique"));
+        // Explicit catalog="main" hits indexes, columns, and primary keys on SQLite.
+        Response mainIdx = dispatch(connMgr, 60, "get-indexes", "conn-id", 7, "catalog", "main", "table", "t");
+        assertTrue(mainIdx.ok, mainIdx.error);
+        List<Map<String, Object>> mainIndexes = resultList(mainIdx, "indexes");
+        assertEquals(1, mainIndexes.size());
+        assertEquals("idx_t_label", mainIndexes.get(0).get("name"));
+
+        Response mainCols = dispatch(connMgr, 61, "get-columns", "conn-id", 7, "catalog", "main", "table", "t");
+        assertTrue(mainCols.ok, mainCols.error);
+        List<Map<String, Object>> mainColumns = resultList(mainCols, "columns");
+        assertEquals(2, mainColumns.size());
+        assertEquals("v", mainColumns.get(0).get("name"));
+        assertEquals("label", mainColumns.get(1).get("name"));
+
+        Response mainPks = dispatch(connMgr, 62, "get-primary-keys", "conn-id", 7, "catalog", "main", "table", "t");
+        assertTrue(mainPks.ok, mainPks.error);
+        assertEquals(List.of("v"), resultList(mainPks, "primary-keys"));
+
+        // Unknown catalog="missing_catalog" must stay empty across all metadata ops.
+        Response missingIdx = dispatch(connMgr, 63, "get-indexes", "conn-id", 7, "catalog", "missing_catalog", "table", "t");
+        assertTrue(missingIdx.ok, missingIdx.error);
+        assertEquals(List.of(), resultList(missingIdx, "indexes"));
+
+        Response missingCols = dispatch(connMgr, 64, "get-columns", "conn-id", 7, "catalog", "missing_catalog", "table", "t");
+        assertTrue(missingCols.ok, missingCols.error);
+        assertEquals(List.of(), resultList(missingCols, "columns"));
+
+        Response missingPks = dispatch(connMgr, 65, "get-primary-keys", "conn-id", 7, "catalog", "missing_catalog", "table", "t");
+        assertTrue(missingPks.ok, missingPks.error);
+        assertEquals(List.of(), resultList(missingPks, "primary-keys"));
     }
 
     @Test
@@ -4385,6 +4415,11 @@ class DispatcherTest {
                     Object value = rowCell(columns, rows.get(index[0]), args[0]);
                     lastValue[0] = value;
                     yield value == null ? (short) 0 : ((Number) value).shortValue();
+                }
+                case "getInt" -> {
+                    Object value = rowCell(columns, rows.get(index[0]), args[0]);
+                    lastValue[0] = value;
+                    yield value == null ? 0 : ((Number) value).intValue();
                 }
                 case "getBoolean" -> {
                     Object value = rowCell(columns, rows.get(index[0]), args[0]);

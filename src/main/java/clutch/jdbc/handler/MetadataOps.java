@@ -288,7 +288,7 @@ final class MetadataOps {
         List<List<Object>> rows = new ArrayList<>();
         try (ResultSet rs = meta.getTables(catalog, schema, "%", types)) {
             while (rs.next()) {
-                if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                if (!matchesRequestedCatalog(conn, rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
                     continue;
                 }
                 String tableSchema = Objects.toString(rs.getString("TABLE_SCHEM"), "");
@@ -342,7 +342,7 @@ final class MetadataOps {
         List<Map<String, Object>> tables = new ArrayList<>();
         try (ResultSet rs = meta.getTables(catalog, schema, pattern, types)) {
             while (rs.next()) {
-                if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                if (!matchesRequestedCatalog(conn, rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
                     continue;
                 }
                 String tableSchema = Objects.toString(rs.getString("TABLE_SCHEM"), "");
@@ -507,7 +507,7 @@ final class MetadataOps {
         List<Map<String, Object>> cols = new ArrayList<>();
         try (ResultSet rs = meta.getColumns(catalog, schema, table, pattern)) {
             while (rs.next()) {
-                if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                if (!matchesRequestedCatalog(conn, rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
                     continue;
                 }
                 String name = rs.getString("COLUMN_NAME");
@@ -673,7 +673,7 @@ final class MetadataOps {
         int order = 0;
         try (ResultSet rs = conn.getMetaData().getPrimaryKeys(catalog, schema, table)) {
             while (rs.next()) {
-                if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                if (!matchesRequestedCatalog(conn, rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
                     continue;
                 }
                 short keySeq = optionalShortColumn(rs, "KEY_SEQ", Short.MAX_VALUE);
@@ -772,7 +772,7 @@ final class MetadataOps {
         List<KeyColumn> columns = new ArrayList<>();
         try (ResultSet rs = conn.getMetaData().getImportedKeys(catalog, schema, table)) {
             while (rs.next()) {
-                if (!matchesRequestedCatalog(rs, catalog, "FKTABLE_CAT", "FKTABLE_SCHEM")) {
+                if (!matchesRequestedCatalog(conn, rs, catalog, "FKTABLE_CAT", "FKTABLE_SCHEM")) {
                     continue;
                 }
                 String pkSchema = Objects.toString(rs.getString("PKTABLE_SCHEM"), "");
@@ -806,7 +806,7 @@ final class MetadataOps {
         List<KeyColumn> columns = new ArrayList<>();
         try (ResultSet rs = conn.getMetaData().getExportedKeys(catalog, schema, table)) {
             while (rs.next()) {
-                if (!matchesRequestedCatalog(rs, catalog, "PKTABLE_CAT", "PKTABLE_SCHEM")) {
+                if (!matchesRequestedCatalog(conn, rs, catalog, "PKTABLE_CAT", "PKTABLE_SCHEM")) {
                     continue;
                 }
                 String fkSchema = Objects.toString(rs.getString("FKTABLE_SCHEM"), "");
@@ -841,7 +841,7 @@ final class MetadataOps {
         Set<String> seen = new LinkedHashSet<>();
         try (ResultSet rs = conn.getMetaData().getExportedKeys(catalog, schema, table)) {
             while (rs.next()) {
-                if (!matchesRequestedCatalog(rs, catalog, "PKTABLE_CAT", "PKTABLE_SCHEM")) {
+                if (!matchesRequestedCatalog(conn, rs, catalog, "PKTABLE_CAT", "PKTABLE_SCHEM")) {
                     continue;
                 }
                 String name = rs.getString("FKTABLE_NAME");
@@ -1038,7 +1038,7 @@ final class MetadataOps {
         List<Map<String, Object>> tables = new ArrayList<>();
         try (ResultSet rs = meta.getTables(catalog, schema, "%", types)) {
             while (rs.next()) {
-                if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                if (!matchesRequestedCatalog(conn, rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
                     continue;
                 }
                 String tableSchema = Objects.toString(rs.getString("TABLE_SCHEM"), "");
@@ -1053,7 +1053,7 @@ final class MetadataOps {
         return tables;
     }
 
-    private boolean matchesRequestedCatalog(ResultSet rs, String requestedCatalog,
+    private boolean matchesRequestedCatalog(Connection conn, ResultSet rs, String requestedCatalog,
                                             String primaryColumnLabel, String fallbackColumnLabel)
             throws SQLException {
         if (requestedCatalog == null || requestedCatalog.isBlank()) {
@@ -1063,10 +1063,34 @@ final class MetadataOps {
         if (actualCatalog.isBlank()) {
             actualCatalog = Objects.toString(optionalStringColumn(rs, fallbackColumnLabel), "");
         }
-        if (actualCatalog.isBlank()) {
-            return true;
+        if (!actualCatalog.isBlank()) {
+            return actualCatalog.equalsIgnoreCase(requestedCatalog);
         }
-        return actualCatalog.equalsIgnoreCase(requestedCatalog);
+        // Only treat unattributed rows (null TABLE_CAT and TABLE_SCHEM) as belonging
+        // to the requested catalog when the connection's own default catalog matches
+        // it (for example SQLite's "main" database); unknown catalogs stay empty.
+        String fallbackCatalog = implicitMetadataCatalog(conn);
+        return fallbackCatalog != null && fallbackCatalog.equalsIgnoreCase(requestedCatalog);
+    }
+
+    private String implicitMetadataCatalog(Connection conn) {
+        try {
+            String currentCatalog = conn.getCatalog();
+            if (currentCatalog != null && !currentCatalog.isBlank()) {
+                return currentCatalog;
+            }
+        } catch (SQLException | RuntimeException ignored) {
+            // Fall through to product-specific default below.
+        }
+        try {
+            String product = conn.getMetaData().getDatabaseProductName();
+            if (product != null && product.toLowerCase(Locale.ROOT).contains("sqlite")) {
+                return "main";
+            }
+        } catch (SQLException | RuntimeException ignored) {
+            // No known default catalog.
+        }
+        return null;
     }
 
     private String tableComment(ResultSet rs) throws SQLException {
@@ -1136,7 +1160,7 @@ final class MetadataOps {
         for (String tableName : tables) {
             try (ResultSet rs = meta.getIndexInfo(catalog, schema, tableName, false, true)) {
                 while (rs.next()) {
-                    if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                    if (!matchesRequestedCatalog(conn, rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
                         continue;
                     }
                     short type = rs.getShort("TYPE");
@@ -1419,7 +1443,7 @@ final class MetadataOps {
                 ? meta.getProcedures(catalog, schema, "%")
                 : meta.getFunctions(catalog, schema, "%")) {
             while (rs.next()) {
-                if (!matchesRequestedCatalog(rs, catalog, catCol, schemCol)) {
+                if (!matchesRequestedCatalog(conn, rs, catalog, catCol, schemCol)) {
                     continue;
                 }
                 String name = procedures
