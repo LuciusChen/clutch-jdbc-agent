@@ -126,8 +126,9 @@ final class MetadataOps {
     private Response describeSourceColumns(Request req) throws SQLException {
         Connection conn = connMgr.getMetadata(req.getInt("conn-id"));
         // Browse mode 2 preserves the view's columns when the projection reads a view.
-        String sql = "SELECT source_column, is_hidden, error_number, error_message "
+        String sql = "SELECT source_column, error_number, error_message "
             + "FROM sys.dm_exec_describe_first_result_set(?, NULL, 2) "
+            + "WHERE is_hidden = 0 OR error_number IS NOT NULL OR error_message IS NOT NULL "
             + "ORDER BY column_ordinal";
         List<String> names = new ArrayList<>();
         try (PreparedStatement stmt = conn.prepareStatement(sql)) {
@@ -135,20 +136,16 @@ final class MetadataOps {
             try (ResultSet rows = stmt.executeQuery()) {
                 while (rows.next()) {
                     String sourceColumn = rows.getString(1);
-                    boolean hidden = rows.getBoolean(2);
-                    boolean hiddenNull = rows.wasNull();
-                    int errorNumber = rows.getInt(3);
+                    int errorNumber = rows.getInt(2);
                     boolean hasErrorNumber = !rows.wasNull();
-                    String errorMessage = rows.getString(4);
+                    String errorMessage = rows.getString(3);
                     if ((errorMessage != null && !errorMessage.isBlank()) || hasErrorNumber) {
                         throw new SQLException(
                             errorMessage != null && !errorMessage.isBlank() ? errorMessage
                                 : "Could not describe source columns (SQL Server error " + errorNumber + ")",
                             null, hasErrorNumber ? errorNumber : 0);
                     }
-                    if (!hiddenNull && !hidden) {
-                        names.add(sourceColumn);
-                    }
+                    names.add(sourceColumn);
                 }
             }
         }
