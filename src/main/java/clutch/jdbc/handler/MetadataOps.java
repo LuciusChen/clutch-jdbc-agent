@@ -36,6 +36,8 @@ final class MetadataOps {
 
     private static final int ORACLE_TABLES_TIMEOUT_SECONDS   = 15;
     private static final int ORACLE_METADATA_TIMEOUT_SECONDS = 5;
+    private static final int ORACLE_TABLES_FETCH_SIZE        = 1000;
+    private static final int ORACLE_METADATA_FETCH_SIZE      = 500;
     private static final List<String> ORACLE_SYSTEM_OWNERS = List.of(
         "SYS", "SYSTEM", "XDB", "MDSYS", "CTXSYS", "LBACSYS", "OLAPSYS",
         "WMSYS", "DBSNMP", "APPQOSSYS", "AUDSYS", "DVSYS",
@@ -244,6 +246,7 @@ final class MetadataOps {
         Integer cursorId = null;
         try {
             ps.setQueryTimeout(ORACLE_TABLES_TIMEOUT_SECONDS);
+            setFetchSizeQuietly(ps, ORACLE_TABLES_FETCH_SIZE);
             if (os.useUserTables()) {
                 ps.setString(1, os.owner());
                 ps.setString(2, os.owner());
@@ -257,11 +260,11 @@ final class MetadataOps {
                 ps.setString(2, os.owner());
             }
             ResultSet rs = ps.executeQuery();
-            rs.setFetchSize(1000);
+            setFetchSizeQuietly(rs, ORACLE_TABLES_FETCH_SIZE);
             cursorId = lane == CursorManager.Lane.BULK
                 ? cursorMgr.registerBulk(connId, ps, rs)
                 : cursorMgr.registerMetadata(connId, ps, rs);
-            CursorManager.FetchResult first = cursorMgr.fetch(cursorId, 1000);
+            CursorManager.FetchResult first = cursorMgr.fetch(cursorId, ORACLE_TABLES_FETCH_SIZE);
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("cursor-id", first.done() ? null : cursorId);
             result.put("columns", List.of("name", "type", "schema", "source_schema"));
@@ -419,8 +422,7 @@ final class MetadataOps {
                 """;
         }
         LinkedHashMap<String, Map<String, Object>> tablesByName = new LinkedHashMap<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             if (os.useUserTables()) {
                 ps.setString(1, os.owner());
                 ps.setString(2, os.owner());
@@ -541,8 +543,7 @@ final class MetadataOps {
             ORDER BY column_id
             """;
         List<Map<String, Object>> cols = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             ps.setString(1, table.toUpperCase(Locale.ROOT));
             ps.setString(2, columnPattern);
             try (ResultSet rs = ps.executeQuery()) {
@@ -566,8 +567,7 @@ final class MetadataOps {
             ORDER BY column_id
             """;
         List<Map<String, Object>> cols = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             ps.setString(1, owner.toUpperCase(Locale.ROOT));
             ps.setString(2, table.toUpperCase(Locale.ROOT));
             ps.setString(3, columnPattern);
@@ -593,8 +593,7 @@ final class MetadataOps {
             ORDER BY owner, column_id
             """;
         LinkedHashMap<String, Map<String, Object>> colsByName = new LinkedHashMap<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             ps.setString(1, table.toUpperCase(Locale.ROOT));
             ps.setString(2, columnPattern);
             try (ResultSet rs = ps.executeQuery()) {
@@ -618,8 +617,7 @@ final class MetadataOps {
             WHERE owner = 'PUBLIC'
               AND synonym_name = ?
             """;
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             ps.setString(1, name.toUpperCase(Locale.ROOT));
             ps.setString(2, name.toUpperCase(Locale.ROOT));
             try (ResultSet rs = ps.executeQuery()) {
@@ -670,14 +668,22 @@ final class MetadataOps {
     private List<String> getJdbcMetadataPrimaryKeys(Connection conn, String catalog,
                                                     String schema, String table)
             throws SQLException {
-        List<String> pks = new ArrayList<>();
+        record PkColumn(short keySeq, int order, String columnName) {}
+        List<PkColumn> rows = new ArrayList<>();
+        int order = 0;
         try (ResultSet rs = conn.getMetaData().getPrimaryKeys(catalog, schema, table)) {
             while (rs.next()) {
                 if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
                     continue;
                 }
-                pks.add(rs.getString("COLUMN_NAME"));
+                short keySeq = optionalShortColumn(rs, "KEY_SEQ", Short.MAX_VALUE);
+                rows.add(new PkColumn(keySeq, order++, rs.getString("COLUMN_NAME")));
             }
+        }
+        rows.sort(Comparator.comparingInt(PkColumn::keySeq).thenComparingInt(PkColumn::order));
+        List<String> pks = new ArrayList<>(rows.size());
+        for (PkColumn row : rows) {
+            pks.add(row.columnName());
         }
         return pks;
     }
@@ -708,8 +714,7 @@ final class MetadataOps {
                 """;
         }
         List<String> pks = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             int i = 1;
             if (!os.useUserTables()) {
                 ps.setString(i++, os.owner());
@@ -897,8 +902,7 @@ final class MetadataOps {
                 """;
         }
         List<Map<String, Object>> fks = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             int i = 1;
             if (!os.useUserTables()) {
                 ps.setString(i++, os.owner());
@@ -943,8 +947,7 @@ final class MetadataOps {
                 ORDER BY ac.owner, ac.table_name, ac.constraint_name, acc.position
                 """;
         List<Map<String, Object>> keys = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             ps.setString(1, os.owner());
             ps.setString(2, table);
             try (ResultSet rs = ps.executeQuery()) {
@@ -995,8 +998,7 @@ final class MetadataOps {
                 """;
         }
         List<Map<String, Object>> objects = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             int i = 1;
             if (!os.useUserTables()) {
                 ps.setString(i++, os.owner());
@@ -1092,8 +1094,7 @@ final class MetadataOps {
                 """;
         }
         List<Map<String, Object>> indexes = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             int i = 1;
             if (!os.useUserTables()) {
                 ps.setString(i++, os.owner());
@@ -1132,18 +1133,25 @@ final class MetadataOps {
         for (String tableName : tables) {
             try (ResultSet rs = meta.getIndexInfo(catalog, schema, tableName, false, true)) {
                 while (rs.next()) {
+                    if (!matchesRequestedCatalog(rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                        continue;
+                    }
                     short type = rs.getShort("TYPE");
                     String indexName = rs.getString("INDEX_NAME");
                     if (type == DatabaseMetaData.tableIndexStatistic || indexName == null) {
                         continue;
                     }
-                    String key = tableName + "\u0000" + indexName;
+                    String tableSchema = optionalStringColumn(rs, "TABLE_SCHEM");
+                    String effectiveSchema = (tableSchema != null && !tableSchema.isBlank())
+                        ? tableSchema : schema;
+                    String key = Objects.toString(effectiveSchema, "") + "\u0000"
+                        + tableName + "\u0000" + indexName;
                     if (seen.add(key)) {
                         indexes.add(entryMap(
                             "name", indexName,
                             "type", "INDEX",
-                            "schema", schema,
-                            "source-schema", schema,
+                            "schema", effectiveSchema,
+                            "source-schema", effectiveSchema,
                             "table", rs.getString("TABLE_NAME"),
                             "unique", !rs.getBoolean("NON_UNIQUE")
                         ));
@@ -1188,8 +1196,7 @@ final class MetadataOps {
                 """;
         }
         List<Map<String, Object>> columns = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             int i = 1;
             if (!os.useUserTables()) {
                 ps.setString(i++, os.owner());
@@ -1275,8 +1282,7 @@ final class MetadataOps {
                 """;
         }
         List<Map<String, Object>> sequences = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             if (!os.useUserTables()) {
                 ps.setString(1, os.owner());
             }
@@ -1378,8 +1384,7 @@ final class MetadataOps {
                 """;
         }
         List<Map<String, Object>> routines = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             int i = 1;
             if (!os.useUserTables()) {
                 ps.setString(i++, os.owner());
@@ -1405,19 +1410,27 @@ final class MetadataOps {
             throws SQLException {
         DatabaseMetaData meta = conn.getMetaData();
         List<Map<String, Object>> routines = new ArrayList<>();
+        String catCol = procedures ? "PROCEDURE_CAT" : "FUNCTION_CAT";
+        String schemCol = procedures ? "PROCEDURE_SCHEM" : "FUNCTION_SCHEM";
         try (ResultSet rs = procedures
                 ? meta.getProcedures(catalog, schema, "%")
                 : meta.getFunctions(catalog, schema, "%")) {
             while (rs.next()) {
+                if (!matchesRequestedCatalog(rs, catalog, catCol, schemCol)) {
+                    continue;
+                }
                 String name = procedures
                     ? rs.getString("PROCEDURE_NAME")
                     : rs.getString("FUNCTION_NAME");
                 String specificName = rs.getString("SPECIFIC_NAME");
+                String rowSchema = optionalStringColumn(rs, schemCol);
+                String effectiveSchema = (rowSchema != null && !rowSchema.isBlank())
+                    ? rowSchema : Objects.toString(schema, "");
                 routines.add(entryMap(
                     "name", name,
                     "type", procedures ? "PROCEDURE" : "FUNCTION",
-                    "schema", Objects.toString(schema, ""),
-                    "source-schema", Objects.toString(schema, ""),
+                    "schema", effectiveSchema,
+                    "source-schema", effectiveSchema,
                     "identity", specificName == null ? null : "SPECIFIC_NAME:" + specificName
                 ));
             }
@@ -1474,8 +1487,7 @@ final class MetadataOps {
                 """;
         }
         List<Map<String, Object>> params = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             int i = 1;
             if (!os.useUserTables()) {
                 ps.setString(i++, os.owner());
@@ -1569,8 +1581,7 @@ final class MetadataOps {
                 """;
         }
         StringBuilder source = new StringBuilder();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             int i = 1;
             if (!os.useUserTables()) {
                 ps.setString(i++, os.owner());
@@ -1590,8 +1601,7 @@ final class MetadataOps {
             throws SQLException {
         OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
         String sql = "SELECT DBMS_METADATA.GET_DDL(?, ?, ?) FROM DUAL";
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             ps.setString(1, type.toUpperCase(Locale.ROOT));
             ps.setString(2, name.toUpperCase(Locale.ROOT));
             ps.setString(3, os.owner());
@@ -1684,6 +1694,8 @@ final class MetadataOps {
                 return text.toString();
             } catch (java.io.IOException e) {
                 throw new SQLException("Failed reading CLOB", e);
+            } finally {
+                freeQuietly(clob);
             }
         }
         return rs.getString(column);
@@ -1721,8 +1733,7 @@ final class MetadataOps {
                 """;
         }
         List<Map<String, Object>> triggers = new ArrayList<>();
-        try (PreparedStatement ps = prepareTrackedStatement(conn, sql)) {
-            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+        try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
             int i = 1;
             if (!os.useUserTables()) {
                 ps.setString(i++, os.owner());
@@ -1855,6 +1866,59 @@ final class MetadataOps {
     private PreparedStatement prepareTrackedStatement(Connection conn, String sql) throws SQLException {
         recordGeneratedSql(sql);
         return conn.prepareStatement(sql);
+    }
+
+    private PreparedStatement prepareOracleStatement(Connection conn, String sql) throws SQLException {
+        PreparedStatement ps = prepareTrackedStatement(conn, sql);
+        try {
+            ps.setQueryTimeout(ORACLE_METADATA_TIMEOUT_SECONDS);
+            setFetchSizeQuietly(ps, ORACLE_METADATA_FETCH_SIZE);
+            return ps;
+        } catch (SQLException | RuntimeException e) {
+            closeStatementQuietly(ps);
+            throw e;
+        }
+    }
+
+    private void setFetchSizeQuietly(Statement stmt, int fetchSize) {
+        try {
+            stmt.setFetchSize(fetchSize);
+        } catch (SQLException | UnsupportedOperationException | AbstractMethodError ignored) {
+            // Optional prefetch hint; Oracle uses it to avoid 10-row round trips.
+        }
+    }
+
+    private void setFetchSizeQuietly(ResultSet rs, int fetchSize) {
+        try {
+            rs.setFetchSize(fetchSize);
+        } catch (SQLException | UnsupportedOperationException | AbstractMethodError ignored) {
+            // Optional driver hint.
+        }
+    }
+
+    private void freeQuietly(Clob clob) {
+        try {
+            clob.free();
+        } catch (SQLException | UnsupportedOperationException | AbstractMethodError ignored) {
+            // Optional JDBC 4 cleanup; releases Oracle temporary CLOB locators.
+        }
+    }
+
+    private short optionalShortColumn(ResultSet rs, String label, short fallback) {
+        try {
+            short value = rs.getShort(label);
+            return rs.wasNull() ? fallback : value;
+        } catch (SQLException | RuntimeException e) {
+            return fallback;
+        }
+    }
+
+    private String optionalStringColumn(ResultSet rs, String label) {
+        try {
+            return rs.getString(label);
+        } catch (SQLException | RuntimeException e) {
+            return null;
+        }
     }
 
     private void executeTrackedStatement(Connection conn, String sql) throws SQLException {

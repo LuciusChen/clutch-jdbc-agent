@@ -13,6 +13,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLTimeoutException;
 import java.sql.SQLWarning;
@@ -247,18 +248,31 @@ public class Dispatcher {
             // Sample before another foreground request can acquire the lane.
             if (lane == CursorManager.Lane.PRIMARY) {
                 String catalog = null;
-                boolean poisonedByCatalog = false;
+                boolean poisonedAfterAction = false;
                 try {
                     catalog = connMgr.sqlServerCatalog(connId);
                 } catch (SQLException catalogError) {
                     if (ConnectionManager.isConnectionFailure(catalogError)) {
                         poisonConnection(connId);
-                        poisonedByCatalog = true;
+                        poisonedAfterAction = true;
+                    }
+                }
+                if (!poisonedAfterAction && connMgr.hasConnection(connId)) {
+                    try {
+                        if (connMgr.isPrimaryClosed(connId)) {
+                            poisonConnection(connId);
+                            poisonedAfterAction = true;
+                        }
+                    } catch (SQLException closedError) {
+                        if (ConnectionManager.isConnectionFailure(closedError)) {
+                            poisonConnection(connId);
+                            poisonedAfterAction = true;
+                        }
                     }
                 }
                 if (failure != null) {
                     reply = errorResponse(req, failure);
-                } else if (poisonedByCatalog && connectionInvalidated(req, connId)) {
+                } else if (poisonedAfterAction && connectionInvalidated(req, connId)) {
                     if (reply.ok) {
                         reply.connectionInvalidated = Boolean.TRUE;
                     } else if (reply.diag instanceof Map<?, ?> diag) {
@@ -601,7 +615,8 @@ public class Dispatcher {
         AtomicBoolean cleanupDone = new AtomicBoolean(false);
         AtomicBoolean cleanupOnWorkerExit = new AtomicBoolean(false);
         try {
-            stmt.setQueryTimeout(executeTimeout);
+            setQueryTimeoutQuietly(stmt, executeTimeout);
+            setFetchSizeQuietly(stmt, fetchSize);
             running = beginRunningStatement(connId, req.id, stmt);
             StartingExecution starting = startingExecutions.get(req.id);
             CountDownLatch workerFinished = new CountDownLatch(1);
@@ -658,7 +673,7 @@ public class Dispatcher {
             }
 
             ResultSet rs = stmt.getResultSet();
-            rs.setFetchSize(fetchSize);
+            setFetchSizeQuietly(rs, fetchSize);
             cursorId = cursorMgr.register(connId, stmt, rs);
             CursorManager.FetchResult first;
             try {
@@ -1225,6 +1240,30 @@ public class Dispatcher {
         } catch (Exception e) {
             LOG.log(System.Logger.Level.WARNING,
                 "Failed to cancel JDBC statement after timeout", e);
+        }
+    }
+
+    private void setQueryTimeoutQuietly(Statement stmt, int timeoutSeconds) throws SQLException {
+        try {
+            stmt.setQueryTimeout(timeoutSeconds);
+        } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
+            // Outer awaitTask timeout + cancelStatementQuietly still enforce the deadline.
+        }
+    }
+
+    private void setFetchSizeQuietly(Statement stmt, int fetchSize) {
+        try {
+            stmt.setFetchSize(fetchSize);
+        } catch (SQLException | UnsupportedOperationException | AbstractMethodError ignored) {
+            // Fetch size is an optional driver prefetch hint; ResultSet fetchSize runs too.
+        }
+    }
+
+    private void setFetchSizeQuietly(ResultSet rs, int fetchSize) {
+        try {
+            rs.setFetchSize(fetchSize);
+        } catch (SQLException | UnsupportedOperationException | AbstractMethodError ignored) {
+            // Fetch size is an optional driver hint; CursorManager still bounds rows per batch.
         }
     }
 

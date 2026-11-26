@@ -1,13 +1,19 @@
 package clutch.jdbc;
 
 import java.io.File;
+import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.sql.Driver;
 import java.sql.DriverManager;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
+import java.util.ServiceConfigurationError;
 import java.util.ServiceLoader;
+import java.util.jar.JarFile;
 
 /**
  * Loads JDBC drivers from the drivers/ directory at runtime.
@@ -42,37 +48,67 @@ public class DriverLoader {
             return loaded;
         }
 
-        File[] jars = driversDir.listFiles(f -> f.getName().endsWith(".jar"));
+        File[] jars = driversDir.listFiles(f -> f.isFile() && f.getName().endsWith(".jar"));
         if (jars == null || jars.length == 0) {
             LOG.log(System.Logger.Level.INFO, "No driver jars found in {0}",
                     driversDir.getAbsolutePath());
             return loaded;
         }
+        Arrays.sort(jars, Comparator.comparing(File::getName));
 
-        URL[] urls = new URL[jars.length];
-        try {
-            for (int i = 0; i < jars.length; i++) {
-                urls[i] = jars[i].toURI().toURL();
-                LOG.log(System.Logger.Level.INFO, "Found driver jar: {0}", jars[i].getName());
+        List<URL> validUrls = new ArrayList<>(jars.length);
+        for (File jar : jars) {
+            if (!isReadableJar(jar)) {
+                continue;
             }
-        } catch (Exception e) {
-            LOG.log(System.Logger.Level.ERROR, "Failed to build driver URLs", e);
+            try {
+                validUrls.add(jar.toURI().toURL());
+                LOG.log(System.Logger.Level.INFO, "Found driver jar: {0}", jar.getName());
+            } catch (Exception e) {
+                LOG.log(System.Logger.Level.WARNING,
+                        "Skipping driver jar {0}: {1}", jar.getName(), e.getMessage());
+            }
+        }
+        if (validUrls.isEmpty()) {
             return loaded;
         }
 
-        URLClassLoader driverCL = new URLClassLoader(urls, ClassLoader.getSystemClassLoader());
+        URLClassLoader driverCL = new URLClassLoader(
+            validUrls.toArray(URL[]::new), ClassLoader.getSystemClassLoader());
 
         // ServiceLoader discovers Driver implementations declared in
         // META-INF/services/java.sql.Driver inside each jar.
+        // Iterate explicitly so one broken or incompatible driver provider
+        // never aborts loading remaining healthy drivers.
         ServiceLoader<Driver> sl = ServiceLoader.load(Driver.class, driverCL);
-        for (Driver driver : sl) {
+        Iterator<Driver> iterator = sl.iterator();
+        while (true) {
+            boolean hasNext;
+            try {
+                hasNext = iterator.hasNext();
+            } catch (ServiceConfigurationError | LinkageError | Exception e) {
+                LOG.log(System.Logger.Level.WARNING,
+                        "Skipping unusable driver provider entry: {0}", e.getMessage());
+                continue;
+            }
+            if (!hasNext) {
+                break;
+            }
+            Driver driver;
+            try {
+                driver = iterator.next();
+            } catch (ServiceConfigurationError | LinkageError | Exception e) {
+                LOG.log(System.Logger.Level.WARNING,
+                        "Failed to load driver provider: {0}", e.getMessage());
+                continue;
+            }
             try {
                 // Wrap in DriverShim so DriverManager accepts it.
                 DriverManager.registerDriver(new DriverShim(driver));
                 loaded.add(driver.getClass().getName());
                 LOG.log(System.Logger.Level.INFO, "Registered driver: {0}",
                         driver.getClass().getName());
-            } catch (Exception e) {
+            } catch (LinkageError | Exception e) {
                 LOG.log(System.Logger.Level.WARNING,
                         "Failed to register driver {0}: {1}",
                         driver.getClass().getName(), e.getMessage());
@@ -80,5 +116,15 @@ public class DriverLoader {
         }
 
         return loaded;
+    }
+
+    private static boolean isReadableJar(File jar) {
+        try (JarFile ignored = new JarFile(jar)) {
+            return true;
+        } catch (IOException | RuntimeException e) {
+            LOG.log(System.Logger.Level.WARNING,
+                    "Skipping unreadable driver jar {0}: {1}", jar.getName(), e.getMessage());
+            return false;
+        }
     }
 }

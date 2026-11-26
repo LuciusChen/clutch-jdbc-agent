@@ -16,6 +16,7 @@ import java.sql.Date;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Time;
 import java.sql.Timestamp;
 import java.util.Base64;
@@ -345,6 +346,52 @@ class TypeConverterTest {
             });
 
         assertEquals("text-value", TypeConverter.convert(rs, 1));
+    }
+
+    @Test
+    void convertFreesClobAndBlobLocatorsAfterReading() throws SQLException {
+        int[] clobFrees = {0};
+        Clob clob = (Clob) Proxy.newProxyInstance(
+            TypeConverterTest.class.getClassLoader(),
+            new Class<?>[]{Clob.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "length" -> 5L;
+                case "getSubString" -> "hello";
+                case "free" -> { clobFrees[0]++; yield null; }
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        @SuppressWarnings("unchecked")
+        Map<String, Object> clobResult = (Map<String, Object>) TypeConverter.convert(
+            resultSetReturning(clob), 1);
+        assertEquals("hello", clobResult.get("preview"));
+        assertEquals(1, clobFrees[0], "Clob locator must be freed after preview read");
+
+        int[] blobFrees = {0};
+        Blob smallBlob = (Blob) Proxy.newProxyInstance(
+            TypeConverterTest.class.getClassLoader(),
+            new Class<?>[]{Blob.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "length" -> 4L;
+                case "getBytes" -> new byte[]{1, 2, 3, 4};
+                case "free" -> { blobFrees[0]++; yield null; }
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        TypeConverter.convert(resultSetReturning(smallBlob), 1);
+        assertEquals(1, blobFrees[0], "inline Blob locator must be freed after reading bytes");
+
+        Blob largeBlob = (Blob) Proxy.newProxyInstance(
+            TypeConverterTest.class.getClassLoader(),
+            new Class<?>[]{Blob.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "length" -> (long) TypeConverter.MAX_INLINE_BINARY_BYTES + 1;
+                case "free" -> { blobFrees[0]++; throw new SQLFeatureNotSupportedException("no free"); }
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        @SuppressWarnings("unchecked")
+        Map<String, Object> largeResult = (Map<String, Object>) TypeConverter.convert(
+            resultSetReturning(largeBlob), 1);
+        assertEquals((long) TypeConverter.MAX_INLINE_BINARY_BYTES + 1, largeResult.get("length"));
+        assertEquals(2, blobFrees[0], "oversized Blob locator must still attempt free() and ignore unsupported");
     }
 
     private static ResultSet resultSetReturning(Object value) {

@@ -433,6 +433,99 @@ class ConnectionManagerTest {
     }
 
     @Test
+    void isConnectionFailureRecognizesOracleAndPostgresFatalErrorsWithoutFalsePositives() {
+        // Oracle session-death codes that arrive as plain SQLException (non-08* SQLState).
+        assertTrue(ConnectionManager.isConnectionFailure(
+            new SQLException("ORA-00028: your session has been killed", "61000", 28)));
+        assertTrue(ConnectionManager.isConnectionFailure(
+            new SQLException("ORA-01012: not logged on", "72000", 1012)));
+        assertTrue(ConnectionManager.isConnectionFailure(
+            new SQLException("ORA-02396: exceeded maximum idle time, please connect again", "61000", 2396)));
+        assertTrue(ConnectionManager.isConnectionFailure(
+            new SQLException("ORA-03113: end-of-file on communication channel", "72000", 3113)));
+        assertTrue(ConnectionManager.isConnectionFailure(
+            new SQLException("ORA-03114: not connected to ORACLE", "72000", 3114)));
+        assertTrue(ConnectionManager.isConnectionFailure(
+            new SQLException("ORA-03135: connection lost contact", "72000", 3135)));
+        assertTrue(ConnectionManager.isConnectionFailure(
+            new SQLException("ORA-17008: Closed Connection", "08003", 17008)));
+
+        // PostgreSQL server-initiated termination SQLStates.
+        assertTrue(ConnectionManager.isConnectionFailure(
+            new SQLException("FATAL: terminating connection due to administrator command", "57P01", 0)));
+        assertTrue(ConnectionManager.isConnectionFailure(
+            new SQLException("FATAL: terminating connection because of crash of another server process", "57P02", 0)));
+        assertTrue(ConnectionManager.isConnectionFailure(
+            new SQLException("FATAL: the database system is shutting down", "57P03", 0)));
+
+        // Must NOT falsely treat user cancellation or non-Oracle vendor code collisions as dead connections.
+        assertFalse(ConnectionManager.isConnectionFailure(
+            new SQLException("ERROR: canceling statement due to user request", "57014", 0)));
+        assertFalse(ConnectionManager.isConnectionFailure(
+            new SQLException("Error writing file (Errcode: 28 - No space left on device)", "HY000", 28)));
+        assertFalse(ConnectionManager.isConnectionFailure(
+            new SQLException("ORA-00942: table or view does not exist", "42000", 942)));
+    }
+
+    @Test
+    void reconnectMetadataDoesNotBlockPrimaryCommitAndClosesOnConcurrentPoison() throws Exception {
+        RecordingDriver driver = new RecordingDriver();
+        CountDownLatch reconnectStarted = new CountDownLatch(1);
+        CountDownLatch allowReconnectFinish = new CountDownLatch(1);
+        driver.onConnect = connectionNumber -> {
+            if (connectionNumber == 2) {
+                reconnectStarted.countDown();
+                try {
+                    assertTrue(allowReconnectFinish.await(5, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        DriverManager.registerDriver(driver);
+        ConnectionManager mgr = new ConnectionManager();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            int connId = mgr.connect("jdbc:test:metadata-reconnect-lock", "reader", "secret",
+                Map.of(), null, null, null, false, RecordingDriver.class.getName());
+
+            Future<Boolean> reconnect = executor.submit(() -> mgr.reconnectMetadataIfInvalid(
+                connId, new SQLRecoverableException("metadata connection lost", "08006")));
+
+            assertTrue(reconnectStarted.await(2, TimeUnit.SECONDS));
+
+            // Primary commit acquires synchronized(session); it must not stall behind
+            // metadata reconnect's network logon.
+            mgr.commit(connId);
+            assertEquals(1, driver.primaryCommitCalls);
+
+            // Poisoning the session while reconnect is in flight must close the replacement
+            // connection instead of leaking it.
+            mgr.poison(connId);
+            allowReconnectFinish.countDown();
+
+            assertThrows(SQLException.class, () -> {
+                try {
+                    reconnect.get(2, TimeUnit.SECONDS);
+                } catch (java.util.concurrent.ExecutionException e) {
+                    if (e.getCause() instanceof SQLException sqlEx) {
+                        throw sqlEx;
+                    }
+                    throw new RuntimeException(e.getCause());
+                }
+            });
+            awaitClosedCount(driver, 3);
+            assertEquals(3, driver.closedCount,
+                "primary, old metadata, and racing replacement metadata must all be closed");
+        } finally {
+            allowReconnectFinish.countDown();
+            executor.shutdownNow();
+            mgr.disconnectAll();
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
     void poisonRemovesLogicalConnectionBeforeAsynchronousCleanup() throws Exception {
         RecordingDriver driver = new RecordingDriver();
         DriverManager.registerDriver(driver);

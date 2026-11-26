@@ -31,6 +31,9 @@ final class DispatcherDiagnostics {
     private static final Pattern ORACLE_EMBEDDED_CREDENTIAL_PATTERN = Pattern.compile(
         "(?i)^(jdbc:oracle:[^:]+:)([^/@\\s]+)/([^@\\s]+)(@.*)$");
 
+    private static final Pattern AUTHORITY_CREDENTIAL_PATTERN = Pattern.compile(
+        "(://[^/?#@:\\s]+:)([^/?#@\\s]+)(@)");
+
     private static final Pattern URL_ASSIGNMENT_PATTERN = Pattern.compile(
         "([?&;:])([A-Za-z0-9_.-]+)(\\s*=\\s*)([^&;\\s]*)");
 
@@ -280,7 +283,8 @@ final class DispatcherDiagnostics {
             assignments.appendReplacement(rendered, Matcher.quoteReplacement(replacement));
         }
         assignments.appendTail(rendered);
-        String redacted = rendered.toString();
+        String redacted = AUTHORITY_CREDENTIAL_PATTERN.matcher(rendered.toString())
+            .replaceAll("$1<redacted>$3");
         Matcher oracleCredentials = ORACLE_EMBEDDED_CREDENTIAL_PATTERN.matcher(redacted);
         if (oracleCredentials.matches()) {
             return oracleCredentials.group(1) + oracleCredentials.group(2)
