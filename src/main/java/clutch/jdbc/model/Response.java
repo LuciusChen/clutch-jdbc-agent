@@ -29,6 +29,10 @@ public class Response {
     @JsonProperty("catalog")
     public String catalog;
 
+    /** Present as true when the agent retired the connection after a successful reply. */
+    @JsonProperty("connection-invalidated")
+    public Boolean connectionInvalidated;
+
     /** Present on error. */
     @JsonProperty("error")
     public String error;

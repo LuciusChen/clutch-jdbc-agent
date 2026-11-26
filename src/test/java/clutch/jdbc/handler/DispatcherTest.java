@@ -813,6 +813,7 @@ class DispatcherTest {
         Response okReply = dispatch(connMgr, 893, "execute", "conn-id", 7, "sql", "USE reporting");
         assertTrue(okReply.ok, okReply.error);
         assertEquals("reporting", okReply.catalog);
+        assertNull(okReply.connectionInvalidated);
 
         connMgr.connection = failingConn;
         Response errReply = dispatch(connMgr, 894, "execute", "conn-id", 7, "sql", "RAISERROR('x', 16, 1)");
@@ -826,6 +827,7 @@ class DispatcherTest {
         Response okDespiteProbeFailure = dispatch(connMgr, 895, "execute", "conn-id", 7, "sql", "SELECT 1");
         assertTrue(okDespiteProbeFailure.ok, okDespiteProbeFailure.error);
         assertNull(okDespiteProbeFailure.catalog);
+        assertNull(okDespiteProbeFailure.connectionInvalidated);
         assertFalse(connMgr.disconnected);
 
         connMgr.connection = failingConn;
@@ -846,32 +848,26 @@ class DispatcherTest {
         assertNull(killedReply.catalog);
         assertTrue(connMgr.disconnected, "08S01 from sqlServerCatalog must poison the dead session");
 
-        // A 08S01 catalog failure after a successful foreground query also retires the session.
+        // A 08S01 catalog failure after a successful foreground query keeps the result and marks invalidation.
         RecordingConnectionManager okThenDead = new RecordingConnectionManager();
         okThenDead.connection = okConn;
         okThenDead.sqlServerCatalogFailure = new SQLException("The connection is closed.", "08S01");
-        Response okBeforeDrop = dispatch(okThenDead, 898, "execute", "conn-id", 7, "sql", "SHUTDOWN");
+        Response okBeforeDrop = dispatch(okThenDead, 898, "execute", "conn-id", 7, "sql", "EXEC dbo.return_17_and_close");
         assertTrue(okBeforeDrop.ok, okBeforeDrop.error);
         assertNull(okBeforeDrop.catalog);
+        assertEquals(Boolean.TRUE, okBeforeDrop.connectionInvalidated);
         assertTrue(okThenDead.disconnected);
     }
 
     @Test
-    void describeSourceColumnsFiltersHiddenRowsAndPropagatesSqlServerErrors() throws Exception {
-        record DescribeRow(String sourceColumn, Boolean isHidden, Integer errorNumber, String errorMessage) {}
+    void describeSourceColumnsDecodesColumnsAndPropagatesSqlServerErrors() throws Exception {
         List<String> boundProjections = new ArrayList<>();
-        List<DescribeRow> serverRows = new ArrayList<>();
+        List<List<Object>> resultRows = new ArrayList<>();
         Connection metadataConn = (Connection) Proxy.newProxyInstance(
             DispatcherTest.class.getClassLoader(), new Class<?>[]{Connection.class},
             (_proxy, method, args) -> switch (method.getName()) {
                 case "prepareStatement" -> {
-                    String sql = ((String) args[0]).toLowerCase(java.util.Locale.ROOT);
-                    assertTrue(sql.contains("sys.dm_exec_describe_first_result_set(?, null, 2)"), sql);
-                    // Simulate SQL Server's WHERE clause so bare "WHERE is_hidden = 0" drops error rows.
-                    boolean hasWhere = sql.contains(" where ");
-                    boolean filtersHidden = sql.contains("is_hidden = 0");
-                    boolean keepsErrors = sql.contains("error_number is not null")
-                        || sql.contains("error_message is not null");
+                    assertTrue(((String) args[0]).contains("sys.dm_exec_describe_first_result_set(?, NULL, 2)"));
                     yield (PreparedStatement) Proxy.newProxyInstance(
                         DispatcherTest.class.getClassLoader(), new Class<?>[]{PreparedStatement.class},
                         (_ps, psMethod, psArgs) -> switch (psMethod.getName()) {
@@ -880,39 +876,30 @@ class DispatcherTest {
                                 boundProjections.add((String) psArgs[1]);
                                 yield null;
                             }
-                            case "executeQuery" -> {
-                                List<DescribeRow> visible = serverRows.stream()
-                                    .filter(r -> !hasWhere
-                                        || (filtersHidden && Boolean.FALSE.equals(r.isHidden()))
-                                        || (keepsErrors && (r.errorNumber() != null || r.errorMessage() != null)))
-                                    .toList();
-                                yield (ResultSet) Proxy.newProxyInstance(
-                                    DispatcherTest.class.getClassLoader(), new Class<?>[]{ResultSet.class},
-                                    new java.lang.reflect.InvocationHandler() {
-                                        int index = -1;
-                                        Object lastValue;
-                                        @Override
-                                        public Object invoke(Object _rs, java.lang.reflect.Method m, Object[] a) {
-                                            return switch (m.getName()) {
-                                                case "next" -> ++index < visible.size();
-                                                case "getString" -> {
-                                                    DescribeRow row = visible.get(index);
-                                                    lastValue = ((Integer) a[0]) == 1
-                                                        ? row.sourceColumn() : row.errorMessage();
-                                                    yield (String) lastValue;
-                                                }
-                                                case "getInt" -> {
-                                                    lastValue = visible.get(index).errorNumber();
-                                                    yield lastValue == null ? 0 : (Integer) lastValue;
-                                                }
-                                                case "wasNull" -> lastValue == null;
-                                                case "close", "unwrap" -> null;
-                                                case "isWrapperFor" -> false;
-                                                default -> throw new UnsupportedOperationException(m.getName());
-                                            };
-                                        }
-                                    });
-                            }
+                            case "executeQuery" -> (ResultSet) Proxy.newProxyInstance(
+                                DispatcherTest.class.getClassLoader(), new Class<?>[]{ResultSet.class},
+                                new java.lang.reflect.InvocationHandler() {
+                                    int index = -1;
+                                    Object lastValue;
+                                    @Override
+                                    public Object invoke(Object _rs, java.lang.reflect.Method m, Object[] a) {
+                                        return switch (m.getName()) {
+                                            case "next" -> ++index < resultRows.size();
+                                            case "getString" -> {
+                                                lastValue = resultRows.get(index).get(((Integer) a[0]) - 1);
+                                                yield (String) lastValue;
+                                            }
+                                            case "getInt" -> {
+                                                lastValue = resultRows.get(index).get(((Integer) a[0]) - 1);
+                                                yield lastValue == null ? 0 : (Integer) lastValue;
+                                            }
+                                            case "wasNull" -> lastValue == null;
+                                            case "close", "unwrap" -> null;
+                                            case "isWrapperFor" -> false;
+                                            default -> throw new UnsupportedOperationException(m.getName());
+                                        };
+                                    }
+                                });
                             case "close", "unwrap" -> null;
                             case "isWrapperFor" -> false;
                             default -> throw new UnsupportedOperationException(psMethod.getName());
@@ -926,11 +913,9 @@ class DispatcherTest {
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         connMgr.metadataConnection = metadataConn;
 
-        serverRows.addAll(List.of(
-            new DescribeRow("id", false, null, null),
-            new DescribeRow("internal_key", true, null, null),
-            new DescribeRow(null, false, null, null),
-            new DescribeRow("café", false, null, null)));
+        resultRows.add(java.util.Arrays.asList("id", null, null));
+        resultRows.add(java.util.Arrays.asList(null, null, null));
+        resultRows.add(java.util.Arrays.asList("café", null, null));
         Response ok = dispatch(connMgr, 899, "describe-source-columns",
             "conn-id", 7, "projection", "USE [sales]; SELECT [id], 1, [cafe] FROM [dbo].[users]");
         assertTrue(ok.ok, ok.error);
@@ -938,8 +923,8 @@ class DispatcherTest {
         assertEquals(List.of("USE [sales]; SELECT [id], 1, [cafe] FROM [dbo].[users]"), boundProjections);
         assertEquals(List.of(CursorManager.Lane.METADATA), connMgr.usedLanes);
 
-        serverRows.clear();
-        serverRows.add(new DescribeRow(null, null, 207, "Invalid column name 'no_such_column'."));
+        resultRows.clear();
+        resultRows.add(java.util.Arrays.asList(null, 207, "Invalid column name 'no_such_column'."));
         Response err = dispatch(connMgr, 900, "describe-source-columns",
             "conn-id", 7, "projection", "SELECT [no_such_column] FROM [dbo].[users]");
         assertFalse(err.ok, "SQL Server describe_first_result_set error row must fail the request");

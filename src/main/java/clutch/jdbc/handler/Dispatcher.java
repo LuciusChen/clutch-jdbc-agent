@@ -258,12 +258,14 @@ public class Dispatcher {
                 }
                 if (failure != null) {
                     reply = errorResponse(req, failure);
-                } else if (poisonedByCatalog && !reply.ok
-                           && connectionInvalidated(req, connId)
-                           && reply.diag instanceof Map<?, ?> diag) {
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> diagMap = (Map<String, Object>) diag;
-                    diagMap.put("connection-invalidated", Boolean.TRUE);
+                } else if (poisonedByCatalog && connectionInvalidated(req, connId)) {
+                    if (reply.ok) {
+                        reply.connectionInvalidated = Boolean.TRUE;
+                    } else if (reply.diag instanceof Map<?, ?> diag) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> diagMap = (Map<String, Object>) diag;
+                        diagMap.put("connection-invalidated", Boolean.TRUE);
+                    }
                 }
                 reply.catalog = catalog;
             }
