@@ -102,15 +102,22 @@ public class ConnectionManager {
         Connection primary = openConnection(url, p, connectTimeoutSeconds, driverClass);
         try {
             configurePrimaryConnection(primary, autoCommit);
-            Connection metadata = openConnection(url, p, connectTimeoutSeconds, driverClass);
+            String product = productName(primary);
+            Properties metadataProps = p;
+            if (isOracleProduct(product)) {
+                metadataProps = (Properties) p.clone();
+                // DATA_DEFAULT is LONG. Without this the driver fetches one column per trip.
+                metadataProps.putIfAbsent("useFetchSizeWithLongColumn", "true");
+            }
+            Connection metadata = openConnection(url, metadataProps, connectTimeoutSeconds, driverClass);
             try {
                 configureMetadataConnection(metadata, networkTimeoutSeconds);
                 int id = nextId.getAndIncrement();
                 connections.put(id, new Session(
-                    primary, metadata, url, p, connectTimeoutSeconds,
+                    primary, metadata, url, metadataProps, connectTimeoutSeconds,
                     networkTimeoutSeconds, driverClass,
                     validateAfterIdleMillis, clock.millis(),
-                    bulkProducts.test(productName(primary))));
+                    bulkProducts.test(product)));
                 return id;
             } catch (SQLException | RuntimeException e) {
                 closeQuietly(metadata);
@@ -469,7 +476,7 @@ public class ConnectionManager {
             return false;
         }
         Connection replacement = openConnection(
-            session.url, session.props, session.connectTimeoutSeconds,
+            session.url, session.metadataProps, session.connectTimeoutSeconds,
             session.driverClass);
         try {
             configureMetadataConnection(replacement, session.networkTimeoutSeconds);
@@ -549,7 +556,7 @@ public class ConnectionManager {
         Connection bulk;
         try {
             bulk = openConnection(
-                session.url, session.props, session.connectTimeoutSeconds,
+                session.url, session.metadataProps, session.connectTimeoutSeconds,
                 session.driverClass);
             try {
                 configureMetadataConnection(bulk, session.networkTimeoutSeconds);
@@ -787,7 +794,7 @@ public class ConnectionManager {
         private volatile Connection bulk;
         private volatile boolean bulkEligible;
         private final String url;
-        private final Properties props;
+        private final Properties metadataProps;
         private final Integer connectTimeoutSeconds;
         private final Integer networkTimeoutSeconds;
         private final String driverClass;
@@ -799,15 +806,14 @@ public class ConnectionManager {
         private final Map<Integer, Savepoint> savepoints = new HashMap<>();
 
         private Session(Connection primary, Connection metadata, String url,
-                        Properties props, Integer connectTimeoutSeconds,
+                        Properties metadataProps, Integer connectTimeoutSeconds,
                         Integer networkTimeoutSeconds, String driverClass,
                         long validateAfterIdleMillis, long connectedAtMillis,
                         boolean bulkEligible) {
             this.primary = primary;
             this.metadata = metadata;
             this.url = url;
-            this.props = new Properties();
-            this.props.putAll(props);
+            this.metadataProps = (Properties) metadataProps.clone();
             this.connectTimeoutSeconds = connectTimeoutSeconds;
             this.networkTimeoutSeconds = networkTimeoutSeconds;
             this.driverClass = driverClass;

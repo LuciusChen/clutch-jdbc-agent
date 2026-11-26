@@ -30,6 +30,7 @@ import java.util.function.IntConsumer;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -41,6 +42,7 @@ class ConnectionManagerTest {
     @Test
     void connectAppliesAndRestoresTimeouts() throws Exception {
         RecordingDriver driver = new RecordingDriver();
+        driver.productName = "Oracle";
         int originalTimeout = DriverManager.getLoginTimeout();
         DriverManager.registerDriver(driver);
         DriverManager.setLoginTimeout(3);
@@ -56,6 +58,8 @@ class ConnectionManagerTest {
             assertEquals("scott", driver.seenProps.getProperty("user"));
             assertEquals("tiger", driver.seenProps.getProperty("password"));
             assertEquals("reporting", driver.seenProps.getProperty("role"));
+            assertEquals("true", driver.seenProps.getProperty("useFetchSizeWithLongColumn"));
+            assertNull(driver.primaryProps.getProperty("useFetchSizeWithLongColumn"));
             assertEquals(Map.of(1, 11_000), driver.networkTimeoutMillisByConnection,
                 "only the metadata session gets a network timeout; "
                 + "the primary session runs statements that may stay silent longer");
@@ -894,6 +898,8 @@ class ConnectionManagerTest {
         private String seenUrl;
         private int seenLoginTimeout = -1;
         private Properties seenProps;
+        private Properties primaryProps;
+        private String productName;
         private final Map<Integer, Integer> networkTimeoutMillisByConnection =
             new ConcurrentHashMap<>();
         private boolean primaryAutoCommitDisabled;
@@ -944,6 +950,7 @@ class ConnectionManagerTest {
             seenLoginTimeout = DriverManager.getLoginTimeout();
             seenProps = new Properties();
             seenProps.putAll(info);
+            if (!metadata) primaryProps = info;
             return (Connection) Proxy.newProxyInstance(
                 getClass().getClassLoader(),
                 new Class<?>[]{Connection.class},
@@ -1050,6 +1057,7 @@ class ConnectionManagerTest {
                 getClass().getClassLoader(),
                 new Class<?>[]{DatabaseMetaData.class},
                 (_proxy, method, _args) -> switch (method.getName()) {
+                    case "getDatabaseProductName" -> productName;
                     case "supportsSavepoints" -> savepointsSupported;
                     case "unwrap" -> null;
                     case "isWrapperFor" -> false;
