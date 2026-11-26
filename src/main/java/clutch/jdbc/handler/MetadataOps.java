@@ -1059,9 +1059,12 @@ final class MetadataOps {
         if (requestedCatalog == null || requestedCatalog.isBlank()) {
             return true;
         }
-        String actualCatalog = Objects.toString(rs.getString(primaryColumnLabel), "");
+        String actualCatalog = Objects.toString(optionalStringColumn(rs, primaryColumnLabel), "");
         if (actualCatalog.isBlank()) {
-            actualCatalog = Objects.toString(rs.getString(fallbackColumnLabel), "");
+            actualCatalog = Objects.toString(optionalStringColumn(rs, fallbackColumnLabel), "");
+        }
+        if (actualCatalog.isBlank()) {
+            return true;
         }
         return actualCatalog.equalsIgnoreCase(requestedCatalog);
     }

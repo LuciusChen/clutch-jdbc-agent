@@ -3842,6 +3842,34 @@ class DispatcherTest {
     }
 
     @Test
+    void jdbcIndexesKeepRowsWhenDriverOmitsCatalogAndSchemaLikeSqlite() throws Exception {
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getDatabaseProductName" -> "SQLite";
+                case "getIndexInfo" -> resultSet(
+                    List.of("TABLE_CAT", "TABLE_SCHEM", "TYPE", "INDEX_NAME", "TABLE_NAME", "NON_UNIQUE"),
+                    List.of(
+                        java.util.Arrays.asList(null, null, DatabaseMetaData.tableIndexOther,
+                            "idx_items_code", "items", false)));
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.metadataConnection = connectionWithMetadata(meta);
+
+        Response resp = dispatch(connMgr, 60, "get-indexes",
+            "conn-id", 7, "catalog", "main", "table", "items");
+        assertTrue(resp.ok, resp.error);
+        List<Map<String, Object>> indexes = resultList(resp, "indexes");
+        assertEquals(1, indexes.size(),
+            "SQLite getIndexInfo returns NULL TABLE_CAT/TABLE_SCHEM even when catalog='main' is requested");
+        assertEquals("idx_items_code", indexes.get(0).get("name"));
+        assertEquals("items", indexes.get(0).get("table"));
+        assertEquals(true, indexes.get(0).get("unique"));
+    }
+
+    @Test
     void primaryClosedAfterNonSqlServerExecutionPoisonsAndMarksBothOkAndErrorReplies() throws Exception {
         // 1. Successful statement whose driver closes the primary connection afterwards.
         RecordingConnectionManager okMgr = new RecordingConnectionManager();
