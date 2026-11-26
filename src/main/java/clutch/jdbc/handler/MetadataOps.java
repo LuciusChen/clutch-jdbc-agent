@@ -1258,6 +1258,9 @@ final class MetadataOps {
         for (String tableName : tables) {
             try (ResultSet rs = meta.getIndexInfo(catalog, schema, tableName, false, true)) {
                 while (rs.next()) {
+                    if (!matchesRequestedCatalog(conn, rs, catalog, "TABLE_CAT", "TABLE_SCHEM")) {
+                        continue;
+                    }
                     short type = rs.getShort("TYPE");
                     String indexName = rs.getString("INDEX_NAME");
                     if (type == DatabaseMetaData.tableIndexStatistic
@@ -1542,10 +1545,15 @@ final class MetadataOps {
         DatabaseMetaData meta = conn.getMetaData();
         List<Map<String, Object>> params = new ArrayList<>();
         String specificName = specificNameFromIdentity(identity);
+        String catCol = procedures ? "PROCEDURE_CAT" : "FUNCTION_CAT";
+        String schemCol = procedures ? "PROCEDURE_SCHEM" : "FUNCTION_SCHEM";
         try (ResultSet rs = procedures
                 ? meta.getProcedureColumns(catalog, schema, name, "%")
                 : meta.getFunctionColumns(catalog, schema, name, "%")) {
             while (rs.next()) {
+                if (!matchesRequestedCatalog(conn, rs, catalog, catCol, schemCol)) {
+                    continue;
+                }
                 if (specificName != null
                     && !specificName.equals(Objects.toString(rs.getString("SPECIFIC_NAME"), ""))) {
                     continue;

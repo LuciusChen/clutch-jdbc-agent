@@ -3849,10 +3849,11 @@ class DispatcherTest {
             (_proxy, method, _args) -> switch (method.getName()) {
                 case "getDatabaseProductName" -> "SQLite";
                 case "getIndexInfo" -> resultSet(
-                    List.of("TABLE_CAT", "TABLE_SCHEM", "TYPE", "INDEX_NAME", "TABLE_NAME", "NON_UNIQUE"),
+                    List.of("TABLE_CAT", "TABLE_SCHEM", "TYPE", "INDEX_NAME", "TABLE_NAME",
+                        "NON_UNIQUE", "COLUMN_NAME", "ORDINAL_POSITION", "ASC_OR_DESC"),
                     List.of(
                         java.util.Arrays.asList(null, null, DatabaseMetaData.tableIndexOther,
-                            "idx_t_label", "t", false)));
+                            "idx_t_label", "t", false, "label", 1, "A")));
                 case "getColumns" -> resultSet(
                     List.of("TABLE_CAT", "TABLE_SCHEM", "COLUMN_NAME", "TYPE_NAME", "NULLABLE", "COLUMN_DEF", "ORDINAL_POSITION"),
                     List.of(
@@ -3862,17 +3863,28 @@ class DispatcherTest {
                     List.of("TABLE_CAT", "TABLE_SCHEM", "COLUMN_NAME", "KEY_SEQ"),
                     List.of(
                         java.util.Arrays.asList(null, null, "v", (short) 1)));
+                case "getProcedureColumns" -> resultSet(
+                    List.of("PROCEDURE_CAT", "PROCEDURE_SCHEM", "COLUMN_NAME", "TYPE_NAME", "COLUMN_TYPE", "ORDINAL_POSITION", "SPECIFIC_NAME"),
+                    List.of(
+                        java.util.Arrays.asList(null, null, "p_id", "INTEGER", DatabaseMetaData.procedureColumnIn, 1, "p_spec")));
                 default -> throw new UnsupportedOperationException(method.getName());
             });
         RecordingConnectionManager connMgr = new RecordingConnectionManager();
         connMgr.metadataConnection = connectionWithMetadata(meta);
 
-        // Explicit catalog="main" hits indexes, columns, and primary keys on SQLite.
+        // Explicit catalog="main" hits indexes, index columns, columns, primary keys, and routine params on SQLite.
         Response mainIdx = dispatch(connMgr, 60, "get-indexes", "conn-id", 7, "catalog", "main", "table", "t");
         assertTrue(mainIdx.ok, mainIdx.error);
         List<Map<String, Object>> mainIndexes = resultList(mainIdx, "indexes");
         assertEquals(1, mainIndexes.size());
         assertEquals("idx_t_label", mainIndexes.get(0).get("name"));
+
+        Response mainIdxCols = dispatch(connMgr, 66, "get-index-columns",
+            "conn-id", 7, "catalog", "main", "table", "t", "index", "idx_t_label");
+        assertTrue(mainIdxCols.ok, mainIdxCols.error);
+        List<Map<String, Object>> mainIndexColumns = resultList(mainIdxCols, "columns");
+        assertEquals(1, mainIndexColumns.size());
+        assertEquals("label", mainIndexColumns.get(0).get("name"));
 
         Response mainCols = dispatch(connMgr, 61, "get-columns", "conn-id", 7, "catalog", "main", "table", "t");
         assertTrue(mainCols.ok, mainCols.error);
@@ -3885,10 +3897,22 @@ class DispatcherTest {
         assertTrue(mainPks.ok, mainPks.error);
         assertEquals(List.of("v"), resultList(mainPks, "primary-keys"));
 
+        Response mainProcParams = dispatch(connMgr, 68, "get-procedure-params",
+            "conn-id", 7, "catalog", "main", "name", "p_demo");
+        assertTrue(mainProcParams.ok, mainProcParams.error);
+        List<Map<String, Object>> mainParams = resultList(mainProcParams, "params");
+        assertEquals(1, mainParams.size());
+        assertEquals("p_id", mainParams.get(0).get("name"));
+
         // Unknown catalog="missing_catalog" must stay empty across all metadata ops.
         Response missingIdx = dispatch(connMgr, 63, "get-indexes", "conn-id", 7, "catalog", "missing_catalog", "table", "t");
         assertTrue(missingIdx.ok, missingIdx.error);
         assertEquals(List.of(), resultList(missingIdx, "indexes"));
+
+        Response missingIdxCols = dispatch(connMgr, 67, "get-index-columns",
+            "conn-id", 7, "catalog", "missing_catalog", "table", "t", "index", "idx_t_label");
+        assertTrue(missingIdxCols.ok, missingIdxCols.error);
+        assertEquals(List.of(), resultList(missingIdxCols, "columns"));
 
         Response missingCols = dispatch(connMgr, 64, "get-columns", "conn-id", 7, "catalog", "missing_catalog", "table", "t");
         assertTrue(missingCols.ok, missingCols.error);
@@ -3897,6 +3921,11 @@ class DispatcherTest {
         Response missingPks = dispatch(connMgr, 65, "get-primary-keys", "conn-id", 7, "catalog", "missing_catalog", "table", "t");
         assertTrue(missingPks.ok, missingPks.error);
         assertEquals(List.of(), resultList(missingPks, "primary-keys"));
+
+        Response missingProcParams = dispatch(connMgr, 69, "get-procedure-params",
+            "conn-id", 7, "catalog", "missing_catalog", "name", "p_demo");
+        assertTrue(missingProcParams.ok, missingProcParams.error);
+        assertEquals(List.of(), resultList(missingProcParams, "params"));
     }
 
     @Test
