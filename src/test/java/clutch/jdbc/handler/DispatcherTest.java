@@ -755,6 +755,187 @@ class DispatcherTest {
         }
     }
 
+    @Test
+    void connectReportsSqlServerCapabilitiesAndCatalog() throws Exception {
+        RecordingConnectionManager sqlServer = new RecordingConnectionManager();
+        sqlServer.returnedConnId = 7;
+        sqlServer.sqlServerCatalog = "sales";
+        Response ok = dispatch(sqlServer, 890, "connect",
+            "url", "jdbc:sqlserver://db.local:1433;databaseName=sales",
+            "driver-class", DRIVER_CLASS);
+        assertTrue(ok.ok, ok.error);
+        assertEquals(7, resultMap(ok).get("conn-id"));
+        assertEquals(Boolean.TRUE, resultMap(ok).get("describe-source-columns"));
+        assertEquals("sales", resultMap(ok).get("catalog"));
+        assertFalse(sqlServer.disconnected);
+
+        RecordingConnectionManager nonSqlServer = new RecordingConnectionManager();
+        nonSqlServer.returnedConnId = 7;
+        Response other = dispatch(nonSqlServer, 891, "connect",
+            "url", "jdbc:postgresql://db.local:5432/app",
+            "driver-class", DRIVER_CLASS);
+        assertTrue(other.ok, other.error);
+        assertNull(resultMap(other).get("describe-source-columns"));
+        assertNull(resultMap(other).get("catalog"));
+
+        RecordingConnectionManager failing = new RecordingConnectionManager();
+        failing.returnedConnId = 7;
+        failing.sqlServerCatalogFailure = new SQLException("catalog lookup failed");
+        Response err = dispatch(failing, 892, "connect",
+            "url", "jdbc:sqlserver://db.local:1433",
+            "driver-class", DRIVER_CLASS);
+        assertFalse(err.ok);
+        assertTrue(err.error.contains("catalog lookup failed"), err.error);
+        assertTrue(failing.disconnected, "failed catalog probe during connect must disconnect");
+    }
+
+    @Test
+    void foregroundRequestsReportSqlServerCatalogAndIgnoreSamplingFailures() throws Exception {
+        RecordingStatementHandler okStmt = new RecordingStatementHandler();
+        Connection okConn = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement" -> okStmt.proxy();
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Statement failingStmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "setQueryTimeout" -> null;
+                case "execute" -> throw new SQLException("Invalid object name 'dbo.missing'", "S0002", 208);
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Connection failingConn = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement" -> failingStmt;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = okConn;
+        connMgr.sqlServerCatalog = "reporting";
+        Response okReply = dispatch(connMgr, 893, "execute", "conn-id", 7, "sql", "USE reporting");
+        assertTrue(okReply.ok, okReply.error);
+        assertEquals("reporting", okReply.catalog);
+
+        connMgr.connection = failingConn;
+        Response errReply = dispatch(connMgr, 894, "execute", "conn-id", 7, "sql", "SELECT * FROM dbo.missing");
+        assertFalse(errReply.ok);
+        assertTrue(errReply.error.contains("Invalid object name 'dbo.missing'"), errReply.error);
+        assertEquals("reporting", errReply.catalog);
+
+        connMgr.sqlServerCatalogFailure = new SQLException("getCatalog failed");
+        connMgr.connection = okConn;
+        Response okDespiteProbeFailure = dispatch(connMgr, 895, "execute", "conn-id", 7, "sql", "SELECT 1");
+        assertTrue(okDespiteProbeFailure.ok, "catalog probe failure must not clobber a successful reply");
+        assertNull(okDespiteProbeFailure.catalog);
+
+        connMgr.connection = failingConn;
+        Response errDespiteProbeFailure = dispatch(connMgr, 896, "execute", "conn-id", 7, "sql", "SELECT * FROM dbo.missing");
+        assertFalse(errDespiteProbeFailure.ok);
+        assertTrue(errDespiteProbeFailure.error.contains("Invalid object name 'dbo.missing'"),
+            "catalog probe failure must not clobber the original SQL error: " + errDespiteProbeFailure.error);
+        assertNull(errDespiteProbeFailure.catalog);
+    }
+
+    @Test
+    void describeSourceColumnsReturnsVisibleColumnsAndPropagatesSqlServerErrors() throws Exception {
+        List<String> boundProjections = new ArrayList<>();
+        List<List<Object>> describeRows = new ArrayList<>();
+        java.util.function.Supplier<ResultSet> newResultSet = () -> (ResultSet) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{ResultSet.class},
+            new java.lang.reflect.InvocationHandler() {
+                int index = -1;
+                Object lastValue;
+
+                @Override
+                public Object invoke(Object _proxy, java.lang.reflect.Method method, Object[] args) {
+                    return switch (method.getName()) {
+                        case "next" -> ++index < describeRows.size();
+                        case "getString" -> {
+                            lastValue = describeRows.get(index).get(((Integer) args[0]) - 1);
+                            yield (String) lastValue;
+                        }
+                        case "getBoolean" -> {
+                            lastValue = describeRows.get(index).get(((Integer) args[0]) - 1);
+                            yield lastValue != null && (Boolean) lastValue;
+                        }
+                        case "getInt" -> {
+                            lastValue = describeRows.get(index).get(((Integer) args[0]) - 1);
+                            yield lastValue == null ? 0 : ((Number) lastValue).intValue();
+                        }
+                        case "wasNull" -> lastValue == null;
+                        case "close" -> null;
+                        case "unwrap" -> null;
+                        case "isWrapperFor" -> false;
+                        default -> throw new UnsupportedOperationException(method.getName());
+                    };
+                }
+            });
+        PreparedStatement ps = (PreparedStatement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{PreparedStatement.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "setNString" -> {
+                    assertEquals(1, args[0]);
+                    boundProjections.add((String) args[1]);
+                    yield null;
+                }
+                case "executeQuery" -> newResultSet.get();
+                case "close" -> null;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Connection metadataConn = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "prepareStatement" -> {
+                    String sql = (String) args[0];
+                    assertTrue(sql.contains("sys.dm_exec_describe_first_result_set(?, NULL, 2)"), sql);
+                    yield ps;
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.metadataConnection = metadataConn;
+
+        describeRows.add(java.util.Arrays.asList("id", false, null, null));
+        describeRows.add(java.util.Arrays.asList("internal_key", true, null, null));
+        describeRows.add(java.util.Arrays.asList(null, false, null, null));
+        describeRows.add(java.util.Arrays.asList("café", false, null, null));
+        Response ok = dispatch(connMgr, 897, "describe-source-columns",
+            "conn-id", 7, "projection", "USE [sales]; SELECT [id], 1, [cafe] FROM [dbo].[users]");
+        assertTrue(ok.ok, ok.error);
+        assertEquals(java.util.Arrays.asList("id", null, "café"), resultList(ok, "columns"));
+        assertEquals(List.of("USE [sales]; SELECT [id], 1, [cafe] FROM [dbo].[users]"), boundProjections);
+        assertEquals(List.of(CursorManager.Lane.METADATA), connMgr.usedLanes);
+
+        describeRows.clear();
+        describeRows.add(java.util.Arrays.asList(null, null, 208, "Invalid object name 'dbo.missing'."));
+        Response err = dispatch(connMgr, 898, "describe-source-columns",
+            "conn-id", 7, "projection", "SELECT [id] FROM [dbo].[missing]");
+        assertFalse(err.ok, "SQL Server describe_first_result_set error row must fail the request");
+        assertTrue(err.error.contains("Invalid object name 'dbo.missing'."), err.error);
+        assertEquals(208, diagMap(err).get("vendor-code"));
+    }
+
     private static Connection connectionWithMetadata(DatabaseMetaData meta) {
         return (Connection) Proxy.newProxyInstance(
             DispatcherTest.class.getClassLoader(),
@@ -4005,6 +4186,8 @@ class DispatcherTest {
         private int metadataInvalidations;
         private boolean metadataInvalid;
         private SQLException connectFailure;
+        private String sqlServerCatalog;
+        private SQLException sqlServerCatalogFailure;
         private int currentSchemaFailureAtReconnect = -1;
         private SQLException currentSchemaFailure;
         private String currentSchema;
@@ -4230,6 +4413,14 @@ class DispatcherTest {
                 throw currentSchemaFailure;
             }
             return currentSchema;
+        }
+
+        @Override
+        public String sqlServerCatalog(int connId) throws SQLException {
+            if (sqlServerCatalogFailure != null) {
+                throw sqlServerCatalogFailure;
+            }
+            return sqlServerCatalog;
         }
 
         @Override

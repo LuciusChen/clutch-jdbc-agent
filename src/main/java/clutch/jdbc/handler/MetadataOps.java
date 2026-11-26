@@ -126,14 +126,29 @@ final class MetadataOps {
     private Response describeSourceColumns(Request req) throws SQLException {
         Connection conn = connMgr.getMetadata(req.getInt("conn-id"));
         // Browse mode 2 preserves the view's columns when the projection reads a view.
-        String sql = "SELECT source_column FROM sys.dm_exec_describe_first_result_set(?, NULL, 2) "
-            + "WHERE is_hidden = 0 ORDER BY column_ordinal";
+        String sql = "SELECT source_column, is_hidden, error_number, error_message "
+            + "FROM sys.dm_exec_describe_first_result_set(?, NULL, 2) "
+            + "ORDER BY column_ordinal";
         List<String> names = new ArrayList<>();
         try (PreparedStatement stmt = conn.prepareStatement(sql)) {
             stmt.setNString(1, req.getString("projection"));
             try (ResultSet rows = stmt.executeQuery()) {
                 while (rows.next()) {
-                    names.add(rows.getString(1));
+                    String sourceColumn = rows.getString(1);
+                    boolean hidden = rows.getBoolean(2);
+                    boolean hiddenNull = rows.wasNull();
+                    int errorNumber = rows.getInt(3);
+                    boolean hasErrorNumber = !rows.wasNull();
+                    String errorMessage = rows.getString(4);
+                    if ((errorMessage != null && !errorMessage.isBlank()) || hasErrorNumber) {
+                        throw new SQLException(
+                            errorMessage != null && !errorMessage.isBlank() ? errorMessage
+                                : "Could not describe source columns (SQL Server error " + errorNumber + ")",
+                            null, hasErrorNumber ? errorNumber : 0);
+                    }
+                    if (!hiddenNull && !hidden) {
+                        names.add(sourceColumn);
+                    }
                 }
             }
         }

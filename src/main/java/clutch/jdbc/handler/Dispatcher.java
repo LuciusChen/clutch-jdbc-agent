@@ -244,7 +244,13 @@ public class Dispatcher {
             }
             // Statement/cursor cleanup has consumed any trailing database change.
             // Sample before another foreground request can acquire the lane.
-            if (lane == CursorManager.Lane.PRIMARY) reply.catalog = connMgr.sqlServerCatalog(connId);
+            if (lane == CursorManager.Lane.PRIMARY) {
+                try {
+                    reply.catalog = connMgr.sqlServerCatalog(connId);
+                } catch (SQLException ignored) {
+                    // Leave the primary reply intact when catalog sampling fails.
+                }
+            }
             return reply;
         };
     }
