@@ -234,17 +234,41 @@ public class Dispatcher {
 
     private Callable<Response> lockedAction(Request req, int connId, CursorManager.Lane lane) {
         return () -> {
-            Response reply;
+            Response reply = null;
+            Exception failure = null;
             try {
                 reply = dispatchUnlocked(req, lane);
             } catch (Exception error) {
                 poisonOnPrimaryConnectionFailure(req, error);
                 if (lane != CursorManager.Lane.PRIMARY) throw error;
-                reply = errorResponse(req, error);
+                failure = error;
             }
             // Statement/cursor cleanup has consumed any trailing database change.
             // Sample before another foreground request can acquire the lane.
-            if (lane == CursorManager.Lane.PRIMARY) reply.catalog = connMgr.sqlServerCatalog(connId);
+            if (lane == CursorManager.Lane.PRIMARY) {
+                String catalog = null;
+                boolean poisonedByCatalog = false;
+                try {
+                    catalog = connMgr.sqlServerCatalog(connId);
+                } catch (SQLException catalogError) {
+                    if (ConnectionManager.isConnectionFailure(catalogError)) {
+                        poisonConnection(connId);
+                        poisonedByCatalog = true;
+                    }
+                }
+                if (failure != null) {
+                    reply = errorResponse(req, failure);
+                } else if (poisonedByCatalog && connectionInvalidated(req, connId)) {
+                    if (reply.ok) {
+                        reply.connectionInvalidated = Boolean.TRUE;
+                    } else if (reply.diag instanceof Map<?, ?> diag) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> diagMap = (Map<String, Object>) diag;
+                        diagMap.put("connection-invalidated", Boolean.TRUE);
+                    }
+                }
+                reply.catalog = catalog;
+            }
             return reply;
         };
     }

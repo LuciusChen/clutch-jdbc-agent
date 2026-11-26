@@ -755,6 +755,183 @@ class DispatcherTest {
         }
     }
 
+    @Test
+    void connectReportsSqlServerCapabilitiesAndCatalog() throws Exception {
+        RecordingConnectionManager sqlServer = new RecordingConnectionManager();
+        sqlServer.returnedConnId = 7;
+        sqlServer.sqlServerCatalog = "sales";
+        Response ok = dispatch(sqlServer, 890, "connect",
+            "url", "jdbc:sqlserver://db.local:1433;databaseName=sales",
+            "driver-class", DRIVER_CLASS);
+        assertTrue(ok.ok, ok.error);
+        assertEquals(Boolean.TRUE, resultMap(ok).get("describe-source-columns"));
+        assertEquals("sales", resultMap(ok).get("catalog"));
+        assertFalse(sqlServer.disconnected);
+
+        RecordingConnectionManager nonSqlServer = new RecordingConnectionManager();
+        nonSqlServer.returnedConnId = 7;
+        Response other = dispatch(nonSqlServer, 891, "connect",
+            "url", "jdbc:postgresql://db.local:5432/app",
+            "driver-class", DRIVER_CLASS);
+        assertTrue(other.ok, other.error);
+        assertNull(resultMap(other).get("describe-source-columns"));
+        assertNull(resultMap(other).get("catalog"));
+
+        RecordingConnectionManager failing = new RecordingConnectionManager();
+        failing.returnedConnId = 7;
+        failing.sqlServerCatalogFailure = new SQLException("catalog lookup failed");
+        Response err = dispatch(failing, 892, "connect",
+            "url", "jdbc:sqlserver://db.local:1433",
+            "driver-class", DRIVER_CLASS);
+        assertFalse(err.ok);
+        assertTrue(failing.disconnected, "failed catalog probe during connect must disconnect");
+    }
+
+    @Test
+    void foregroundRequestsReportSqlServerCatalogAndPoisonOnConnectionFailure() throws Exception {
+        Connection okConn = proxyConnection(new RecordingStatementHandler());
+        Statement failingStmt = (Statement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Statement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "setQueryTimeout", "close", "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                case "execute" -> throw new SQLException("Session killed by server", "S0001", 50000);
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Connection failingConn = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "createStatement" -> failingStmt;
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connection = okConn;
+        connMgr.sqlServerCatalog = "reporting";
+        Response okReply = dispatch(connMgr, 893, "execute", "conn-id", 7, "sql", "USE reporting");
+        assertTrue(okReply.ok, okReply.error);
+        assertEquals("reporting", okReply.catalog);
+        assertNull(okReply.connectionInvalidated);
+
+        connMgr.connection = failingConn;
+        Response errReply = dispatch(connMgr, 894, "execute", "conn-id", 7, "sql", "RAISERROR('x', 16, 1)");
+        assertFalse(errReply.ok);
+        assertEquals("reporting", errReply.catalog);
+        assertNull(diagMap(errReply).get("connection-invalidated"));
+
+        // A non-connection catalog failure keeps the reply and leaves the session alive.
+        connMgr.sqlServerCatalogFailure = new SQLException("catalog unavailable", "S1000");
+        connMgr.connection = okConn;
+        Response okDespiteProbeFailure = dispatch(connMgr, 895, "execute", "conn-id", 7, "sql", "SELECT 1");
+        assertTrue(okDespiteProbeFailure.ok, okDespiteProbeFailure.error);
+        assertNull(okDespiteProbeFailure.catalog);
+        assertNull(okDespiteProbeFailure.connectionInvalidated);
+        assertFalse(connMgr.disconnected);
+
+        connMgr.connection = failingConn;
+        Response errDespiteProbeFailure = dispatch(connMgr, 896, "execute", "conn-id", 7, "sql", "SELECT 1");
+        assertFalse(errDespiteProbeFailure.ok);
+        assertTrue(errDespiteProbeFailure.error.contains("Session killed by server"), errDespiteProbeFailure.error);
+        assertNull(diagMap(errDespiteProbeFailure).get("connection-invalidated"));
+        assertFalse(connMgr.disconnected);
+
+        // A 08S01 catalog failure retires the session while keeping original error diagnostics.
+        connMgr.sqlServerCatalogFailure = new SQLException("The connection is closed.", "08S01");
+        Response killedReply = dispatch(connMgr, 897, "execute", "conn-id", 7, "sql", "RAISERROR('boom', 20, 1)");
+        assertFalse(killedReply.ok);
+        assertTrue(killedReply.error.contains("Session killed by server"), killedReply.error);
+        assertEquals("S0001", diagMap(killedReply).get("sql-state"));
+        assertEquals(50000, diagMap(killedReply).get("vendor-code"));
+        assertEquals(Boolean.TRUE, diagMap(killedReply).get("connection-invalidated"));
+        assertNull(killedReply.catalog);
+        assertTrue(connMgr.disconnected, "08S01 from sqlServerCatalog must poison the dead session");
+
+        // A 08S01 catalog failure after a successful foreground query keeps the result and marks invalidation.
+        RecordingConnectionManager okThenDead = new RecordingConnectionManager();
+        okThenDead.connection = okConn;
+        okThenDead.sqlServerCatalogFailure = new SQLException("The connection is closed.", "08S01");
+        Response okBeforeDrop = dispatch(okThenDead, 898, "execute", "conn-id", 7, "sql", "EXEC dbo.return_17_and_close");
+        assertTrue(okBeforeDrop.ok, okBeforeDrop.error);
+        assertNull(okBeforeDrop.catalog);
+        assertEquals(Boolean.TRUE, okBeforeDrop.connectionInvalidated);
+        assertTrue(okThenDead.disconnected);
+    }
+
+    @Test
+    void describeSourceColumnsDecodesColumnsAndPropagatesSqlServerErrors() throws Exception {
+        List<String> boundProjections = new ArrayList<>();
+        List<List<Object>> resultRows = new ArrayList<>();
+        Connection metadataConn = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(), new Class<?>[]{Connection.class},
+            (_proxy, method, args) -> switch (method.getName()) {
+                case "prepareStatement" -> {
+                    assertTrue(((String) args[0]).contains("sys.dm_exec_describe_first_result_set(?, NULL, 2)"));
+                    yield (PreparedStatement) Proxy.newProxyInstance(
+                        DispatcherTest.class.getClassLoader(), new Class<?>[]{PreparedStatement.class},
+                        (_ps, psMethod, psArgs) -> switch (psMethod.getName()) {
+                            case "setNString" -> {
+                                assertEquals(1, psArgs[0]);
+                                boundProjections.add((String) psArgs[1]);
+                                yield null;
+                            }
+                            case "executeQuery" -> (ResultSet) Proxy.newProxyInstance(
+                                DispatcherTest.class.getClassLoader(), new Class<?>[]{ResultSet.class},
+                                new java.lang.reflect.InvocationHandler() {
+                                    int index = -1;
+                                    Object lastValue;
+                                    @Override
+                                    public Object invoke(Object _rs, java.lang.reflect.Method m, Object[] a) {
+                                        return switch (m.getName()) {
+                                            case "next" -> ++index < resultRows.size();
+                                            case "getString" -> {
+                                                lastValue = resultRows.get(index).get(((Integer) a[0]) - 1);
+                                                yield (String) lastValue;
+                                            }
+                                            case "getInt" -> {
+                                                lastValue = resultRows.get(index).get(((Integer) a[0]) - 1);
+                                                yield lastValue == null ? 0 : (Integer) lastValue;
+                                            }
+                                            case "wasNull" -> lastValue == null;
+                                            case "close", "unwrap" -> null;
+                                            case "isWrapperFor" -> false;
+                                            default -> throw new UnsupportedOperationException(m.getName());
+                                        };
+                                    }
+                                });
+                            case "close", "unwrap" -> null;
+                            case "isWrapperFor" -> false;
+                            default -> throw new UnsupportedOperationException(psMethod.getName());
+                        });
+                }
+                case "unwrap" -> null;
+                case "isWrapperFor" -> false;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.metadataConnection = metadataConn;
+
+        resultRows.add(java.util.Arrays.asList("id", null, null));
+        resultRows.add(java.util.Arrays.asList(null, null, null));
+        resultRows.add(java.util.Arrays.asList("café", null, null));
+        Response ok = dispatch(connMgr, 899, "describe-source-columns",
+            "conn-id", 7, "projection", "USE [sales]; SELECT [id], 1, [cafe] FROM [dbo].[users]");
+        assertTrue(ok.ok, ok.error);
+        assertEquals(java.util.Arrays.asList("id", null, "café"), resultList(ok, "columns"));
+        assertEquals(List.of("USE [sales]; SELECT [id], 1, [cafe] FROM [dbo].[users]"), boundProjections);
+        assertEquals(List.of(CursorManager.Lane.METADATA), connMgr.usedLanes);
+
+        resultRows.clear();
+        resultRows.add(java.util.Arrays.asList(null, 207, "Invalid column name 'no_such_column'."));
+        Response err = dispatch(connMgr, 900, "describe-source-columns",
+            "conn-id", 7, "projection", "SELECT [no_such_column] FROM [dbo].[users]");
+        assertFalse(err.ok, "SQL Server describe_first_result_set error row must fail the request");
+        assertTrue(err.error.contains("Invalid column name 'no_such_column'."), err.error);
+        assertEquals(207, diagMap(err).get("vendor-code"));
+    }
+
     private static Connection connectionWithMetadata(DatabaseMetaData meta) {
         return (Connection) Proxy.newProxyInstance(
             DispatcherTest.class.getClassLoader(),
@@ -4005,6 +4182,8 @@ class DispatcherTest {
         private int metadataInvalidations;
         private boolean metadataInvalid;
         private SQLException connectFailure;
+        private String sqlServerCatalog;
+        private SQLException sqlServerCatalogFailure;
         private int currentSchemaFailureAtReconnect = -1;
         private SQLException currentSchemaFailure;
         private String currentSchema;
@@ -4230,6 +4409,14 @@ class DispatcherTest {
                 throw currentSchemaFailure;
             }
             return currentSchema;
+        }
+
+        @Override
+        public String sqlServerCatalog(int connId) throws SQLException {
+            if (sqlServerCatalogFailure != null) {
+                throw sqlServerCatalogFailure;
+            }
+            return sqlServerCatalog;
         }
 
         @Override
