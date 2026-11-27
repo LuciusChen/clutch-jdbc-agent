@@ -3682,6 +3682,291 @@ class DispatcherTest {
         assertEquals("ORDER_IDX", indexes.get(0).get("name"));
         assertEquals("ORDERS", indexes.get(0).get("table"));
         assertEquals(true, indexes.get(0).get("unique"));
+        assertEquals(500, oracle.fetchSize,
+            "Oracle metadata statements should set fetchSize before executeQuery");
+        assertTrue(oracle.fetchSizeBeforeExecute);
+    }
+
+    @Test
+    void oracleTablesCursorAndObjectSourceSetFetchSizeBeforeExecute() throws Exception {
+        OracleMetadataRecorder oracle = new OracleMetadataRecorder();
+        Map<String, Object> tableRow = new HashMap<>();
+        tableRow.put("object_name", "ORDERS");
+        tableRow.put("object_type", "TABLE");
+        tableRow.put("owner", "ZJSY");
+        tableRow.put("source_owner", "ZJSY");
+        oracle.resultRows = List.of(tableRow);
+
+        Response tables = dispatchOracle(oracle, 51, "get-tables",
+            "conn-id", 7, "schema", "ZJSY");
+        assertTrue(tables.ok);
+        assertEquals(1000, oracle.fetchSize);
+        assertTrue(oracle.fetchSizeBeforeExecute);
+
+        Map<String, Object> sourceRow = new HashMap<>();
+        sourceRow.put("text", "PROCEDURE p AS BEGIN NULL; END;\n");
+        oracle.resultRows = List.of(sourceRow);
+
+        Response source = dispatchOracle(oracle, 52, "get-object-source",
+            "conn-id", 7, "schema", "ZJSY", "name", "p", "type", "PROCEDURE");
+        assertTrue(source.ok);
+        assertEquals(500, oracle.fetchSize);
+        assertTrue(oracle.fetchSizeBeforeExecute);
+    }
+
+    @Test
+    void oracleObjectDdlFreesTemporaryClob() throws Exception {
+        int[] freed = {0};
+        java.sql.Clob clob = (java.sql.Clob) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{java.sql.Clob.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getCharacterStream" -> new java.io.StringReader("CREATE VIEW v AS SELECT 1 FROM DUAL");
+                case "free" -> { freed[0]++; yield null; }
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        ResultSet rs = (ResultSet) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{ResultSet.class},
+            new java.lang.reflect.InvocationHandler() {
+                boolean read;
+                @Override
+                public Object invoke(Object _proxy, java.lang.reflect.Method method, Object[] _args) {
+                    return switch (method.getName()) {
+                        case "next" -> { boolean first = !read; read = true; yield first; }
+                        case "getClob" -> clob;
+                        case "close" -> null;
+                        default -> throw new UnsupportedOperationException(method.getName());
+                    };
+                }
+            });
+        PreparedStatement ps = (PreparedStatement) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{PreparedStatement.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "setQueryTimeout", "setFetchSize", "setString", "close" -> null;
+                case "executeQuery" -> rs;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getDatabaseProductName" -> "Oracle";
+                case "getUserName" -> "APP";
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        Connection conn = (Connection) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{Connection.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getMetaData" -> meta;
+                case "prepareStatement" -> ps;
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.metadataConnection = conn;
+        Response response = dispatch(connMgr, 53, "get-object-ddl",
+            "conn-id", 7, "schema", "APP", "name", "v", "type", "VIEW");
+
+        assertTrue(response.ok);
+        assertEquals("CREATE VIEW v AS SELECT 1 FROM DUAL", resultMap(response).get("ddl"));
+        assertEquals(1, freed[0], "DBMS_METADATA.GET_DDL temporary CLOB must be freed");
+    }
+
+    @Test
+    void jdbcPrimaryKeysAreSortedByKeySeqNotColumnName() throws Exception {
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getDatabaseProductName" -> "PostgreSQL";
+                case "getPrimaryKeys" -> resultSet(
+                    List.of("TABLE_CAT", "TABLE_SCHEM", "COLUMN_NAME", "KEY_SEQ"),
+                    List.of(
+                        List.of("app", "public", "account_id", (short) 2),
+                        List.of("app", "public", "seq_no", (short) 3),
+                        List.of("app", "public", "tenant_id", (short) 1)));
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.metadataConnection = connectionWithMetadata(meta);
+
+        Response response = dispatch(connMgr, 54, "get-primary-keys",
+            "conn-id", 7, "catalog", "app", "schema", "public", "table", "ledger");
+
+        assertTrue(response.ok);
+        assertEquals(List.of("tenant_id", "account_id", "seq_no"),
+            resultList(response, "primary-keys"));
+    }
+
+    @Test
+    void jdbcIndexesAndProceduresPreserveRowSchemaAndFilterByCatalog() throws Exception {
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getDatabaseProductName" -> "PostgreSQL";
+                case "getIndexInfo" -> resultSet(
+                    List.of("TABLE_CAT", "TABLE_SCHEM", "TYPE", "INDEX_NAME", "TABLE_NAME", "NON_UNIQUE"),
+                    List.of(
+                        List.of("app", "s1", DatabaseMetaData.tableIndexOther, "idx_same", "orders", false),
+                        List.of("app", "s2", DatabaseMetaData.tableIndexOther, "idx_same", "orders", true),
+                        List.of("other", "s3", DatabaseMetaData.tableIndexOther, "idx_other", "orders", true)));
+                case "getProcedures" -> resultSet(
+                    List.of("PROCEDURE_CAT", "PROCEDURE_SCHEM", "PROCEDURE_NAME", "SPECIFIC_NAME"),
+                    List.of(
+                        List.of("app", "billing", "close_month", "close_month_1"),
+                        List.of("other", "other_s", "ignore_me", "ignore_1")));
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.metadataConnection = connectionWithMetadata(meta);
+
+        Response indexesResp = dispatch(connMgr, 55, "get-indexes",
+            "conn-id", 7, "catalog", "app", "table", "orders");
+        assertTrue(indexesResp.ok);
+        List<Map<String, Object>> indexes = resultList(indexesResp, "indexes");
+        assertEquals(2, indexes.size(), "same index name in distinct schemas must not collide, and wrong catalog filtered");
+        assertEquals("s1", indexes.get(0).get("schema"));
+        assertEquals("s2", indexes.get(1).get("schema"));
+
+        Response procsResp = dispatch(connMgr, 56, "get-procedures",
+            "conn-id", 7, "catalog", "app");
+        assertTrue(procsResp.ok);
+        List<Map<String, Object>> procs = resultList(procsResp, "procedures");
+        assertEquals(1, procs.size());
+        assertEquals("billing", procs.get(0).get("schema"));
+        assertEquals("close_month", procs.get(0).get("name"));
+    }
+
+    @Test
+    void sqliteCatalogFilterMatchesMainAndRejectsUnknownCatalog() throws Exception {
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+            DispatcherTest.class.getClassLoader(),
+            new Class<?>[]{DatabaseMetaData.class},
+            (_proxy, method, _args) -> switch (method.getName()) {
+                case "getDatabaseProductName" -> "SQLite";
+                case "getIndexInfo" -> resultSet(
+                    List.of("TABLE_CAT", "TABLE_SCHEM", "TYPE", "INDEX_NAME", "TABLE_NAME",
+                        "NON_UNIQUE", "COLUMN_NAME", "ORDINAL_POSITION", "ASC_OR_DESC"),
+                    List.of(
+                        java.util.Arrays.asList(null, null, DatabaseMetaData.tableIndexOther,
+                            "idx_t_label", "t", false, "label", 1, "A")));
+                case "getColumns" -> resultSet(
+                    List.of("TABLE_CAT", "TABLE_SCHEM", "COLUMN_NAME", "TYPE_NAME", "NULLABLE", "COLUMN_DEF", "ORDINAL_POSITION"),
+                    List.of(
+                        java.util.Arrays.asList(null, null, "v", "INTEGER", DatabaseMetaData.columnNoNulls, null, 1),
+                        java.util.Arrays.asList(null, null, "label", "TEXT", DatabaseMetaData.columnNullable, null, 2)));
+                case "getPrimaryKeys" -> resultSet(
+                    List.of("TABLE_CAT", "TABLE_SCHEM", "COLUMN_NAME", "KEY_SEQ"),
+                    List.of(
+                        java.util.Arrays.asList(null, null, "v", (short) 1)));
+                case "getProcedureColumns" -> resultSet(
+                    List.of("PROCEDURE_CAT", "PROCEDURE_SCHEM", "COLUMN_NAME", "TYPE_NAME", "COLUMN_TYPE", "ORDINAL_POSITION", "SPECIFIC_NAME"),
+                    List.of(
+                        java.util.Arrays.asList(null, null, "p_id", "INTEGER", DatabaseMetaData.procedureColumnIn, 1, "p_spec")));
+                default -> throw new UnsupportedOperationException(method.getName());
+            });
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.metadataConnection = connectionWithMetadata(meta);
+
+        // Explicit catalog="main" hits indexes, index columns, columns, primary keys, and routine params on SQLite.
+        Response mainIdx = dispatch(connMgr, 60, "get-indexes", "conn-id", 7, "catalog", "main", "table", "t");
+        assertTrue(mainIdx.ok, mainIdx.error);
+        List<Map<String, Object>> mainIndexes = resultList(mainIdx, "indexes");
+        assertEquals(1, mainIndexes.size());
+        assertEquals("idx_t_label", mainIndexes.get(0).get("name"));
+
+        Response mainIdxCols = dispatch(connMgr, 66, "get-index-columns",
+            "conn-id", 7, "catalog", "main", "table", "t", "index", "idx_t_label");
+        assertTrue(mainIdxCols.ok, mainIdxCols.error);
+        List<Map<String, Object>> mainIndexColumns = resultList(mainIdxCols, "columns");
+        assertEquals(1, mainIndexColumns.size());
+        assertEquals("label", mainIndexColumns.get(0).get("name"));
+
+        Response mainCols = dispatch(connMgr, 61, "get-columns", "conn-id", 7, "catalog", "main", "table", "t");
+        assertTrue(mainCols.ok, mainCols.error);
+        List<Map<String, Object>> mainColumns = resultList(mainCols, "columns");
+        assertEquals(2, mainColumns.size());
+        assertEquals("v", mainColumns.get(0).get("name"));
+        assertEquals("label", mainColumns.get(1).get("name"));
+
+        Response mainPks = dispatch(connMgr, 62, "get-primary-keys", "conn-id", 7, "catalog", "main", "table", "t");
+        assertTrue(mainPks.ok, mainPks.error);
+        assertEquals(List.of("v"), resultList(mainPks, "primary-keys"));
+
+        Response mainProcParams = dispatch(connMgr, 68, "get-procedure-params",
+            "conn-id", 7, "catalog", "main", "name", "p_demo");
+        assertTrue(mainProcParams.ok, mainProcParams.error);
+        List<Map<String, Object>> mainParams = resultList(mainProcParams, "params");
+        assertEquals(1, mainParams.size());
+        assertEquals("p_id", mainParams.get(0).get("name"));
+
+        // Unknown catalog="missing_catalog" must stay empty across all metadata ops.
+        Response missingIdx = dispatch(connMgr, 63, "get-indexes", "conn-id", 7, "catalog", "missing_catalog", "table", "t");
+        assertTrue(missingIdx.ok, missingIdx.error);
+        assertEquals(List.of(), resultList(missingIdx, "indexes"));
+
+        Response missingIdxCols = dispatch(connMgr, 67, "get-index-columns",
+            "conn-id", 7, "catalog", "missing_catalog", "table", "t", "index", "idx_t_label");
+        assertTrue(missingIdxCols.ok, missingIdxCols.error);
+        assertEquals(List.of(), resultList(missingIdxCols, "columns"));
+
+        Response missingCols = dispatch(connMgr, 64, "get-columns", "conn-id", 7, "catalog", "missing_catalog", "table", "t");
+        assertTrue(missingCols.ok, missingCols.error);
+        assertEquals(List.of(), resultList(missingCols, "columns"));
+
+        Response missingPks = dispatch(connMgr, 65, "get-primary-keys", "conn-id", 7, "catalog", "missing_catalog", "table", "t");
+        assertTrue(missingPks.ok, missingPks.error);
+        assertEquals(List.of(), resultList(missingPks, "primary-keys"));
+
+        Response missingProcParams = dispatch(connMgr, 69, "get-procedure-params",
+            "conn-id", 7, "catalog", "missing_catalog", "name", "p_demo");
+        assertTrue(missingProcParams.ok, missingProcParams.error);
+        assertEquals(List.of(), resultList(missingProcParams, "params"));
+    }
+
+    @Test
+    void primaryClosedAfterNonSqlServerExecutionPoisonsAndMarksBothOkAndErrorReplies() throws Exception {
+        // 1. Successful statement whose driver closes the primary connection afterwards.
+        RecordingConnectionManager okMgr = new RecordingConnectionManager();
+        RecordingStatementHandler okStmt = new RecordingStatementHandler();
+        okStmt.updateCount = 1;
+        okMgr.connection = proxyConnection(okStmt);
+        okMgr.primaryClosed = true;
+        Response okResp = dispatch(okMgr, 57, "execute", "conn-id", 7, "sql", "CALL close_me()");
+        assertTrue(okResp.ok);
+        assertEquals(Boolean.TRUE, okResp.connectionInvalidated);
+        assertTrue(okMgr.disconnected);
+
+        // 2. Non-08* error after which the driver marks primary closed.
+        RecordingConnectionManager errMgr = new RecordingConnectionManager();
+        RecordingStatementHandler errStmt = new RecordingStatementHandler();
+        errStmt.executeFailure = new SQLException("session aborted by server", "HY000", 999);
+        errMgr.connection = proxyConnection(errStmt);
+        errMgr.primaryClosed = true;
+        Response errResp = dispatch(errMgr, 58, "execute", "conn-id", 7, "sql", "SELECT 1");
+        assertFalse(errResp.ok);
+        assertEquals(Boolean.TRUE, diagMap(errResp).get("connection-invalidated"));
+        assertTrue(errMgr.disconnected);
+    }
+
+    @Test
+    void connectDiagnosticsRedactAuthorityPasswordInRfc3986JdbcUrls() throws Exception {
+        RecordingConnectionManager connMgr = new RecordingConnectionManager();
+        connMgr.connectFailure = new SQLException(
+            "FATAL: password authentication failed for jdbc:postgresql://alice:s3cr3tPass@db.internal:5432/prod");
+        Response resp = dispatch(connMgr, 59, "connect",
+            "url", "jdbc:postgresql://alice:s3cr3tPass@db.internal:5432/prod",
+            "driver-class", "org.postgresql.Driver");
+        assertFalse(resp.ok);
+        assertFalse(resp.error.contains("s3cr3tPass"), resp.error);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> ctx = (Map<String, Object>) diagMap(resp).get("context");
+        assertEquals("jdbc:postgresql://alice:<redacted>@db.internal:5432/prod",
+            ctx.get("redacted-url"));
     }
 
     @Test
@@ -4144,24 +4429,47 @@ class DispatcherTest {
 
     private static ResultSet resultSet(List<String> columns, List<List<Object>> rows) {
         final int[] index = {-1};
+        final Object[] lastValue = {null};
         return (ResultSet) Proxy.newProxyInstance(
             DispatcherTest.class.getClassLoader(),
             new Class<?>[]{ResultSet.class},
             (_proxy, method, args) -> switch (method.getName()) {
                 case "next" -> ++index[0] < rows.size();
                 case "getString" -> {
-                    Object key = args[0];
-                    int col = key instanceof Integer n
-                        ? n.intValue() - 1
-                        : columns.indexOf((String) key);
-                    Object value = rows.get(index[0]).get(col);
+                    Object value = rowCell(columns, rows.get(index[0]), args[0]);
+                    lastValue[0] = value;
                     yield value == null ? null : value.toString();
                 }
+                case "getShort" -> {
+                    Object value = rowCell(columns, rows.get(index[0]), args[0]);
+                    lastValue[0] = value;
+                    yield value == null ? (short) 0 : ((Number) value).shortValue();
+                }
+                case "getInt" -> {
+                    Object value = rowCell(columns, rows.get(index[0]), args[0]);
+                    lastValue[0] = value;
+                    yield value == null ? 0 : ((Number) value).intValue();
+                }
+                case "getBoolean" -> {
+                    Object value = rowCell(columns, rows.get(index[0]), args[0]);
+                    lastValue[0] = value;
+                    yield Boolean.TRUE.equals(value);
+                }
+                case "wasNull" -> lastValue[0] == null;
                 case "close" -> null;
                 case "unwrap" -> null;
                 case "isWrapperFor" -> false;
                 default -> throw new UnsupportedOperationException(method.getName());
             });
+    }
+
+    private static Object rowCell(List<String> columns, List<Object> row, Object key)
+            throws SQLException {
+        int col = key instanceof Integer n ? n - 1 : columns.indexOf((String) key);
+        if (col < 0 || col >= row.size()) {
+            throw new SQLException("Unknown column: " + key);
+        }
+        return row.get(col);
     }
 
     private static final class RecordingConnectionManager extends ConnectionManager {
@@ -4419,6 +4727,13 @@ class DispatcherTest {
             return sqlServerCatalog;
         }
 
+        private boolean primaryClosed;
+
+        @Override
+        public boolean isPrimaryClosed(int connId) throws SQLException {
+            return !disconnected && primaryClosed;
+        }
+
         @Override
         public void disconnect(int connId) {
             assertEquals(7, connId);
@@ -4435,6 +4750,7 @@ class DispatcherTest {
     private static final class RecordingStatementHandler {
         private int queryTimeoutSeconds;
         private SQLException queryTimeoutFailure;
+        private SQLException executeFailure;
         private String executedSql;
         private int updateCount = 3;
         private SQLWarning warnings;
@@ -4453,6 +4769,7 @@ class DispatcherTest {
                     }
                     case "execute" -> {
                         executedSql = (String) args[0];
+                        if (executeFailure != null) throw executeFailure;
                         yield false;
                     }
                     case "getWarnings" -> {
@@ -4476,6 +4793,8 @@ class DispatcherTest {
         private final List<String> sqlHistory = new ArrayList<>();
         private final List<String> params = new ArrayList<>();
         private int queryTimeoutSeconds;
+        private int fetchSize;
+        private boolean fetchSizeBeforeExecute;
         private final Map<String, List<Map<String, Object>>> rowsBySql = new HashMap<>();
         List<Map<String, Object>> resultRows = List.of(
             row("PARA_ID", "NUMBER", "N", 1),
@@ -4509,6 +4828,9 @@ class DispatcherTest {
             this.sql = sql;
             this.sqlHistory.add(sql);
             this.params.clear();
+            this.fetchSize = 0;
+            this.fetchSizeBeforeExecute = false;
+            final boolean[] executed = {false};
             return (PreparedStatement) Proxy.newProxyInstance(
                 DispatcherTest.class.getClassLoader(),
                 new Class<?>[]{PreparedStatement.class},
@@ -4517,13 +4839,23 @@ class DispatcherTest {
                         queryTimeoutSeconds = (Integer) args[0];
                         yield null;
                     }
+                    case "setFetchSize" -> {
+                        fetchSize = (Integer) args[0];
+                        if (!executed[0]) {
+                            fetchSizeBeforeExecute = true;
+                        }
+                        yield null;
+                    }
                     case "setString" -> {
                         int idx = (Integer) args[0];
                         while (params.size() < idx) params.add(null);
                         params.set(idx - 1, (String) args[1]);
                         yield null;
                     }
-                    case "executeQuery" -> resultSet();
+                    case "executeQuery" -> {
+                        executed[0] = true;
+                        yield resultSet();
+                    }
                     case "close" -> null;
                     case "unwrap" -> null;
                     case "isWrapperFor" -> false;

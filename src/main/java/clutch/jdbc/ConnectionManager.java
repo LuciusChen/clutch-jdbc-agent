@@ -239,6 +239,22 @@ public class ConnectionManager {
             ? session.primary().getCatalog() : null;
     }
 
+    /**
+     * Return whether the primary JDBC session of {@code connId} already reports closed.
+     * Per JDBC, {@code isClosed()} inspects local driver state without a network round trip.
+     */
+    public boolean isPrimaryClosed(int connId) throws SQLException {
+        Session session = connections.get(connId);
+        if (session == null) {
+            return false;
+        }
+        try {
+            return session.primary().isClosed();
+        } catch (UnsupportedOperationException | AbstractMethodError e) {
+            return false;
+        }
+    }
+
     /** Commit the primary transaction and invalidate its savepoint handles. */
     public void commit(int connId) throws SQLException {
         Session session = requireSession(connId);
@@ -437,31 +453,46 @@ public class ConnectionManager {
         return metadata;
     }
 
-    /** Reopen only the metadata connection when FAILURE indicates it is dead. */
+    /**
+     * Reopen only the metadata connection when FAILURE indicates it is dead.
+     * Validation and logon run outside the session monitor so a concurrent
+     * primary commit or rollback does not wait on network I/O.
+     */
     public boolean reconnectMetadataIfInvalid(int connId, SQLException failure)
             throws SQLException {
         Session session = connections.get(connId);
         if (session == null) {
             return false;
         }
-        Connection metadata;
-        synchronized (session) {
-            metadata = session.metadata();
-            if (sessionUsable(metadata, failure)) {
-                return false;
-            }
-            Connection replacement = openConnection(
-                session.url, session.props, session.connectTimeoutSeconds,
-                session.driverClass);
-            try {
-                configureMetadataConnection(replacement, session.networkTimeoutSeconds);
-                session.setMetadata(replacement);
-            } catch (SQLException | RuntimeException e) {
-                closeQuietly(replacement);
-                throw e;
-            }
+        Connection previous = session.metadata();
+        if (sessionUsable(previous, failure)) {
+            return false;
         }
-        closeAsync(metadata);
+        Connection replacement = openConnection(
+            session.url, session.props, session.connectTimeoutSeconds,
+            session.driverClass);
+        try {
+            configureMetadataConnection(replacement, session.networkTimeoutSeconds);
+        } catch (SQLException | RuntimeException e) {
+            closeQuietly(replacement);
+            throw e;
+        }
+        synchronized (session) {
+            if (connections.get(connId) != session) {
+                closeQuietly(replacement);
+                throw new SQLException("Unknown connection id: " + connId);
+            }
+            previous = session.metadata();
+            session.setMetadata(replacement);
+        }
+        // A poison or force-disconnect racing with the swap may already have
+        // closed the session's previous connections; do not leave replacement behind.
+        if (connections.get(connId) != session) {
+            closeQuietly(replacement);
+            closeAsync(previous);
+            throw new SQLException("Unknown connection id: " + connId);
+        }
+        closeAsync(previous);
         return true;
     }
 
@@ -637,6 +668,25 @@ public class ConnectionManager {
         }
     }
 
+    private static final Set<String> FATAL_SQL_STATES = Set.of(
+        "57P01", // PostgreSQL admin_shutdown (e.g. pg_terminate_backend)
+        "57P02", // PostgreSQL crash_shutdown
+        "57P03"  // PostgreSQL cannot_connect_now
+    );
+
+    private static final Set<Integer> ORACLE_FATAL_ERROR_CODES = Set.of(
+        28,    // ORA-00028: your session has been killed
+        1012,  // ORA-01012: not logged on
+        1033,  // ORA-01033: ORACLE initialization or shutdown in progress
+        1034,  // ORA-01034: ORACLE not available
+        1089,  // ORA-01089: immediate shutdown or close in progress
+        2396,  // ORA-02396: exceeded maximum idle time, please connect again
+        3113,  // ORA-03113: end-of-file on communication channel
+        3114,  // ORA-03114: not connected to ORACLE
+        3135,  // ORA-03135: connection lost contact
+        17008  // ORA-17008: Closed Connection
+    );
+
     /** Return whether FAILURE means its JDBC connection must not be reused. */
     public static boolean isConnectionFailure(Throwable failure) {
         Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -650,17 +700,31 @@ public class ConnectionManager {
         if (failure instanceof SQLRecoverableException) {
             return true;
         }
-        if (failure instanceof SQLException sqlException
-            && (sqlException.getErrorCode() == 12592
-                || sqlException.getSQLState() != null
-                    && sqlException.getSQLState().startsWith("08"))) {
-            return true;
+        if (failure instanceof SQLException sqlException) {
+            String sqlState = sqlException.getSQLState();
+            if (isOracleConnectionFailure(sqlException)
+                || sqlState != null
+                    && (sqlState.startsWith("08") || FATAL_SQL_STATES.contains(sqlState))) {
+                return true;
+            }
         }
         if (isConnectionFailure(failure.getCause(), seen)) {
             return true;
         }
         return failure instanceof SQLException sqlException
             && isConnectionFailure(sqlException.getNextException(), seen);
+    }
+
+    private static boolean isOracleConnectionFailure(SQLException sqlException) {
+        int code = sqlException.getErrorCode();
+        if (code == 12592) {
+            return true;
+        }
+        if (!ORACLE_FATAL_ERROR_CODES.contains(code)) {
+            return false;
+        }
+        String message = sqlException.getMessage();
+        return message != null && message.contains("ORA-");
     }
 
     /** Close and remove the connection for {@code connId}. No-op if already closed. */

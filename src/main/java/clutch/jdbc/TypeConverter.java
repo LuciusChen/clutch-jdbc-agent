@@ -132,26 +132,34 @@ public class TypeConverter {
         if (val instanceof Date) return ((Date) val).toLocalDate().toString();
         if (val instanceof Time) return formatTime((Time) val);
 
-        // Bound large-object reads.
+        // Bound large-object reads and free temporary LOB locators immediately.
         if (val instanceof Clob) {
             Clob clob = (Clob) val;
-            long len = clob.length();
-            String preview = clob.getSubString(1, (int) Math.min(len, 256));
-            // A preview boundary must not split a UTF-16 surrogate pair.
-            if (len > 256 && !preview.isEmpty()
-                    && Character.isHighSurrogate(preview.charAt(preview.length() - 1))) {
-                preview = preview.substring(0, preview.length() - 1);
+            try {
+                long len = clob.length();
+                String preview = clob.getSubString(1, (int) Math.min(len, 256));
+                // A preview boundary must not split a UTF-16 surrogate pair.
+                if (len > 256 && !preview.isEmpty()
+                        && Character.isHighSurrogate(preview.charAt(preview.length() - 1))) {
+                    preview = preview.substring(0, preview.length() - 1);
+                }
+                return java.util.Map.of("__type", "clob", "length", len, "preview", preview);
+            } finally {
+                freeQuietly(clob);
             }
-            return java.util.Map.of("__type", "clob", "length", len, "preview", preview);
         }
         if (val instanceof Blob) {
             Blob blob = (Blob) val;
-            long len = blob.length();
-            // A locator read can make a database round trip for each row.
-            if (len > MAX_INLINE_BINARY_BYTES) {
-                return Map.of("__type", "blob", "length", len);
+            try {
+                long len = blob.length();
+                // A locator read can make a database round trip for each row.
+                if (len > MAX_INLINE_BINARY_BYTES) {
+                    return Map.of("__type", "blob", "length", len);
+                }
+                return blobBytesToMap(blob.getBytes(1, (int) len), len);
+            } finally {
+                freeQuietly(blob);
             }
-            return blobBytesToMap(blob.getBytes(1, (int) len), len);
         }
         if (val instanceof byte[] bytes) return blobBytesToMap(bytes, bytes.length);
         if (val instanceof ByteBuffer buffer) {
@@ -165,6 +173,22 @@ public class TypeConverter {
         // Fallback: getString() for anything else (e.g. Oracle-specific types).
         String s = rs.getString(col);
         return boundedTextCell(s != null ? s : val.toString());
+    }
+
+    private static void freeQuietly(Clob clob) {
+        try {
+            clob.free();
+        } catch (SQLException | UnsupportedOperationException | AbstractMethodError ignored) {
+            // Optional JDBC 4 cleanup; drivers without locator free() ignore it.
+        }
+    }
+
+    private static void freeQuietly(Blob blob) {
+        try {
+            blob.free();
+        } catch (SQLException | UnsupportedOperationException | AbstractMethodError ignored) {
+            // Optional JDBC 4 cleanup; drivers without locator free() ignore it.
+        }
     }
 
     private static String boundedTextCell(String value) throws SQLException {
