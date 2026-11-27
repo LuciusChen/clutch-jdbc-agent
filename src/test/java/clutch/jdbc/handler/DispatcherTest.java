@@ -3409,6 +3409,15 @@ class DispatcherTest {
         assertEquals("ORDERS", tables.get(0).get("name"));
         assertEquals("DATA_OWNER", tables.get(0).get("schema"));
         assertEquals("ZJSY", tables.get(0).get("source-schema"));
+
+        for (var scope : Map.of("ZJSY", "user_tables", "REPORTING", "all_tables").entrySet()) {
+            response = dispatchOracle(oracle, 41, "search-tables",
+                "conn-id", 7, "schema", scope.getKey(), "table", "ORDER_LOG", "prefix", "ORDER_LOG");
+            assertTrue(response.ok, response.error);
+            assertEquals(List.of(scope.getKey(), "ORDER_LOG"), oracle.params);
+            assertTrue(oracle.lastSqlNormalized().contains("FROM " + scope.getValue()));
+            assertTrue(oracle.lastSqlNormalized().contains("table_name = ?"));
+        }
     }
 
     @Test
