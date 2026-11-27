@@ -49,6 +49,8 @@ Timeout-related params are explicit:
 - `query-timeout-seconds`: statement timeout for `execute`, `execute-params` and `fetch`. A positive value limits the statement, and the agent waits one second longer before cancelling it itself. `0` sets no limit: the statement runs until it ends, is cancelled, or its connection is force-disconnected. Omitting it keeps a 29-second limit for older clients. Negative values are rejected before JDBC work or cursor advancement.
 - `validate-after-idle-seconds`: validate the primary connection before new SQL, and the metadata or bulk session before a metadata request, after this many idle seconds; omitted or zero disables the check
 
+Oracle metadata sessions enable `useFetchSizeWithLongColumn` so column defaults can be fetched in batches. An explicit driver property takes precedence.
+
 `execute`, `execute-params`, and `fetch` accept an optional integer
 `fetch-size` from 1 through 10,000. The default is 500. Values outside that
 range are rejected before JDBC work or cursor advancement.
