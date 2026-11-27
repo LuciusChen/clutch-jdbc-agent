@@ -326,9 +326,10 @@ final class MetadataOps {
         String catalog = getOptionalString(req, "catalog");
         String schema = getOptionalString(req, "schema");
         String prefix = Objects.toString(req.params.get("prefix"), "");
+        String table = getOptionalString(req, "table");
         Connection conn = connMgr.getMetadata(connId);
         List<Map<String, Object>> tables = isOracle(conn)
-            ? searchOracleTables(conn, schema, prefix)
+            ? searchOracleTables(conn, schema, prefix, table)
             : searchJdbcMetadataTables(conn, catalog, schema, prefix);
         return Response.ok(req.id, Map.of("tables", tables));
     }
@@ -358,13 +359,22 @@ final class MetadataOps {
         return tables;
     }
 
-    private List<Map<String, Object>> searchOracleTables(Connection conn, String schema, String prefix)
+    private List<Map<String, Object>> searchOracleTables(Connection conn, String schema, String prefix,
+                                                          String table)
             throws SQLException {
         OracleSchema os = OracleSchema.of(currentOracleUser(conn), schema);
         String pattern = ((prefix == null || prefix.isBlank()) ? "" : prefix)
             .toUpperCase(Locale.ROOT) + "%";
         String sql;
-        if (os.useUserTables()) {
+        if (table != null) {
+            sql = os.useUserTables() ? """
+                SELECT table_name AS object_name, 'TABLE' AS object_type, ? AS owner, NULL AS source_owner
+                FROM user_tables WHERE table_name = ?
+                """ : """
+                SELECT table_name AS object_name, 'TABLE' AS object_type, owner, owner AS source_owner
+                FROM all_tables WHERE owner = ? AND table_name = ?
+                """;
+        } else if (os.useUserTables()) {
             sql = """
                 SELECT object_name, object_type, owner, source_owner, source_rank
                 FROM (
@@ -423,7 +433,10 @@ final class MetadataOps {
         }
         LinkedHashMap<String, Map<String, Object>> tablesByName = new LinkedHashMap<>();
         try (PreparedStatement ps = prepareOracleStatement(conn, sql)) {
-            if (os.useUserTables()) {
+            if (table != null) {
+                ps.setString(1, os.owner());
+                ps.setString(2, table);
+            } else if (os.useUserTables()) {
                 ps.setString(1, os.owner());
                 ps.setString(2, os.owner());
                 ps.setString(3, pattern);
